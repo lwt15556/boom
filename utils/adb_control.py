@@ -1,8 +1,9 @@
 import re
 import subprocess
+from dataclasses import dataclass
 from shutil import which
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 
 import cv2
 
@@ -11,6 +12,15 @@ from utils.logger import get_logger
 
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class NetworkIsolationStatus:
+    safe: bool
+    ipv4_blocked: bool
+    ipv6_route_present: bool
+    ipv6_blocked: bool
+    detail: str
 
 
 class AdbCommandError(RuntimeError):
@@ -96,7 +106,7 @@ class AdbController:
         remote_path = "/sdcard/_bbma_screen.png"
         self._run(["shell", "screencap", "-p", remote_path])
         self._run(["pull", remote_path, str(path)])
-        logger.info("截图已保存: %s", path)
+        logger.debug("截图已保存: %s", path)
         return path
 
     def read_screenshot(self, output_path: str | Path | None = None):
@@ -153,6 +163,50 @@ class AdbController:
         self._run(["shell", "am", "force-stop", package_name])
         logger.info("已通过包名关闭 APP: %s", package_name)
 
+    def wait_until_app_stopped(
+        self,
+        package_name: str,
+        *,
+        timeout: float = 3.0,
+        poll_interval: float = 0.1,
+    ) -> bool:
+        """等待包名对应的进程完全退出，超时返回 False。"""
+        package_name = package_name.strip()
+        if not package_name:
+            _raise_value_error("包名不能为空")
+        timeout = float(timeout)
+        poll_interval = float(poll_interval)
+        if timeout < 0:
+            _raise_value_error(f"timeout 不能小于 0: {timeout}")
+        if poll_interval <= 0:
+            _raise_value_error(f"poll_interval 必须大于 0: {poll_interval}")
+
+        deadline = monotonic() + timeout
+        while True:
+            result = self._run(
+                ["shell", "pidof", package_name],
+                check=False,
+            )
+            if result.stderr.strip() or result.returncode not in {0, 1}:
+                logger.error(
+                    "检查 APP 进程状态失败: package=%s returncode=%s stderr=%r",
+                    package_name,
+                    result.returncode,
+                    _limit_text(result.stderr),
+                )
+                return False
+            if not result.stdout.strip():
+                logger.info("APP 进程已完全退出: %s", package_name)
+                return True
+            if monotonic() >= deadline:
+                logger.error(
+                    "等待 APP 进程退出超时: package=%s pid=%s",
+                    package_name,
+                    result.stdout.strip(),
+                )
+                return False
+            sleep(poll_interval)
+
     def enable_weak_network(self, package_name: str) -> None:
         """通过包名开启弱网，阻断该 APP 的出站网络。"""
         package_name = package_name.strip()
@@ -172,6 +226,38 @@ class AdbController:
         uid = self._get_package_uid(package_name)
         self._set_weak_network_rule(uid, enabled=False)
         logger.info("已关闭 APP 弱网: package=%s uid=%s", package_name, uid)
+
+    def verify_app_network_isolated(self, package_name: str) -> NetworkIsolationStatus:
+        package_name = package_name.strip()
+        if not package_name:
+            _raise_value_error("package name cannot be empty")
+
+        uid = self._get_package_uid(package_name)
+        ipv4_blocked = self._is_weak_network_rule_active(uid)
+        route_result = self._run_privileged_script("ip -6 route show", check=False)
+        route_check_failed = route_result.returncode != 0 or bool(route_result.stderr.strip())
+        ipv6_route_present = False
+        ipv6_blocked = False
+
+        if not route_check_failed:
+            ipv6_route_present = any(
+                line.strip() and re.search(r"\bdev\s+\S+", line)
+                for line in route_result.stdout.splitlines()
+            )
+            if ipv6_route_present:
+                rule = f"ip6tables -C OUTPUT -m owner --uid-owner {uid} -j BBMA_WEAKNET"
+                rule_result = self._run_privileged_script(rule, check=False)
+                ipv6_blocked = rule_result.returncode == 0 and not rule_result.stderr.strip()
+
+        safe = not route_check_failed and ipv4_blocked and (not ipv6_route_present or ipv6_blocked)
+        flags = (
+            f"ipv4_blocked={ipv4_blocked}, ipv6_route_present={ipv6_route_present}, "
+            f"ipv6_blocked={ipv6_blocked}, safe={safe}"
+        )
+        detail = f"package={package_name}, uid={uid}, {flags}"
+        if route_check_failed:
+            detail += "; ipv6 route check failed"
+        return NetworkIsolationStatus(safe, ipv4_blocked, ipv6_route_present, ipv6_blocked, detail)
 
     def enable_reject_network(self, package_name: str) -> None:
         """通过包名开启 REJECT 断网，独立于 DROP 弱网规则。"""

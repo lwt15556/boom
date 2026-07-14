@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -39,6 +39,7 @@ class DiamondHitConfig:
     strong_hit_center_gray_ratio: float = 0.20
     strong_hit_component_ratio: float = 0.20
     strong_hit_gray_excess: float = 0.02
+    adaptive_thresholds: bool = True
     debug: bool = False
     debug_dir: str = "debug_diamond_pair"
 
@@ -115,6 +116,8 @@ def classify_diamond_hit(
 
     before_crop, local_center, _ = crop_around(before_screenshot, refined_center, crop_w, crop_h)
     after_crop, _, _ = crop_around(after_screenshot, refined_center, crop_w, crop_h)
+    if config.adaptive_thresholds:
+        config = adapt_config_to_local_water(after_crop, config)
 
     h, w = after_crop.shape[:2]
 
@@ -361,6 +364,43 @@ def build_gray_candidate_mask(after_bgr: np.ndarray, config: DiamondHitConfig) -
     gray_candidate = cv2.morphologyEx(gray_candidate, cv2.MORPH_CLOSE, kernel)
 
     return gray_candidate
+
+
+def adapt_config_to_local_water(after_bgr: np.ndarray, config: DiamondHitConfig) -> DiamondHitConfig:
+    hsv = cv2.cvtColor(after_bgr, cv2.COLOR_BGR2HSV)
+    _h, s, v = cv2.split(hsv)
+    median_s = float(np.median(s))
+    median_v = float(np.median(v))
+
+    gray_s_max = config.gray_s_max
+    diff_threshold = config.diff_threshold
+    min_center_gray_ratio = config.min_center_gray_ratio
+    min_component_ratio = config.min_component_ratio
+    min_s_drop = config.min_s_drop
+    v_min = config.v_min
+    v_max = config.v_max
+
+    if median_s >= 105:
+        gray_s_max += 10
+        min_s_drop = max(4.0, min_s_drop - 2.0)
+    if median_v <= 95:
+        v_min = max(18, v_min - 8)
+        min_center_gray_ratio *= 0.88
+        min_component_ratio *= 0.90
+    elif median_v >= 170:
+        diff_threshold += 2
+        v_max = min(245, v_max + 8)
+
+    return replace(
+        config,
+        gray_s_max=gray_s_max,
+        diff_threshold=diff_threshold,
+        min_center_gray_ratio=min_center_gray_ratio,
+        min_component_ratio=min_component_ratio,
+        min_s_drop=min_s_drop,
+        v_min=v_min,
+        v_max=v_max,
+    )
 
 
 def refine_center_by_pair(
