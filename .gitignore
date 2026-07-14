@@ -7,6 +7,7 @@ _debug/screenshots/**
 _debug/diamond_hit_probe/**
 _debug/screenshots/fullyauto/
 _debug/logs/**
+_debug/runtime/**
 
 AGENTS.md
 COLLABORATION.md
