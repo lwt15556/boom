@@ -13,12 +13,8 @@ import cv2
 import numpy as np
 
 from config import TEMPLATE_DIR
-from utils.diamond_hit import classify_diamond_hit
+from utils.diamond_hit import DiamondHitConfig, classify_diamond_hit, make_diamond_mask
 from utils.image_match import MatchResult, find_template_multi_scale
-from utils.wreck_detection import (
-    red_hit_marker_visible,
-    visible_wreck_static_detected,
-)
 
 
 Cell = tuple[int, int]
@@ -132,10 +128,111 @@ def _inside_grid(cell: Cell, grid_size: int) -> bool:
 
 
 def _default_hit_detector(image: np.ndarray, point: tuple[int, int]) -> bool:
-    return red_hit_marker_visible(image, point) or visible_wreck_static_detected(
-        image,
-        point,
-    )
+    # Match the visible wreck to the requested cell instead of searching the
+    # whole crop for a template that can also occur in ordinary water tiles.
+    try:
+        result = classify_diamond_hit(image, image, point)
+    except Exception:
+        return False
+    return str(getattr(result, "state", "")).strip().lower() == "hit"
+
+
+def _prefilter_candidates_by_change_upper_bound(
+    *,
+    before_image: np.ndarray,
+    after_images: Sequence[np.ndarray],
+    points_by_cell: Mapping[Cell, tuple[int, int]],
+    candidates: set[Cell],
+    minimum_change_threshold: float,
+) -> set[Cell] | None:
+    if not candidates:
+        return set()
+    if (
+        not np.isfinite(minimum_change_threshold)
+        or not 0.0 <= minimum_change_threshold <= 1.0
+        or before_image.ndim != 3
+        or before_image.shape[2] != 3
+    ):
+        return None
+
+    frames = tuple(after_images)
+    if any(
+        frame.ndim != 3
+        or frame.shape[2] != 3
+        or frame.shape[:2] != before_image.shape[:2]
+        for frame in frames
+    ):
+        return None
+
+    config = DiamondHitConfig()
+    half_width = int(np.ceil(config.diamond_w * config.inner_scale / 2.0))
+    half_height = int(np.ceil(config.diamond_h * config.inner_scale / 2.0))
+    kernel = (
+        make_diamond_mask(
+            (half_height * 2 + 1, half_width * 2 + 1),
+            (half_width, half_height),
+            config.diamond_w,
+            config.diamond_h,
+            scale=config.inner_scale,
+        )
+        > 0
+    ).astype(np.float32)
+
+    # The convolution gives an upper bound for every center the exact classifier
+    # may choose during refinement. Falling below the threshold here is conclusive.
+    try:
+        before_gray = cv2.cvtColor(before_image, cv2.COLOR_BGR2GRAY)
+        ones = np.ones(before_gray.shape, dtype=np.float32)
+        area_map = cv2.filter2D(
+            ones,
+            -1,
+            kernel,
+            anchor=(half_width, half_height),
+            borderType=cv2.BORDER_CONSTANT,
+        )
+        upper_bound_maps: list[np.ndarray] = []
+        for frame in frames:
+            after_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            changed = (
+                cv2.absdiff(before_gray, after_gray) >= config.diff_threshold
+            ).astype(np.float32)
+            changed_count = cv2.filter2D(
+                changed,
+                -1,
+                kernel,
+                anchor=(half_width, half_height),
+                borderType=cv2.BORDER_CONSTANT,
+            )
+            upper_bound_maps.append(
+                np.divide(
+                    changed_count,
+                    np.maximum(area_map, 1.0),
+                    dtype=np.float32,
+                )
+            )
+    except (cv2.error, TypeError, ValueError):
+        return None
+
+    height, width = before_gray.shape
+    filtered: set[Cell] = set()
+    for cell in sorted(candidates):
+        point = points_by_cell.get(cell)
+        if point is None:
+            return None
+        x, y = point
+        if not 0 <= x < width or not 0 <= y < height:
+            return None
+        x1 = max(0, x - config.search_radius)
+        x2 = min(width, x + config.search_radius + 1)
+        y1 = max(0, y - config.search_radius)
+        y2 = min(height, y + config.search_radius + 1)
+        frame_upper_bounds = [
+            float(np.max(change_map[y1:y2, x1:x2]))
+            for change_map in upper_bound_maps
+        ]
+        if median(frame_upper_bounds) >= minimum_change_threshold - 1e-6:
+            filtered.add(cell)
+    return filtered
 
 
 class RedScoutAnalyzer:
@@ -178,30 +275,26 @@ class RedScoutAnalyzer:
             return self._invalid_result(result_center)
 
         frames, points_by_cell, excluded, learned_offsets = preflight
-        if learned_offsets is None:
-            candidates = {
-                cell
-                for cell in points_by_cell
-                if cell not in excluded
-            }
-        else:
-            candidates = {
-                (result_center[0] + row_offset, result_center[1] + col_offset)
-                for row_offset, col_offset in learned_offsets
-                if _inside_grid(
-                    (
-                        result_center[0] + row_offset,
-                        result_center[1] + col_offset,
-                    ),
-                    grid_size,
-                )
-            } - excluded
+        # A learned footprint is a planning hint, not a fixed description of
+        # every later red-bomb result. The affected cells can vary with the
+        # target position, so every unknown cell must be considered by analysis.
+        candidates = {
+            cell
+            for cell in points_by_cell
+            if cell not in excluded
+        }
 
+        minimum_change_threshold = (
+            FIRST_FOOTPRINT_CHANGE_THRESHOLD
+            if learned_offsets is None
+            else LEARNED_FOOTPRINT_CHANGE_THRESHOLD
+        )
         evidence = self._collect_evidence(
             before_image=before_image,
             after_images=frames,
             points_by_cell=points_by_cell,
             candidates=candidates,
+            minimum_change_threshold=minimum_change_threshold,
         )
         if evidence is None:
             return self._invalid_result(result_center)
@@ -211,7 +304,7 @@ class RedScoutAnalyzer:
             affected = {
                 cell
                 for cell, changed_ratio in median_change_by_cell.items()
-                if changed_ratio >= FIRST_FOOTPRINT_CHANGE_THRESHOLD
+                if changed_ratio >= minimum_change_threshold
             }
             valid = result_center in affected and len(affected) >= 2
             footprint = (
@@ -231,10 +324,37 @@ class RedScoutAnalyzer:
             affected = {
                 cell
                 for cell, changed_ratio in median_change_by_cell.items()
-                if changed_ratio >= LEARNED_FOOTPRINT_CHANGE_THRESHOLD
+                if changed_ratio >= minimum_change_threshold
             }
             valid = bool(affected)
             footprint = learned_footprint
+
+        before_visible = self._before_visible_hit_cells(
+            before_image=before_image,
+            points_by_cell=points_by_cell,
+            candidates=affected,
+        )
+        if before_visible is None:
+            return self._invalid_result(result_center)
+        if before_visible:
+            affected = affected - before_visible
+            if learned_offsets is None:
+                valid = result_center in affected and len(affected) >= 2
+                footprint = (
+                    RedFootprint(
+                        offsets=frozenset(
+                            (
+                                row - result_center[0],
+                                col - result_center[1],
+                            )
+                            for row, col in affected
+                        )
+                    )
+                    if valid
+                    else None
+                )
+            else:
+                valid = bool(affected)
 
         classified = self._classify_affected_cells(
             after_images=frames,
@@ -347,7 +467,19 @@ class RedScoutAnalyzer:
         after_images: tuple[np.ndarray, ...],
         points_by_cell: Mapping[Cell, tuple[int, int]],
         candidates: set[Cell],
+        minimum_change_threshold: float,
     ) -> tuple[dict[Cell, float], dict[Cell, tuple[str, ...]]] | None:
+        if self._classifier is classify_diamond_hit:
+            filtered = _prefilter_candidates_by_change_upper_bound(
+                before_image=before_image,
+                after_images=after_images,
+                points_by_cell=points_by_cell,
+                candidates=candidates,
+                minimum_change_threshold=minimum_change_threshold,
+            )
+            if filtered is not None:
+                candidates = filtered
+
         median_change_by_cell: dict[Cell, float] = {}
         states_by_cell: dict[Cell, tuple[str, ...]] = {}
         for cell in sorted(candidates):
@@ -368,6 +500,22 @@ class RedScoutAnalyzer:
             median_change_by_cell[cell] = float(median(changes))
             states_by_cell[cell] = tuple(states)
         return median_change_by_cell, states_by_cell
+
+    def _before_visible_hit_cells(
+        self,
+        *,
+        before_image: np.ndarray,
+        points_by_cell: Mapping[Cell, tuple[int, int]],
+        candidates: set[Cell],
+    ) -> set[Cell] | None:
+        visible: set[Cell] = set()
+        for cell in sorted(candidates):
+            try:
+                if self._hit_detector(before_image, points_by_cell[cell]):
+                    visible.add(cell)
+            except Exception:
+                return None
+        return visible
 
     def _classify_affected_cells(
         self,

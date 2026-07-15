@@ -759,6 +759,8 @@ def _analyze_red_result(
     click_points,
     grid_size,
     center_cell,
+    excluded_cells: Sequence[Cell] | set[Cell] | frozenset[Cell] | None = None,
+    learned_footprint: RedFootprint | None = None,
 ):
     return RedScoutAnalyzer().analyze(
         before_image=before_image,
@@ -766,8 +768,8 @@ def _analyze_red_result(
         click_points=click_points,
         grid_size=grid_size,
         center_cell=center_cell,
-        excluded_cells=set(),
-        learned_footprint=None,
+        excluded_cells=set() if excluded_cells is None else excluded_cells,
+        learned_footprint=learned_footprint,
     )
 
 
@@ -884,6 +886,8 @@ def _execute_red_scout_transaction(
     index: int,
     grid_size: int,
     all_click_points: Sequence[tuple[int, int]],
+    excluded_cells: Sequence[Cell] | set[Cell] | frozenset[Cell] = (),
+    learned_footprint: RedFootprint | None = None,
 ):
     global _active_probe
     transaction = None
@@ -950,6 +954,8 @@ def _execute_red_scout_transaction(
             all_click_points,
             grid_size,
             center_cell,
+            excluded_cells=excluded_cells,
+            learned_footprint=learned_footprint,
         )
         write_runtime_status(phase="red_scout_discard", level=level)
         _discard_pending_request_and_prepare_next_probe(transaction)
@@ -1369,16 +1375,43 @@ def handle_game_level(
             completed_visual_hits = completed_candidates
 
         initial_visual_hits = partial_cells | completed_visual_hits
+        fleet_visual_hits: set[Cell] = set()
+        if visible_hits:
+            fleet_resolution = resolve_completed_ship_cells(
+                set(visible_hits),
+                submarines,
+                grid_size=grid_size,
+            )
+            fleet_visual_hits = set(fleet_resolution.cells)
+            if fleet_visual_hits:
+                logger.info(
+                    "level %s visible fleet geometry: placements=%s unresolved=%s discarded=%s",
+                    level,
+                    [list(placement) for placement in fleet_resolution.placements],
+                    list(fleet_resolution.unresolved_lengths),
+                    sorted(fleet_resolution.discarded_cells),
+                )
+            if len(fleet_visual_hits) > len(initial_visual_hits):
+                logger.info(
+                    "level %s visible fleet geometry restored %s additional hit cells",
+                    level,
+                    len(fleet_visual_hits - initial_visual_hits),
+                )
+                initial_visual_hits = fleet_visual_hits
 
         max_visible_hits = sum(submarines)
         if len(initial_visual_hits) > max_visible_hits:
             logger.warning(
-                "level %s visual hit coordinates are suspicious: %s/%s; discarding partial wreck coordinates",
+                "level %s visual hit coordinates are suspicious: %s/%s; "
+                "falling back to geometry-constrained coordinates",
                 level,
                 len(initial_visual_hits),
                 max_visible_hits,
             )
-            initial_visual_hits = set(completed_visual_hits)
+            if 0 < len(fleet_visual_hits) <= max_visible_hits:
+                initial_visual_hits = fleet_visual_hits
+            else:
+                initial_visual_hits = set(completed_visual_hits)
 
         for row, col in initial_visual_hits:
             hit_map[row][col] = 1
@@ -1389,6 +1422,7 @@ def handle_game_level(
                 partial_wreck_count=len(partial_wreck_cells),
                 fallback_hit_count=len(visible_hits),
             )
+            initial_visual_hit_count = max(initial_visual_hit_count, len(initial_visual_hits))
             logger.info(
                 "level %s exact visual hit count: completed_cells=%s partial_wrecks=%s total=%s",
                 level,
@@ -1985,12 +2019,25 @@ def _run_red_scout_and_blue_strategy(
     online_sidebar_completed_lengths: tuple[int, ...] = ()
 
     def current_board_states() -> list[list[str]]:
-        return build_red_scout_board_states(
+        display_strategy = SubmarineStrategy(grid_size, submarines)
+        real_hits = initial_real_hits | committed_hits
+        for cell in real_hits:
+            display_strategy.report_result(cell, True)
+        for cell in committed_misses - real_hits:
+            display_strategy.report_result(cell, False)
+        if scout_hits or scout_misses:
+            display_strategy.report_scout_results(
+                hits=scout_hits - real_hits,
+                misses=scout_misses - real_hits - committed_misses,
+            )
+        if online_sidebar_completed_lengths:
+            display_strategy.reconcile_completed_lengths(
+                online_sidebar_completed_lengths,
+                observed_completed_cells=real_hits,
+            )
+        return build_runtime_board_states(
+            display_strategy,
             grid_size,
-            hits=scout_hits,
-            misses=scout_misses,
-            initial_hits=initial_real_hits | committed_hits,
-            initial_misses=committed_misses,
         )
 
     def current_display_hit_count() -> int:
@@ -2032,6 +2079,8 @@ def _run_red_scout_and_blue_strategy(
             index,
             grid_size,
             click_points,
+            excluded_cells=known_cells,
+            learned_footprint=footprint,
         )
         attempts_completed += 1
         logger.info(

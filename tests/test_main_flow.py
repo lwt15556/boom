@@ -223,7 +223,7 @@ class MainFlowTest(unittest.TestCase):
         )
         events = []
 
-        def red_attempt(*_args):
+        def red_attempt(*_args, **_kwargs):
             result = first if not events else second
             events.append(("red", result.center_cell))
             return result
@@ -476,7 +476,7 @@ class MainFlowTest(unittest.TestCase):
         result = self._valid_red_result()
         phases = []
 
-        def execute(*args):
+        def execute(*args, **_kwargs):
             phases.extend([
                 "red_scout_preflight", "red_scout_capture",
                 "red_scout_discard", "red_scout_verify_ammo",
@@ -570,7 +570,7 @@ class MainFlowTest(unittest.TestCase):
         )
         centers = []
 
-        def execute(_level, center, *_args):
+        def execute(_level, center, *_args, **_kwargs):
             centers.append(center)
             return invalid
 
@@ -1103,7 +1103,7 @@ class MainFlowTest(unittest.TestCase):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
         centers = []
 
-        def execute(level, center, point, index, grid_size, all_click_points):
+        def execute(level, center, point, index, grid_size, all_click_points, **_kwargs):
             centers.append((level, center))
             self.assertEqual(grid_size, 3)
             self.assertEqual(len(all_click_points), 9)
@@ -1182,6 +1182,100 @@ class MainFlowTest(unittest.TestCase):
         ):
             self.main.handle_game_level(1, [[0] * 3 for _ in range(3)], settings=settings)
         self.assertIs(run.call_args.kwargs["settings"], settings)
+
+    def test_handle_game_level_keeps_visible_wreck_cells_from_midgame_frames(self):
+        submarines = [2, 2, 3, 3, 4, 5]
+        visible_hits = {
+            (0, 6),
+            (0, 7),
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (4, 0),
+            (7, 1),
+            (7, 2),
+            (7, 3),
+        }
+        partial_wreck_cells = {(2, 0), (3, 0), (4, 0)}
+        sidebar_progress = SidebarProgress(
+            active_lengths=(5, 4, 3, 2, 2),
+            completed_lengths=(3,),
+            unknown_lengths=(),
+        )
+        click_points = [(400 + index, 300 + index) for index in range(81)]
+        grid_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        def run_strategy(*_args, **kwargs):
+            self.assertEqual(kwargs["initial_hits"], visible_hits)
+            self.assertEqual(kwargs["initial_completed_visual_hits"], {(7, 1), (7, 2), (7, 3)})
+            self.assertEqual(kwargs["initial_visual_hit_count"], 9)
+            return True
+
+        with (
+            patch.object(self.main.adb, "delay"),
+            patch.object(self.main.adb, "read_screenshot", return_value=grid_img),
+            patch.object(
+                self.main,
+                "get_click_points",
+                return_value=(click_points, np.zeros((4, 2), dtype=np.float32)),
+            ),
+            patch.object(self.main, "get_configured_submarines", return_value=submarines),
+            patch.object(self.main, "detect_sidebar_progress", return_value=sidebar_progress),
+            patch.object(self.main, "detect_visible_wreck_cells", return_value=visible_hits),
+            patch.object(self.main, "detect_partial_wreck_cells", return_value=partial_wreck_cells),
+            patch.object(self.main, "_run_red_scout_and_blue_strategy", side_effect=run_strategy) as run,
+        ):
+            grid_img_result, _, completed = self.main.handle_game_level(
+                7,
+                [[0] * 9 for _ in range(9)],
+            )
+
+        self.assertTrue(completed)
+        self.assertIs(grid_img_result, grid_img)
+        run.assert_called_once()
+
+    def test_handle_game_level_discards_suspicious_all_grid_wreck_candidates(self):
+        submarines = [2, 2, 3, 3, 4, 5]
+        visible_hits = {
+            (row, col)
+            for row in range(9)
+            for col in range(9)
+        }
+        sidebar_progress = SidebarProgress(
+            active_lengths=(2, 2),
+            completed_lengths=(5, 4, 3, 3),
+            unknown_lengths=(),
+        )
+        click_points = [(400 + index, 300 + index) for index in range(81)]
+        grid_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        def run_strategy(*_args, **kwargs):
+            self.assertEqual(kwargs["initial_hits"], set())
+            self.assertEqual(kwargs["initial_completed_visual_hits"], set())
+            self.assertEqual(kwargs["initial_visual_hit_count"], 15)
+            return True
+
+        with (
+            patch.object(self.main.adb, "delay"),
+            patch.object(self.main.adb, "read_screenshot", return_value=grid_img),
+            patch.object(
+                self.main,
+                "get_click_points",
+                return_value=(click_points, np.zeros((4, 2), dtype=np.float32)),
+            ),
+            patch.object(self.main, "get_configured_submarines", return_value=submarines),
+            patch.object(self.main, "detect_sidebar_progress", return_value=sidebar_progress),
+            patch.object(self.main, "detect_visible_wreck_cells", return_value=visible_hits),
+            patch.object(self.main, "detect_partial_wreck_cells", return_value=set()),
+            patch.object(self.main, "_run_red_scout_and_blue_strategy", side_effect=run_strategy) as run,
+        ):
+            _grid_img_result, _quad, completed = self.main.handle_game_level(
+                7,
+                [[0] * 9 for _ in range(9)],
+            )
+
+        self.assertTrue(completed)
+        run.assert_called_once()
 
     def test_scout_observations_are_not_saved_as_real_shots(self):
         strategy = SimpleNamespace(

@@ -27,10 +27,7 @@
 - 使用进程生命周期锁保证 `main.py` 单实例运行，避免多个脚本同时操作模拟器。
 - 保存多帧识别证据、运行日志和命中图；探测证据默认只保留最近 120 个批次。
 
-<p align="center">
-  <img src="docs/images/home.png" alt="游戏主界面" width="48%">
-  <img src="docs/images/hit_map_level_18.png" alt="命中图示例" width="48%">
-</p>
+
 
 ## 运行流程
 
