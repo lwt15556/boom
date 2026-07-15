@@ -12,6 +12,7 @@ from utils.logger import get_logger
 
 
 logger = get_logger(__name__)
+ADB_COMMAND_TIMEOUT_SECONDS = 20.0
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,15 @@ class AdbCommandError(RuntimeError):
         super().__init__(f"{' '.join(command)}: {message}")
 
 
+class AdbCommandTimeoutError(TimeoutError):
+    """Raised when an adb command exceeds its safety timeout."""
+
+    def __init__(self, command: list[str], timeout: float):
+        self.command = command
+        self.timeout = timeout
+        super().__init__(f"adb command timed out after {timeout:g}s: {' '.join(command)}")
+
+
 class AdbController:
 
     def __init__(self, serial: str = ADB_SERIAL, auto_connect: bool = True):
@@ -48,7 +58,14 @@ class AdbController:
             self.connect()
         logger.info("adb 控制器已初始化: %s", self.serial)
 
-    def _run(self, args: list[str], *, device: bool = True, check: bool = True) -> subprocess.CompletedProcess[str]:
+    def _run(
+        self,
+        args: list[str],
+        *,
+        device: bool = True,
+        check: bool = True,
+        timeout: float = ADB_COMMAND_TIMEOUT_SECONDS,
+    ) -> subprocess.CompletedProcess[str]:
         ''' 执行 adb 命令，自动添加设备参数。 '''
         command = [_resolve_adb_executable()]
         if device:
@@ -56,7 +73,7 @@ class AdbController:
         command.extend(args)
 
         logger.debug("执行 adb 命令: %s", " ".join(command))
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = self._run_once(command, timeout)
         if check and device and result.returncode != 0 and self._is_recoverable_adb_error(result):
             logger.warning(
                 "ADB 连接异常，正在重连并重试: command=%s stdout=%r stderr=%r",
@@ -65,7 +82,7 @@ class AdbController:
                 _limit_text(result.stderr),
             )
             self._recover_connection()
-            result = subprocess.run(command, capture_output=True, text=True)
+            result = self._run_once(command, timeout)
 
         if check and result.returncode != 0:
             logger.error(
@@ -77,6 +94,19 @@ class AdbController:
             )
             raise AdbCommandError(command, result)
         return result
+
+    @staticmethod
+    def _run_once(command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            logger.error("adb 命令超时: timeout=%ss command=%s", timeout, " ".join(command))
+            raise AdbCommandTimeoutError(command, timeout) from exc
 
     @property
     def ip(self) -> str:
@@ -183,9 +213,11 @@ class AdbController:
 
         deadline = monotonic() + timeout
         while True:
+            remaining = deadline - monotonic()
             result = self._run(
                 ["shell", "pidof", package_name],
                 check=False,
+                timeout=min(ADB_COMMAND_TIMEOUT_SECONDS, max(0.001, remaining)),
             )
             if result.stderr.strip() or result.returncode not in {0, 1}:
                 logger.error(
@@ -198,14 +230,15 @@ class AdbController:
             if not result.stdout.strip():
                 logger.info("APP 进程已完全退出: %s", package_name)
                 return True
-            if monotonic() >= deadline:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
                 logger.error(
                     "等待 APP 进程退出超时: package=%s pid=%s",
                     package_name,
                     result.stdout.strip(),
                 )
                 return False
-            sleep(poll_interval)
+            sleep(min(poll_interval, remaining))
 
     def enable_weak_network(self, package_name: str) -> None:
         """通过包名开启弱网，阻断该 APP 的出站网络。"""
@@ -245,7 +278,10 @@ class AdbController:
                 for line in route_result.stdout.splitlines()
             )
             if ipv6_route_present:
-                rule = f"ip6tables -C OUTPUT -m owner --uid-owner {uid} -j BBMA_WEAKNET"
+                rule = (
+                    f"ip6tables -C OUTPUT -m owner --uid-owner {uid} -j BBMA_WEAKNET "
+                    "&& ip6tables -C BBMA_WEAKNET -j DROP"
+                )
                 rule_result = self._run_privileged_script(rule, check=False)
                 ipv6_blocked = rule_result.returncode == 0 and not rule_result.stderr.strip()
 
@@ -484,9 +520,12 @@ class AdbController:
         """恢复异常的 adb 连接，并清理依赖设备状态的缓存。"""
         self._touch_device_info = None
         self._root_shell_ready = False
-        disconnect_command = ["adb", "disconnect", self.serial]
+        self._package_uid_cache.clear()
+        self._ip6tables_available = None
+        self._weak_network_enabled_uids.clear()
+        self._reject_network_enabled_uids.clear()
         logger.info("断开 adb 设备连接: %s", self.serial)
-        subprocess.run(disconnect_command, capture_output=True, text=True)
+        self._run(["disconnect", self.serial], device=False, check=False)
         sleep(0.5)
         self.connect()
         sleep(1.0)
@@ -675,15 +714,22 @@ class AdbController:
 
     def _is_weak_network_rule_active(self, uid: int) -> bool:
         """确认当前 iptables 中是否存在指定 UID 的弱网规则。"""
-        script = f"iptables -C OUTPUT -m owner --uid-owner {uid} -j BBMA_WEAKNET"
+        script = (
+            f"iptables -C OUTPUT -m owner --uid-owner {uid} -j BBMA_WEAKNET "
+            "&& iptables -C BBMA_WEAKNET -j DROP"
+        )
         result = self._run_privileged_script(script, check=False)
-        return result.returncode == 0
+        return result.returncode == 0 and not result.stderr.strip()
 
     def _is_reject_network_rule_active(self, uid: int) -> bool:
         """确认当前 iptables 中是否存在指定 UID 的 REJECT 断网规则。"""
-        script = f"iptables -C OUTPUT -m owner --uid-owner {uid} -j BBMA_REJECTNET"
+        script = (
+            f"iptables -C OUTPUT -m owner --uid-owner {uid} -j BBMA_REJECTNET "
+            "&& iptables -C BBMA_REJECTNET -p tcp -j REJECT --reject-with tcp-reset "
+            "&& iptables -C BBMA_REJECTNET -j REJECT --reject-with icmp-port-unreachable"
+        )
         result = self._run_privileged_script(script, check=False)
-        return result.returncode == 0
+        return result.returncode == 0 and not result.stderr.strip()
 
     def _run_privileged_script(self, script: str, *, check: bool = True) -> subprocess.CompletedProcess[str]:
         """使用 root adb shell 执行特权脚本。"""

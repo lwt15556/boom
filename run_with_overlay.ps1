@@ -7,7 +7,28 @@ $overlay = Join-Path $root "tools\log_overlay.py"
 $stdout = Join-Path $root "run_stdout.log"
 $stderr = Join-Path $root "run_stderr.log"
 
+if (-not (Test-Path -LiteralPath $python)) {
+    throw "Python virtual environment not found: $python"
+}
+
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+
 Remove-Item -LiteralPath $stdout, $stderr -ErrorAction SilentlyContinue
+
+$mainProcess = Start-Process `
+    -FilePath $python `
+    -ArgumentList @($main) `
+    -WorkingDirectory $root `
+    -RedirectStandardOutput $stdout `
+    -RedirectStandardError $stderr `
+    -WindowStyle Hidden `
+    -PassThru
+
+Start-Sleep -Milliseconds 750
+if ($mainProcess.HasExited) {
+    throw "main.py exited during startup (exit code=$($mainProcess.ExitCode)); check run_stderr.log"
+}
 
 Start-Process `
     -FilePath $python `
@@ -15,14 +36,4 @@ Start-Process `
     -WorkingDirectory $root `
     -WindowStyle Hidden
 
-Start-Sleep -Milliseconds 500
-
-Start-Process `
-    -FilePath $python `
-    -ArgumentList @($main) `
-    -WorkingDirectory $root `
-    -RedirectStandardOutput $stdout `
-    -RedirectStandardError $stderr `
-    -WindowStyle Hidden `
-    -PassThru |
-    Select-Object Id, ProcessName
+$mainProcess | Select-Object Id, ProcessName

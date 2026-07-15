@@ -71,6 +71,30 @@ def _read_existing_tail(log_file: Path, max_lines: int) -> list[str]:
         return []
 
 
+def _read_log_chunk(log_file: Path, position: int) -> tuple[list[str], int]:
+    try:
+        size = log_file.stat().st_size
+        start = int(position)
+        if start < 0 or start > size:
+            start = 0
+        with log_file.open("rb") as file:
+            file.seek(start)
+            data = file.read()
+    except OSError:
+        return [], position
+
+    if not data:
+        return [], start
+    last_newline = data.rfind(b"\n")
+    if last_newline < 0:
+        return [], start
+
+    consumed = data[: last_newline + 1]
+    next_position = start + last_newline + 1
+    text = consumed.decode("utf-8", errors="replace")
+    return [_strip_ansi(line) for line in text.splitlines()], next_position
+
+
 class LogOverlay:
     def __init__(
         self,
@@ -141,20 +165,8 @@ class LogOverlay:
     def _tail_log_file(self) -> None:
         position = self.log_file.stat().st_size if self.log_file.exists() else 0
         while not self.stop_event.is_set():
-            try:
-                if not self.log_file.exists():
-                    time.sleep(0.3)
-                    continue
-                current_size = self.log_file.stat().st_size
-                if current_size < position:
-                    position = 0
-                with self.log_file.open("r", encoding="utf-8", errors="replace") as file:
-                    file.seek(position)
-                    for line in file:
-                        self.pending.append(_strip_ansi(line.rstrip()))
-                    position = file.tell()
-            except OSError:
-                pass
+            lines, position = _read_log_chunk(self.log_file, position)
+            self.pending.extend(lines)
             time.sleep(0.25)
 
     def _flush_pending(self) -> None:

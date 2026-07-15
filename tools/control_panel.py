@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 - this script supports direct execution outside the package.
+
 import json
 import os
 import re
@@ -58,7 +60,7 @@ from PyQt6.QtWidgets import (
 from config import ADB_EXE, ADB_SERIAL, GAME_PACKAGE_NAME, LOG_FILE
 from utils.adb_control import AdbController
 from utils.pending_probe import clear_pending_probe, has_pending_probe
-from utils.runtime_lock import MAIN_PID_FILE, get_main_process, is_pid_running, read_pid, remove_pid
+from utils.runtime_lock import MAIN_PID_FILE, get_main_process, is_pid_running, remove_pid
 
 
 MAIN_SCRIPT = PROJECT_ROOT / "main.py"
@@ -222,7 +224,7 @@ def _runtime_status_is_offline() -> bool:
     status = read_runtime_status()
     network = str(status.get("network", ""))
     return has_pending_probe() or any(
-        marker in network for marker in ("断网", "DROP", "REJECT")
+        marker in network for marker in ("断网", "DROP", "REJECT", "fail_closed")
     )
 
 
@@ -256,12 +258,15 @@ def restore_network() -> str:
 
 
 def stop_program() -> str:
-    pid = read_pid(MAIN_PID_FILE)
-    if pid is None:
+    pid_state = get_main_process()
+    if pid_state is None:
         restore_network()
         return "没有发现主程序 PID，网络已恢复"
 
-    if is_pid_running(pid):
+    pid, running = pid_state
+    if running:
+        if pid is None:
+            raise RuntimeError("主程序锁仍被占用，但 PID 暂不可读；为避免误停其他进程，已中止操作")
         adb = AdbController(ADB_SERIAL)
         adb.ensure_root_shell()
         _block_network_for_safe_stop(adb)
@@ -485,7 +490,6 @@ class SonarBoardWidget(QWidget):
         available_height = max(1.0, self.height() - padding_y * 2)
         tile_width = min(available_width / size, available_height * 2.0 / size)
         tile_height = tile_width / 2.0
-        board_width = tile_width * size
         board_height = tile_height * size
         origin_x = self.width() / 2.0
         origin_y = (self.height() - board_height) / 2.0

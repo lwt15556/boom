@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# ruff: noqa: E402 - this script supports direct execution outside the package.
+
 import json
 import sys
 from pathlib import Path

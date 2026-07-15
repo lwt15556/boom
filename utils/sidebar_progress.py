@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
 
@@ -237,50 +238,96 @@ def resolve_completed_ship_cells(
         for row, col in candidate_cells
         if 0 <= int(row) < grid_size and 0 <= int(col) < grid_size
     }
-    used: set[tuple[int, int]] = set()
-    placements: list[tuple[tuple[int, int], ...]] = []
-    unresolved: list[int] = []
+    lengths = tuple(sorted((int(length) for length in completed_lengths), reverse=True))
 
-    def placement_is_supported(placement: tuple[tuple[int, int], ...]) -> bool:
-        placement_cells = set(placement)
-        if not placement_cells.issubset(candidates) or placement_cells & used:
-            return False
+    def supported_placements(length: int) -> tuple[tuple[tuple[int, int], ...], ...]:
+        if length <= 0 or length > grid_size:
+            return ()
+
+        exact: set[tuple[tuple[int, int], ...]] = set()
+        for row in range(grid_size):
+            for start_col in range(grid_size - length + 1):
+                placement = tuple((row, col) for col in range(start_col, start_col + length))
+                if set(placement).issubset(candidates):
+                    exact.add(placement)
+        for col in range(grid_size):
+            for start_row in range(grid_size - length + 1):
+                placement = tuple((row, col) for row in range(start_row, start_row + length))
+                if set(placement).issubset(candidates):
+                    exact.add(placement)
+        return tuple(sorted(exact))
+
+    placements_by_length = {
+        length: supported_placements(length)
+        for length in set(lengths)
+    }
+
+    def placement_fits(
+        placement: tuple[tuple[int, int], ...],
+        used: frozenset[tuple[int, int]],
+    ) -> bool:
         return not any(
             max(abs(row - used_row), abs(col - used_col)) <= 1
             for row, col in placement
             for used_row, used_col in used
         )
 
-    for raw_length in sorted((int(length) for length in completed_lengths), reverse=True):
-        length = int(raw_length)
-        if length <= 0 or length > grid_size:
-            unresolved.append(length)
-            continue
+    @lru_cache(maxsize=None)
+    def solve(
+        index: int,
+        used: frozenset[tuple[int, int]],
+    ) -> tuple[
+        int,
+        int,
+        tuple[tuple[tuple[int, int], ...], ...],
+        tuple[int, ...],
+    ]:
+        if index >= len(lengths):
+            return 0, 0, (), ()
 
-        exact: list[tuple[tuple[int, int], ...]] = []
-        for row in range(grid_size):
-            for start_col in range(grid_size - length + 1):
-                placement = tuple((row, col) for col in range(start_col, start_col + length))
-                if placement_is_supported(placement):
-                    exact.append(placement)
-        for col in range(grid_size):
-            for start_row in range(grid_size - length + 1):
-                placement = tuple((row, col) for row in range(start_row, start_row + length))
-                if placement_is_supported(placement):
-                    exact.append(placement)
+        length = lengths[index]
+        skipped = solve(index + 1, used)
+        best = (
+            skipped[0],
+            skipped[1],
+            skipped[2],
+            (length,) + skipped[3],
+        )
 
-        if not exact:
-            unresolved.append(length)
-            continue
+        for placement in placements_by_length.get(length, ()):
+            if not placement_fits(placement, used):
+                continue
+            next_used = used | frozenset(placement)
+            remainder = solve(index + 1, next_used)
+            candidate = (
+                length + remainder[0],
+                1 + remainder[1],
+                (placement,) + remainder[2],
+                remainder[3],
+            )
+            candidate_score = candidate[:2]
+            best_score = best[:2]
+            if candidate_score > best_score or (
+                candidate_score == best_score
+                and (candidate[2], candidate[3]) < (best[2], best[3])
+            ):
+                best = candidate
+        return best
 
-        placement = min(exact, key=lambda item: (item[0][0], item[0][1], item[-1]))
-        placements.append(placement)
-        used.update(placement)
+    _resolved_cells, _resolved_count, placements, unresolved = solve(
+        0,
+        frozenset(),
+    )
+    used = {
+        cell
+        for placement in placements
+        for cell in placement
+    }
 
     return CompletedShipResolution(
         cells=frozenset(used),
-        placements=tuple(placements),
-        unresolved_lengths=tuple(unresolved),
+        placements=placements,
+        unresolved_lengths=unresolved,
         discarded_cells=frozenset(candidates - used),
     )
 

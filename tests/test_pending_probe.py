@@ -49,6 +49,28 @@ class PendingProbeTest(unittest.TestCase):
             self.assertFalse(update_pending_probe(path=path, phase="INTERRUPTED"))
             self.assertFalse(path.exists())
 
+    def test_corrupt_pending_probe_is_treated_as_interrupted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "pending_probe.json"
+            path.write_text("{not-json", encoding="utf-8")
+
+            payload = read_pending_probe(path)
+
+            self.assertTrue(has_pending_probe(path))
+            self.assertEqual(payload["phase"], "INTERRUPTED")
+            self.assertTrue(payload["state_unknown"])
+
+    def test_non_object_pending_probe_is_treated_as_interrupted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "pending_probe.json"
+            path.write_text("[]", encoding="utf-8")
+
+            payload = read_pending_probe(path)
+
+            self.assertTrue(has_pending_probe(path))
+            self.assertEqual(payload["phase"], "INTERRUPTED")
+            self.assertTrue(payload["state_unknown"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,8 @@
 import importlib
 import inspect
+import os
 import sys
+import tempfile
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -96,6 +98,24 @@ class MainFlowTest(unittest.TestCase):
         sys.modules.pop("main", None)
         self.main = importlib.import_module("main")
         self.adb = self.main.adb
+        self.runtime_temp = tempfile.TemporaryDirectory()
+        runtime_root = self.main.Path(self.runtime_temp.name)
+        self.runtime_path_patchers = [
+            patch.object(self.main, "PROBE_SAMPLE_DIR", runtime_root / "probes"),
+            patch.object(self.main, "RUNTIME_DIR", runtime_root / "runtime"),
+            patch.object(
+                self.main,
+                "STATUS_FILE",
+                runtime_root / "runtime" / "status.json",
+            ),
+            patch.object(
+                self.main,
+                "LEVEL_STATE_FILE",
+                runtime_root / "runtime" / "level_state.json",
+            ),
+        ]
+        for patcher in self.runtime_path_patchers:
+            patcher.start()
         self.pending_probe_patchers = [
             patch.object(self.main, "write_pending_probe"),
             patch.object(self.main, "update_pending_probe", return_value=False),
@@ -108,6 +128,9 @@ class MainFlowTest(unittest.TestCase):
     def tearDown(self):
         for patcher in reversed(self.pending_probe_patchers):
             patcher.stop()
+        for patcher in reversed(self.runtime_path_patchers):
+            patcher.stop()
+        self.runtime_temp.cleanup()
         sys.modules.pop("main", None)
         self.utils.AdbController = self.original_adb_controller
         FakeAdb.instances.clear()
@@ -124,11 +147,38 @@ class MainFlowTest(unittest.TestCase):
             confidence_by_cell={(1, 1): 0.9, (1, 2): 0.9},
         )
 
+    def test_rejected_second_instance_does_not_register_or_run_network_cleanup(self):
+        with (
+            patch.object(
+                self.main,
+                "acquire_main_lock",
+                side_effect=self.main.AlreadyRunningError("already running"),
+            ),
+            patch.object(self.main, "register_exit_cleanup") as register_cleanup,
+            patch.object(self.main, "cleanup_weak_network") as cleanup_weak,
+            patch.object(self.main, "cleanup_reject_network") as cleanup_reject,
+            patch.object(self.main, "release_main_lock") as release_lock,
+            patch.object(self.main.adb, "ensure_root_shell", create=True) as ensure_root,
+        ):
+            exit_code = self.main.run_main_entrypoint()
+
+        self.assertEqual(exit_code, 2)
+        register_cleanup.assert_not_called()
+        cleanup_weak.assert_not_called()
+        cleanup_reject.assert_not_called()
+        release_lock.assert_not_called()
+        ensure_root.assert_not_called()
+
     def test_red_mode_runs_configured_attempts_then_seeds_strategy(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 3)
         results = [self._valid_red_result() for _ in range(3)]
         with (
             patch.object(self.main, "_execute_red_scout_transaction", side_effect=results) as execute,
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
             patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
             patch.object(self.main, "write_runtime_status") as write_status,
         ):
@@ -143,16 +193,191 @@ class MainFlowTest(unittest.TestCase):
 
         self.assertTrue(completed)
         self.assertEqual(execute.call_count, 3)
+        online_hit.assert_called_once()
         self.assertEqual(execute.call_args.args[4], 3)
         self.assertEqual(execute.call_args.args[5], [(row, col) for row in range(3) for col in range(3)])
-        self.assertEqual(scan.call_args.kwargs["initial_scout_hits"], {(1, 2)})
+        self.assertEqual(scan.call_args.kwargs["initial_hits"], {(1, 2)})
+        self.assertEqual(scan.call_args.kwargs["initial_misses"], set())
+        self.assertEqual(scan.call_args.kwargs["initial_scout_hits"], set())
         self.assertEqual(scan.call_args.kwargs["initial_scout_misses"], {(1, 1)})
+        self.assertTrue(scan.call_args.kwargs["commit_scout_hits_online"])
         self.assertEqual(write_status.call_args.kwargs["phase"], "blue_attack")
         self.assertEqual(write_status.call_args.kwargs["red_scout_current"], 3)
         self.assertEqual(write_status.call_args.kwargs["red_scout_total"], 3)
         phases = [call.kwargs["phase"] for call in write_status.call_args_list if "phase" in call.kwargs]
         self.assertEqual(phases[-1], "blue_attack")
         self.assertEqual(phases.count("red_scout_capture"), 3)
+
+    def test_red_scout_commits_new_hits_online_before_next_red_attempt(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
+        first = self._valid_red_result()
+        second = self.main.RedScoutResult(
+            center_cell=(0, 0),
+            affected_cells=frozenset({(0, 0)}),
+            hit_cells=frozenset(),
+            miss_cells=frozenset({(0, 0)}),
+            unknown_cells=frozenset(),
+            footprint=first.footprint,
+            valid=True,
+            confidence_by_cell={(0, 0): 0.9},
+        )
+        events = []
+
+        def red_attempt(*_args):
+            result = first if not events else second
+            events.append(("red", result.center_cell))
+            return result
+
+        def online_hit(**kwargs):
+            events.append(("blue", kwargs["cell"]))
+            return self.main.ProbeResult.HIT
+
+        def finish_scan(*_args, **kwargs):
+            events.append(("scan", None))
+            return True
+
+        with (
+            patch.object(self.main, "_execute_red_scout_transaction", side_effect=red_attempt),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                side_effect=online_hit,
+            ) as online_commit,
+            patch.object(self.main, "_scan_level_by_strategy", side_effect=finish_scan) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _row in range(3)],
+                [(400, 300)] * 9,
+                [3],
+                set(),
+                settings,
+                initial_visual_hit_count=0,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual([event[0] for event in events], ["red", "blue", "red", "scan"])
+        self.assertTrue(online_commit.call_args.kwargs["activity_ready"])
+        self.assertEqual(scan.call_args.kwargs["initial_hits"], {(1, 2)})
+        self.assertEqual(scan.call_args.kwargs["initial_scout_hits"], set())
+        self.assertEqual(scan.call_args.kwargs["initial_visual_hit_count"], 1)
+
+    def test_repeated_red_scout_hit_is_committed_online_only_once(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
+        repeated = self._valid_red_result()
+
+        with (
+            patch.object(
+                self.main,
+                "_execute_red_scout_transaction",
+                side_effect=[repeated, repeated],
+            ),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True),
+        ):
+            self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _row in range(3)],
+                [(400, 300)] * 9,
+                [3],
+                set(),
+                settings,
+            )
+
+        online_hit.assert_called_once()
+        self.assertEqual(online_hit.call_args.kwargs["cell"], (1, 2))
+
+    def test_red_scout_false_positive_becomes_real_miss_before_final_scan(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+
+        with (
+            patch.object(
+                self.main,
+                "_execute_red_scout_transaction",
+                return_value=self._valid_red_result(),
+            ),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.MISS,
+            ),
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _row in range(3)],
+                [(400, 300)] * 9,
+                [3],
+                set(),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(scan.call_args.kwargs["initial_hits"], set())
+        self.assertEqual(scan.call_args.kwargs["initial_misses"], {(1, 2)})
+        self.assertEqual(scan.call_args.kwargs["initial_scout_hits"], set())
+        self.assertEqual(scan.call_args.kwargs["initial_scout_misses"], {(1, 1)})
+
+    def test_red_scout_does_not_commit_initial_visible_hit_again(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+
+        with (
+            patch.object(
+                self.main,
+                "_execute_red_scout_transaction",
+                return_value=self._valid_red_result(),
+            ),
+            patch.object(self.main, "_execute_online_scout_hit") as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _row in range(3)],
+                [(400, 300)] * 9,
+                [3],
+                {(1, 2)},
+                settings,
+            )
+
+        self.assertTrue(completed)
+        online_hit.assert_not_called()
+        self.assertEqual(scan.call_args.kwargs["initial_hits"], {(1, 2)})
+        self.assertEqual(scan.call_args.kwargs["initial_scout_hits"], set())
+
+    def test_online_blue_victory_stops_remaining_red_scout_attempts(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 3)
+        result = self._valid_red_result()
+
+        with (
+            patch.object(
+                self.main,
+                "_execute_red_scout_transaction",
+                return_value=result,
+            ) as red_attempt,
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT_AND_LEVEL_COMPLETE,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy") as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _row in range(3)],
+                [(400, 300)] * 9,
+                [3],
+                set(),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        red_attempt.assert_called_once()
+        online_hit.assert_called_once()
+        scan.assert_not_called()
 
     def test_red_mode_publishes_cumulative_board_after_each_attempt(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
@@ -188,6 +413,11 @@ class MainFlowTest(unittest.TestCase):
                 "_execute_red_scout_transaction",
                 side_effect=[first, second],
             ),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ),
             patch.object(self.main, "_scan_level_by_strategy", return_value=True),
             patch.object(self.main, "write_runtime_status") as write_status,
         ):
@@ -212,7 +442,7 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(first_board[0][1], "scout_miss")
         self.assertEqual(first_board[1][0], "hit")
         second_board = board_updates[1]["board_states"]
-        self.assertEqual(second_board[0][0], "scout_hit")
+        self.assertEqual(second_board[0][0], "hit")
         self.assertEqual(second_board[0][1], "scout_miss")
         self.assertEqual(second_board[1][0], "hit")
         self.assertEqual(second_board[2][1], "scout_miss")
@@ -255,6 +485,11 @@ class MainFlowTest(unittest.TestCase):
 
         with (
             patch.object(self.main, "_execute_red_scout_transaction", side_effect=execute),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ),
             patch.object(self.main, "_scan_level_by_strategy", return_value=True),
             patch.object(self.main, "write_runtime_status") as write_status,
         ):
@@ -287,6 +522,11 @@ class MainFlowTest(unittest.TestCase):
         with (
             patch.object(self.main.RedScoutPlanner, "choose_center", side_effect=[(1, 1), None]),
             patch.object(self.main, "_execute_red_scout_transaction", return_value=valid),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ),
             patch.object(self.main, "_scan_level_by_strategy", return_value=True),
             patch.object(self.main, "write_runtime_status") as write_status,
         ):
@@ -302,6 +542,11 @@ class MainFlowTest(unittest.TestCase):
         with (
             patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(1, 1)),
             patch.object(self.main, "_execute_red_scout_transaction", return_value=invalid),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ),
             patch.object(self.main, "_scan_level_by_strategy", return_value=True),
             patch.object(self.main, "write_runtime_status") as write_status,
         ):
@@ -309,6 +554,41 @@ class MainFlowTest(unittest.TestCase):
                 1, [[0] * 3 for _ in range(3)], [(0, 0)] * 9, [3], set(), settings
             )
         self.assertEqual(write_status.call_args.kwargs["red_scout_current"], 1)
+
+    def test_red_scout_never_reuses_center_after_invalid_results(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 3)
+        invalid = self._valid_red_result()
+        invalid = self.main.RedScoutResult(
+            center_cell=invalid.center_cell,
+            affected_cells=frozenset(),
+            hit_cells=frozenset(),
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=None,
+            valid=False,
+            confidence_by_cell={},
+        )
+        centers = []
+
+        def execute(_level, center, *_args):
+            centers.append(center)
+            return invalid
+
+        with (
+            patch.object(self.main, "_execute_red_scout_transaction", side_effect=execute),
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True),
+        ):
+            self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _row in range(3)],
+                [(0, 0)] * 9,
+                [3],
+                set(),
+                settings,
+            )
+
+        self.assertEqual(len(centers), 3)
+        self.assertEqual(len(set(centers)), 3)
 
     def test_red_phase_stops_before_blue_when_victory_appears_during_scout(self):
         completed_result = self.main.RedScoutResult(
@@ -359,6 +639,423 @@ class MainFlowTest(unittest.TestCase):
         self.assertTrue(completed)
         execute.assert_not_called()
         scan.assert_called_once()
+        self.assertNotIn("commit_scout_hits_online", scan.call_args.kwargs)
+
+    def test_online_scout_hit_keeps_network_connected_and_clicks_target_once(self):
+        hit_map = [[0, 0, 0] for _row in range(3)]
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=screenshot)
+
+        with (
+            patch.object(self.main, "wait_until_occur", return_value=DummyMatch((40, 38))),
+            patch.object(self.main, "handle_victory_prompt", return_value=False),
+            patch.object(
+                self.main,
+                "locate_red_bomb_button",
+                return_value=DummyMatch((1100, 660)),
+            ),
+            patch.object(self.main, "red_bomb_selected", return_value=False),
+            patch.object(
+                self.main,
+                "classify_diamond_hit",
+                side_effect=lambda *_args, **_kwargs: dummy_hit_result("hit"),
+            ),
+            patch.object(self.main, "find_victory_banner", return_value=None),
+            patch.object(self.main, "red_hit_marker_visible", return_value=False),
+            patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+            patch.object(self.main, "apply_wreck_template_confirmation", return_value=True),
+            patch.object(
+                self.main,
+                "apply_sidebar_completion_confirmation",
+                return_value=(False, None, ()),
+            ),
+            patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
+            patch.object(self.main, "_write_probe_status"),
+            patch.object(self.main, "_save_probe_result_json"),
+            patch.object(self.main, "append_recent_probe_result"),
+            patch.object(self.main, "write_runtime_status"),
+        ):
+            result = self.main._execute_online_scout_hit(
+                level=1,
+                hit_map=hit_map,
+                cell=(1, 1),
+                point=(640, 360),
+                index=4,
+                submarines=[3],
+            )
+
+        package_name = self.main.GAME_PACKAGE_NAME
+        self.assertEqual(result, self.main.ProbeResult.HIT)
+        self.assertEqual(hit_map[1][1], 1)
+        self.assertEqual(self.adb.calls.count(("click", 640, 360)), 1)
+        self.assertEqual(self.adb.calls.count(("click", *self.main.BLUE_BOMB_POINT)), 1)
+        self.assertIn(("disable_reject_network", package_name), self.adb.calls)
+        self.assertIn(("disable_weak_network", package_name), self.adb.calls)
+        self.assertNotIn(("enable_reject_network", package_name), self.adb.calls)
+        self.assertNotIn(("enable_weak_network", package_name), self.adb.calls)
+
+    def test_online_scout_hit_ready_fast_path_skips_redundant_waits(self):
+        hit_map = [[0, 0, 0] for _row in range(3)]
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=screenshot)
+        red_match = DummyMatch((1100, 660))
+
+        with (
+            patch.object(self.main, "wait_until_occur") as wait_until,
+            patch.object(self.main, "handle_victory_prompt", return_value=False),
+            patch.object(self.main, "detect_sidebar_progress", return_value=None),
+            patch.object(self.main, "find_template", return_value=DummyMatch((40, 38))),
+            patch.object(self.main, "locate_red_bomb_button", return_value=red_match),
+            patch.object(self.main, "red_bomb_selected", return_value=False),
+            patch.object(
+                self.main,
+                "classify_diamond_hit",
+                side_effect=lambda *_args, **_kwargs: dummy_hit_result("hit"),
+            ),
+            patch.object(self.main, "find_victory_banner", return_value=None),
+            patch.object(self.main, "red_hit_marker_visible", return_value=False),
+            patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+            patch.object(self.main, "apply_wreck_template_confirmation", return_value=True),
+            patch.object(
+                self.main,
+                "apply_sidebar_completion_confirmation",
+                return_value=(False, None, ()),
+            ),
+            patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
+            patch.object(self.main, "_write_probe_status"),
+            patch.object(self.main, "_save_probe_result_json"),
+            patch.object(self.main, "append_recent_probe_result"),
+            patch.object(self.main, "write_runtime_status"),
+        ):
+            result = self.main._execute_online_scout_hit(
+                level=1,
+                hit_map=hit_map,
+                cell=(1, 1),
+                point=(640, 360),
+                index=4,
+                submarines=[3],
+                activity_ready=True,
+            )
+
+        self.assertEqual(result, self.main.ProbeResult.HIT)
+        wait_until.assert_not_called()
+        self.assertNotIn(
+            ("delay", self.main.ONLINE_SCOUT_NETWORK_SETTLE_SECONDS),
+            self.adb.calls,
+        )
+        self.assertIn(("delay", 0.1), self.adb.calls)
+        self.assertNotIn(
+            ("delay", self.main.ONLINE_SCOUT_BLUE_SELECT_SETTLE_SECONDS),
+            self.adb.calls,
+        )
+        self.assertEqual(self.adb.read_screenshot.call_count, 6)
+
+    def test_fast_blue_selection_waits_remaining_window_when_switch_is_slow(self):
+        selection_screen = object()
+        early_screen = object()
+        confirmed_screen = object()
+        self.adb.read_screenshot = Mock(side_effect=[early_screen, confirmed_screen])
+
+        with (
+            patch.object(
+                self.main,
+                "locate_red_bomb_button",
+                return_value=DummyMatch((1100, 660)),
+            ),
+            patch.object(
+                self.main,
+                "red_bomb_selected",
+                side_effect=[True, False],
+            ) as selected,
+        ):
+            result = self.main._select_blue_bomb_for_online_scout(
+                self.main.Path("unused"),
+                selection_screen,
+                fast=True,
+            )
+
+        self.assertIs(result, confirmed_screen)
+        self.assertEqual(selected.call_count, 2)
+        self.assertIn(("delay", 0.1), self.adb.calls)
+        self.assertIn(("delay", 0.15), self.adb.calls)
+        self.assertEqual(self.adb.calls.count(("click", *self.main.BLUE_BOMB_POINT)), 1)
+
+    def test_blue_selection_refuses_to_fire_when_red_button_cannot_be_verified(self):
+        with patch.object(self.main, "locate_red_bomb_button", return_value=None):
+            with self.assertRaisesRegex(self.main.ProbeNotReadyError, "red bomb button"):
+                self.main._select_blue_bomb_for_online_scout(
+                    self.main.Path("unused"),
+                    object(),
+                    fast=True,
+                )
+
+        self.assertNotIn(("click", *self.main.BLUE_BOMB_POINT), self.adb.calls)
+
+    def test_standard_blue_selection_stops_when_red_bomb_remains_selected(self):
+        selection_screen = object()
+        before_screen = object()
+        red_match = DummyMatch((1100, 660))
+        self.adb.read_screenshot = Mock(return_value=before_screen)
+
+        with (
+            patch.object(
+                self.main,
+                "locate_red_bomb_button",
+                return_value=red_match,
+            ),
+            patch.object(
+                self.main,
+                "red_bomb_selected",
+                return_value=True,
+            ) as selected,
+        ):
+            with self.assertRaises(self.main.ProbeNotReadyError):
+                self.main._select_blue_bomb_for_online_scout(
+                    self.main.Path("unused"),
+                    selection_screen,
+                    fast=False,
+                )
+
+        selected.assert_called_once_with(before_screen, red_match)
+        self.assertIn(
+            ("delay", self.main.ONLINE_SCOUT_BLUE_SELECT_SETTLE_SECONDS),
+            self.adb.calls,
+        )
+        self.assertNotIn(("delay", 0.15), self.adb.calls)
+
+    def test_online_scout_hit_victory_frame_completes_level(self):
+        hit_map = [[0, 0, 0] for _row in range(3)]
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=screenshot)
+
+        with (
+            patch.object(self.main, "wait_until_occur", return_value=DummyMatch((40, 38))),
+            patch.object(
+                self.main,
+                "handle_victory_prompt",
+                side_effect=[False, True],
+            ) as handle_victory,
+            patch.object(
+                self.main,
+                "locate_red_bomb_button",
+                return_value=DummyMatch((1100, 660)),
+            ),
+            patch.object(self.main, "red_bomb_selected", return_value=False),
+            patch.object(
+                self.main,
+                "classify_diamond_hit",
+                side_effect=lambda *_args, **_kwargs: dummy_hit_result("miss"),
+            ),
+            patch.object(
+                self.main,
+                "find_victory_banner",
+                return_value=DummyMatch((640, 360)),
+            ),
+            patch.object(self.main, "red_hit_marker_visible", return_value=False),
+            patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+            patch.object(self.main, "apply_wreck_template_confirmation", return_value=False),
+            patch.object(
+                self.main,
+                "apply_sidebar_completion_confirmation",
+                return_value=(False, None, ()),
+            ),
+            patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
+            patch.object(self.main, "_write_probe_status"),
+            patch.object(self.main, "_save_probe_result_json"),
+            patch.object(self.main, "append_recent_probe_result"),
+            patch.object(self.main, "write_runtime_status"),
+        ):
+            result = self.main._execute_online_scout_hit(
+                level=1,
+                hit_map=hit_map,
+                cell=(1, 1),
+                point=(640, 360),
+                index=4,
+                submarines=[3],
+            )
+
+        self.assertEqual(result, self.main.ProbeResult.HIT_AND_LEVEL_COMPLETE)
+        self.assertEqual(hit_map[1][1], 1)
+        self.assertEqual(self.adb.calls.count(("click", 640, 360)), 1)
+        self.assertEqual(handle_victory.call_count, 2)
+
+    def test_online_scout_hit_unknown_stops_without_clicking_twice(self):
+        hit_map = [[0, 0, 0] for _row in range(3)]
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=screenshot)
+        weak_hit = dummy_hit_result("hit")
+        weak_hit.score = 0.70
+        weak_hit.confidence = 0.70
+        frame_results = [weak_hit] + [dummy_hit_result("miss") for _ in range(6)]
+
+        with (
+            patch.object(self.main, "wait_until_occur", return_value=DummyMatch((40, 38))),
+            patch.object(self.main, "handle_victory_prompt", return_value=False),
+            patch.object(
+                self.main,
+                "locate_red_bomb_button",
+                return_value=DummyMatch((1100, 660)),
+            ),
+            patch.object(self.main, "red_bomb_selected", return_value=False),
+            patch.object(
+                self.main,
+                "classify_diamond_hit",
+                side_effect=frame_results,
+            ),
+            patch.object(self.main, "find_victory_banner", return_value=None),
+            patch.object(self.main, "red_hit_marker_visible", return_value=False),
+            patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+            patch.object(
+                self.main,
+                "apply_wreck_template_confirmation",
+                side_effect=[True, False, False, False, False, False, False],
+            ),
+            patch.object(
+                self.main,
+                "apply_sidebar_completion_confirmation",
+                return_value=(False, None, ()),
+            ),
+            patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
+            patch.object(self.main, "_write_probe_status"),
+            patch.object(self.main, "_save_probe_result_json"),
+            patch.object(self.main, "append_recent_probe_result"),
+            patch.object(self.main, "write_runtime_status"),
+        ):
+            with self.assertRaises(self.main.ProbeProtocolError):
+                self.main._execute_online_scout_hit(
+                    level=1,
+                    hit_map=hit_map,
+                    cell=(1, 1),
+                    point=(640, 360),
+                    index=4,
+                    submarines=[3],
+                )
+
+        self.assertEqual(hit_map[1][1], 0)
+        self.assertEqual(self.adb.calls.count(("click", 640, 360)), 1)
+
+    def test_online_scout_hit_uses_extra_frames_without_firing_twice(self):
+        hit_map = [[0, 0, 0] for _row in range(3)]
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=screenshot)
+        weak_hit = dummy_hit_result("hit")
+        weak_hit.score = 0.70
+        weak_hit.confidence = 0.70
+        frame_results = (
+            [weak_hit]
+            + [dummy_hit_result("miss") for _ in range(3)]
+            + [dummy_hit_result("hit"), dummy_hit_result("hit"), dummy_hit_result("miss")]
+        )
+
+        with (
+            patch.object(self.main, "wait_until_occur", return_value=DummyMatch((40, 38))),
+            patch.object(self.main, "handle_victory_prompt", return_value=False),
+            patch.object(
+                self.main,
+                "locate_red_bomb_button",
+                return_value=DummyMatch((1100, 660)),
+            ),
+            patch.object(self.main, "red_bomb_selected", return_value=False),
+            patch.object(self.main, "classify_diamond_hit", side_effect=frame_results),
+            patch.object(self.main, "find_victory_banner", return_value=None),
+            patch.object(self.main, "red_hit_marker_visible", return_value=False),
+            patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+            patch.object(
+                self.main,
+                "apply_wreck_template_confirmation",
+                side_effect=[True, False, False, False, True, True, False],
+            ),
+            patch.object(
+                self.main,
+                "apply_sidebar_completion_confirmation",
+                return_value=(False, None, ()),
+            ),
+            patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
+            patch.object(self.main, "_write_probe_status"),
+            patch.object(self.main, "_save_probe_result_json"),
+            patch.object(self.main, "append_recent_probe_result"),
+            patch.object(self.main, "write_runtime_status"),
+        ):
+            result = self.main._execute_online_scout_hit(
+                level=1,
+                hit_map=hit_map,
+                cell=(1, 1),
+                point=(640, 360),
+                index=4,
+                submarines=[3],
+            )
+
+        self.assertEqual(result, self.main.ProbeResult.HIT)
+        self.assertEqual(hit_map[1][1], 1)
+        self.assertEqual(self.adb.calls.count(("click", 640, 360)), 1)
+        for delay in self.main.SUSPECT_HIT_EXTRA_FRAME_DELAYS:
+            self.assertIn(("delay", delay), self.adb.calls)
+
+    def test_online_scout_hit_skips_cell_that_is_already_visible(self):
+        hit_map = [[0, 0, 0] for _row in range(3)]
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=screenshot)
+
+        with (
+            patch.object(self.main, "wait_until_occur", return_value=DummyMatch((40, 38))),
+            patch.object(self.main, "handle_victory_prompt", return_value=False),
+            patch.object(self.main, "locate_red_bomb_button", return_value=None),
+            patch.object(self.main, "red_hit_marker_visible", return_value=True),
+            patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+            patch.object(self.main, "classify_diamond_hit") as classify,
+            patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
+            patch.object(self.main, "_write_probe_status"),
+            patch.object(self.main, "append_recent_probe_result"),
+            patch.object(self.main, "write_runtime_status"),
+        ):
+            result = self.main._execute_online_scout_hit(
+                level=1,
+                hit_map=hit_map,
+                cell=(1, 1),
+                point=(640, 360),
+                index=4,
+                submarines=[3],
+            )
+
+        self.assertEqual(result, self.main.ProbeResult.HIT)
+        self.assertEqual(hit_map[1][1], 1)
+        self.assertEqual(self.adb.calls.count(("click", 640, 360)), 0)
+        classify.assert_not_called()
+
+    def test_online_scout_hit_stops_before_click_when_sidebar_is_complete(self):
+        hit_map = [[0, 0, 0] for _row in range(3)]
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=screenshot)
+        completed_progress = SidebarProgress(completed_lengths=(3,))
+
+        with (
+            patch.object(
+                self.main,
+                "handle_victory_prompt",
+                side_effect=[False, True],
+            ) as handle_victory,
+            patch.object(
+                self.main,
+                "detect_sidebar_progress",
+                return_value=completed_progress,
+            ),
+            patch.object(self.main, "classify_diamond_hit") as classify,
+            patch.object(self.main, "write_runtime_status"),
+        ):
+            result = self.main._execute_online_scout_hit(
+                level=1,
+                hit_map=hit_map,
+                cell=(1, 1),
+                point=(640, 360),
+                index=4,
+                submarines=[3],
+            )
+
+        self.assertEqual(result, self.main.ProbeResult.LEVEL_COMPLETE)
+        self.assertNotIn(("click", *self.main.BLUE_BOMB_POINT), self.adb.calls)
+        self.assertNotIn(("click", 640, 360), self.adb.calls)
+        self.assertEqual(handle_victory.call_count, 2)
+        classify.assert_not_called()
 
     def test_invalid_red_result_still_preserves_classified_observations(self):
         invalid = self._valid_red_result()
@@ -375,12 +1072,18 @@ class MainFlowTest(unittest.TestCase):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
         with (
             patch.object(self.main, "_execute_red_scout_transaction", return_value=invalid),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ),
             patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
         ):
             self.main._run_red_scout_and_blue_strategy(
                 1, [[0] * 3 for _ in range(3)], [(0, 0)] * 9, [3], set(), settings
             )
-        self.assertEqual(scan.call_args.kwargs["initial_scout_hits"], {(1, 2)})
+        self.assertEqual(scan.call_args.kwargs["initial_hits"], {(1, 2)})
+        self.assertEqual(scan.call_args.kwargs["initial_scout_hits"], set())
         self.assertEqual(scan.call_args.kwargs["initial_scout_misses"], {(1, 1)})
 
     def test_red_phase_ends_when_planner_has_no_center(self):
@@ -408,6 +1111,11 @@ class MainFlowTest(unittest.TestCase):
 
         with (
             patch.object(self.main, "_execute_red_scout_transaction", side_effect=execute),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ),
             patch.object(self.main, "_scan_level_by_strategy", return_value=True),
         ):
             self.main._run_red_scout_and_blue_strategy(
@@ -432,9 +1140,24 @@ class MainFlowTest(unittest.TestCase):
             valid=True, confidence_by_cell={(1, 1): 0.9, (2, 1): 0.9},
         )
         planner_calls = []
+        planned_centers = iter(((1, 1), (0, 0), (0, 2)))
+
+        def choose_center(footprint, **_kwargs):
+            planner_calls.append(footprint)
+            return next(planned_centers)
+
         with (
-            patch.object(self.main.RedScoutPlanner, "choose_center", side_effect=lambda footprint, **kwargs: (planner_calls.append(footprint) or (1, 1))),
+            patch.object(
+                self.main.RedScoutPlanner,
+                "choose_center",
+                side_effect=choose_center,
+            ),
             patch.object(self.main, "_execute_red_scout_transaction", side_effect=[first, second, second]),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ),
             patch.object(self.main, "_scan_level_by_strategy", return_value=True),
         ):
             self.main._run_red_scout_and_blue_strategy(
@@ -493,6 +1216,57 @@ class MainFlowTest(unittest.TestCase):
             wreck_detection.visible_wreck_static_detected,
         )
 
+    def test_get_click_points_rejects_unsafe_saved_calibration_and_uses_auto(self):
+        image = np.zeros((100, 100, 3), dtype=np.uint8)
+        quad = np.array(
+            [[50, 10], [90, 50], [50, 90], [10, 50]],
+            dtype=np.float32,
+        )
+        auto_points = [
+            (50, 24), (63, 37), (76, 50),
+            (37, 37), (50, 50), (63, 63),
+            (24, 50), (37, 63), (50, 76),
+        ]
+        unsafe_saved = auto_points.copy()
+        unsafe_saved[-1] = (500, 500)
+
+        with (
+            patch.object(self.main, "read_saved_points", return_value=unsafe_saved),
+            patch.object(self.main, "read_saved_quad", return_value=quad),
+            patch.object(
+                self.main,
+                "detect_diamond_centers",
+                return_value=SimpleNamespace(points=auto_points, global_quad=quad),
+            ) as detect,
+        ):
+            points, detected_quad = self.main.get_click_points(1, image)
+
+        self.assertEqual(points, auto_points)
+        np.testing.assert_array_equal(detected_quad, quad)
+        detect.assert_called_once_with(image, 3)
+
+    def test_get_click_points_stops_before_probe_when_auto_geometry_is_unsafe(self):
+        image = np.zeros((100, 100, 3), dtype=np.uint8)
+        degenerate_quad = np.array(
+            [[10, 10], [20, 20], [30, 30], [40, 40]],
+            dtype=np.float32,
+        )
+        duplicate_points = [(50, 50)] * 9
+
+        with (
+            patch.object(self.main, "USE_SAVED_POINTS", False),
+            patch.object(
+                self.main,
+                "detect_diamond_centers",
+                return_value=SimpleNamespace(
+                    points=duplicate_points,
+                    global_quad=degenerate_quad,
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "unsafe grid calibration"),
+        ):
+            self.main.get_click_points(1, image)
+
     def test_red_scout_never_clicks_grid_when_isolation_is_unsafe(self):
         self.adb.verify_app_network_isolated = Mock(
             return_value=SimpleNamespace(safe=False, detail="ipv6 unblocked")
@@ -506,6 +1280,24 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(self.main._network_fail_closed_reason, "ipv6 unblocked")
         self.main.cleanup_weak_network("unsafe preflight")
         self.assertNotIn(("disable_weak_network", self.main.GAME_PACKAGE_NAME), self.adb.calls)
+
+    def test_red_scout_fails_closed_when_network_verification_errors(self):
+        self.adb.verify_app_network_isolated = Mock(
+            side_effect=RuntimeError("adb unavailable")
+        )
+
+        with self.assertRaisesRegex(self.main.RedScoutSafetyError, "adb unavailable"):
+            self.main._execute_red_scout_transaction(
+                level=1,
+                center_cell=(1, 1),
+                point=(100, 200),
+                index=0,
+                grid_size=3,
+                all_click_points=[(0, 0)] * 9,
+            )
+
+        self.assertNotIn(("click", 100, 200), self.adb.calls)
+        self.assertIn("verification failed", self.main._network_fail_closed_reason)
 
     def test_red_selection_failure_clears_active_probe_without_fail_closed_stop(self):
         with (
@@ -591,7 +1383,6 @@ class MainFlowTest(unittest.TestCase):
             unknown_cells=frozenset(), footprint=self.main.RedFootprint(frozenset({(0, 0), (0, 1)})),
             valid=True, confidence_by_cell={(1, 1): 0.9, (1, 2): 0.9},
         )
-        transaction = self.main.ProbeTransaction(1, (1, 1), 0)
         events = []
 
         def exit_red_activity(*_args, **_kwargs):
@@ -1076,6 +1867,55 @@ class MainFlowTest(unittest.TestCase):
             self.adb.calls,
         )
 
+    def test_victory_handler_refuses_network_restore_while_probe_is_pending(self):
+        transaction = self.main.ProbeTransaction(level=1, cell=(0, 0), index=0)
+        transaction.advance(self.main.ProbePhase.REQUEST_PENDING)
+        self.main._active_probe = transaction
+        screenshot = np.zeros((20, 20, 3), dtype=np.uint8)
+
+        with (
+            patch.object(
+                self.main,
+                "find_victory_banner",
+                return_value=DummyMatch((10, 10)),
+            ),
+            self.assertRaisesRegex(self.main.ProbeProtocolError, "待提交"),
+        ):
+            self.main.handle_victory_prompt(
+                timeout=0.0,
+                screenshot=screenshot,
+                restore_network=True,
+            )
+
+        self.assertNotIn(
+            ("disable_reject_network", self.main.GAME_PACKAGE_NAME),
+            self.adb.calls,
+        )
+        self.assertNotIn(
+            ("disable_weak_network", self.main.GAME_PACKAGE_NAME),
+            self.adb.calls,
+        )
+        self.assertNotIn(("click", *self.main.SCREEN_CONTINUE_POINT), self.adb.calls)
+
+    def test_next_level_retry_never_blind_clicks_grid_without_victory_banner(self):
+        with (
+            patch.object(self.main, "LEVEL_ADVANCE_RETRIES", 1),
+            patch.object(
+                self.main,
+                "resolve_current_level_from_device",
+                return_value=7,
+            ),
+            patch.object(self.main, "handle_victory_prompt", return_value=False),
+            patch.object(self.main, "enter_activity"),
+        ):
+            next_level = self.main.resolve_next_level_with_retries(
+                current_level=7,
+                fallback_level=8,
+            )
+
+        self.assertIsNone(next_level)
+        self.assertNotIn(("click", *self.main.SCREEN_CONTINUE_POINT), self.adb.calls)
+
     def test_enter_activity_recovers_after_activity_button_missing(self):
         waits = iter(
             [
@@ -1260,6 +2100,72 @@ class MainFlowTest(unittest.TestCase):
         self.assertNotIn(("disable_weak_network", package_name), self.adb.calls)
         self.assertFalse(self.main._weak_network_cleanup_done)
 
+    def test_cleanup_keeps_reject_when_probe_request_may_be_pending(self):
+        transaction = self.main.ProbeTransaction(level=1, cell=(0, 0), index=0)
+        transaction.advance(self.main.ProbePhase.REQUEST_PENDING)
+        self.main._active_probe = transaction
+
+        self.main.cleanup_reject_network("测试清理")
+
+        self.assertNotIn(
+            ("disable_reject_network", self.main.GAME_PACKAGE_NAME),
+            self.adb.calls,
+        )
+
+    def test_cleanup_keeps_reject_when_network_is_fail_closed(self):
+        self.main.latch_network_fail_closed("safety state unknown")
+
+        self.main.cleanup_reject_network("测试清理")
+
+        self.assertNotIn(
+            ("disable_reject_network", self.main.GAME_PACKAGE_NAME),
+            self.adb.calls,
+        )
+
+    def test_connection_dialog_restores_drop_and_reject_before_retry(self):
+        retry = DummyMatch((320, 240))
+        with (
+            patch.object(
+                self.main,
+                "wait_until_connection_interrupted_dialog",
+                return_value=DummyMatch((100, 100)),
+            ),
+            patch.object(self.main, "wait_until_retry_button", return_value=retry),
+        ):
+            handled = self.main.handle_connection_interrupted_prompt(timeout=8.0)
+
+        package_name = self.main.GAME_PACKAGE_NAME
+        self.assertTrue(handled)
+        self.assertLess(
+            self.adb.calls.index(("disable_weak_network", package_name)),
+            self.adb.calls.index(("disable_reject_network", package_name)),
+        )
+        self.assertLess(
+            self.adb.calls.index(("disable_reject_network", package_name)),
+            self.adb.calls.index(("click", *retry.center)),
+        )
+
+    def test_connection_dialog_never_restores_network_for_pending_probe(self):
+        transaction = self.main.ProbeTransaction(level=1, cell=(0, 0), index=0)
+        transaction.advance(self.main.ProbePhase.REQUEST_PENDING)
+        self.main._active_probe = transaction
+
+        with (
+            patch.object(self.main, "wait_until_connection_interrupted_dialog") as dialog,
+            self.assertRaisesRegex(self.main.ProbeProtocolError, "待提交"),
+        ):
+            self.main.handle_connection_interrupted_prompt(timeout=8.0)
+
+        dialog.assert_not_called()
+        self.assertNotIn(
+            ("disable_weak_network", self.main.GAME_PACKAGE_NAME),
+            self.adb.calls,
+        )
+        self.assertNotIn(
+            ("disable_reject_network", self.main.GAME_PACKAGE_NAME),
+            self.adb.calls,
+        )
+
     def test_runtime_status_retries_when_windows_reader_temporarily_locks_file(self):
         replace = patch.object(
             self.main.Path,
@@ -1271,13 +2177,34 @@ class MainFlowTest(unittest.TestCase):
 
         self.assertEqual(replace_mock.call_count, 2)
 
+    def test_probe_sample_retention_removes_only_old_managed_directories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = self.main.Path(temp_dir)
+            managed = []
+            for index in range(3):
+                directory = root / f"level_1_cell_{index}_sample"
+                directory.mkdir()
+                (directory / "status.json").write_text("{}", encoding="utf-8")
+                os.utime(directory, (index + 1, index + 1))
+                managed.append(directory)
+            unrelated = root / "manual_reference"
+            unrelated.mkdir()
+            (unrelated / "keep.txt").write_text("keep", encoding="utf-8")
+
+            with patch.object(self.main, "PROBE_SAMPLE_DIR", root):
+                self.main._prune_probe_sample_dirs(max_directories=2)
+
+            self.assertFalse(managed[0].exists())
+            self.assertTrue(managed[1].exists())
+            self.assertTrue(managed[2].exists())
+            self.assertTrue(unrelated.exists())
+
     def test_loose_wreck_template_alone_does_not_promote_miss_to_hit(self):
         result = dummy_hit_result("miss")
 
         with (
             patch.object(self.main, "red_hit_marker_visible", return_value=False),
             patch.object(self.main, "visible_wreck_static_detected", return_value=False),
-            patch.object(self.main, "wreck_template_visible", return_value=True),
         ):
             confirmed = self.main.apply_wreck_template_confirmation(
                 object(),
@@ -1465,6 +2392,43 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(update_progress.call_args.args[1], 7)
         self.assertEqual(len(self.main._runtime_status.get("board_states", [])), 9)
 
+    def test_strategy_records_initial_misses_as_real_results(self):
+        strategy = SimpleNamespace(
+            shots={},
+            blocked_cells=set(),
+            done=True,
+            remaining={},
+            get_accounted_completed_lengths=lambda: [],
+            get_confirmed_ships=lambda: [],
+        )
+
+        def report_result(cell, hit):
+            strategy.shots[cell] = hit
+
+        strategy.report_result = Mock(side_effect=report_result)
+        fake_bar = SimpleNamespace(total=3, n=0, set_postfix_str=lambda *_args, **_kwargs: None)
+
+        with (
+            patch.object(self.main, "SubmarineStrategy", return_value=strategy),
+            patch.object(self.main, "load_saved_level_shots", return_value={}),
+            patch.object(self.main, "fixed_progress_bar", return_value=nullcontext(fake_bar)),
+            patch.object(self.main, "update_fixed_progress"),
+            patch.object(self.main, "save_level_shots") as save_shots,
+        ):
+            completed = self.main._scan_level_by_strategy(
+                level=1,
+                hit_map=[[0] * 3 for _row in range(3)],
+                click_points=[(400, 300)] * 9,
+                submarines=[3],
+                initial_misses={(0, 1)},
+            )
+
+        self.assertTrue(completed)
+        strategy.report_result.assert_called_once_with((0, 1), False)
+        self.assertEqual(strategy.shots, {(0, 1): False})
+        save_shots.assert_called_with(1, 3, {(0, 1): False})
+        self.assertEqual(self.main._runtime_status["board_states"][0][1], "miss")
+
     def test_strategy_does_not_record_old_cell_after_delayed_victory(self):
         report_result = Mock()
         strategy = SimpleNamespace(
@@ -1499,6 +2463,114 @@ class MainFlowTest(unittest.TestCase):
         self.assertTrue(completed)
         report_result.assert_not_called()
         self.assertEqual(self.main._runtime_status.get("phase"), "level_complete")
+
+    def test_strategy_commits_scout_hit_online_before_offline_probe(self):
+        hit_map = [[0] * 3 for _row in range(3)]
+        fake_bar = SimpleNamespace(total=1, n=0, set_postfix_str=lambda *_args, **_kwargs: None)
+
+        with (
+            patch.object(self.main, "load_saved_level_shots", return_value={}),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_probe_cell") as offline_probe,
+            patch.object(self.main, "fixed_progress_bar", return_value=nullcontext(fake_bar)),
+            patch.object(self.main, "update_fixed_progress"),
+            patch.object(self.main, "save_level_shots"),
+        ):
+            completed = self.main._scan_level_by_strategy(
+                level=1,
+                hit_map=hit_map,
+                click_points=[(400, 300)] * 9,
+                submarines=[1],
+                initial_scout_hits={(1, 1)},
+                commit_scout_hits_online=True,
+                initial_visual_hit_count=0,
+            )
+
+        self.assertTrue(completed)
+        online_hit.assert_called_once()
+        self.assertEqual(online_hit.call_args.kwargs["cell"], (1, 1))
+        self.assertEqual(online_hit.call_args.kwargs["point"], (400, 300))
+        offline_probe.assert_not_called()
+        self.assertEqual(self.main._runtime_status.get("last_result"), "hit")
+
+    def test_strategy_commits_all_scout_hits_online_before_unknown_cell(self):
+        events = []
+        fake_bar = SimpleNamespace(total=3, n=0, set_postfix_str=lambda *_args, **_kwargs: None)
+
+        def online_hit(**kwargs):
+            events.append(("online", kwargs["cell"]))
+            return self.main.ProbeResult.HIT
+
+        def offline_probe(_level, _hit_map, cell, _point, _index, probe_metadata=None):
+            events.append(("offline", cell))
+            return self.main.ProbeResult.LEVEL_COMPLETE
+
+        with (
+            patch.object(self.main, "load_saved_level_shots", return_value={}),
+            patch.object(self.main, "_execute_online_scout_hit", side_effect=online_hit),
+            patch.object(self.main, "_probe_cell", side_effect=offline_probe),
+            patch.object(self.main, "fixed_progress_bar", return_value=nullcontext(fake_bar)),
+            patch.object(self.main, "update_fixed_progress"),
+            patch.object(self.main, "save_level_shots"),
+        ):
+            completed = self.main._scan_level_by_strategy(
+                level=1,
+                hit_map=[[0] * 3 for _row in range(3)],
+                click_points=[(400, 300)] * 9,
+                submarines=[3],
+                initial_scout_hits={(1, 1), (1, 2)},
+                commit_scout_hits_online=True,
+                initial_visual_hit_count=0,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual([event[0] for event in events[:2]], ["online", "online"])
+        self.assertEqual(events[2][0], "offline")
+        self.assertEqual({event[1] for event in events[:2]}, {(1, 1), (1, 2)})
+
+    def test_online_scout_false_positive_does_not_increase_hit_progress(self):
+        fake_bar = SimpleNamespace(total=1, n=0, set_postfix_str=lambda *_args, **_kwargs: None)
+
+        with (
+            patch.object(self.main, "load_saved_level_shots", return_value={}),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.MISS,
+            ),
+            patch.object(
+                self.main,
+                "_probe_cell",
+                return_value=self.main.ProbeResult.LEVEL_COMPLETE,
+            ),
+            patch.object(self.main, "fixed_progress_bar", return_value=nullcontext(fake_bar)),
+            patch.object(self.main, "update_fixed_progress"),
+            patch.object(self.main, "save_level_shots"),
+            patch.object(self.main, "write_runtime_status") as write_status,
+        ):
+            completed = self.main._scan_level_by_strategy(
+                level=1,
+                hit_map=[[0] * 3 for _row in range(3)],
+                click_points=[(400, 300)] * 9,
+                submarines=[1],
+                initial_scout_hits={(1, 1)},
+                commit_scout_hits_online=True,
+                initial_visual_hit_count=0,
+            )
+
+        self.assertTrue(completed)
+        miss_updates = [
+            call.kwargs
+            for call in write_status.call_args_list
+            if call.kwargs.get("last_result") == "miss"
+        ]
+        self.assertEqual(len(miss_updates), 1)
+        self.assertEqual(miss_updates[0]["hits"], 0)
+        self.assertEqual(miss_updates[0]["board_states"][1][1], "miss")
 
     def test_strategy_records_final_hit_before_finishing_level(self):
         strategy = SimpleNamespace(
@@ -1725,6 +2797,114 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(result, self.main.ProbeResult.MISS)
         self.assertIn(drop_call, self.adb.calls)
         self.assertLess(self.adb.calls.index(drop_call), self.adb.calls.index(target_click))
+
+    def test_blue_probe_refuses_to_click_when_network_isolation_is_unsafe(self):
+        hit_map = [[0, 0], [0, 0]]
+        self.adb.verify_app_network_isolated = Mock(
+            return_value=SimpleNamespace(safe=False, detail="ipv6 unblocked")
+        )
+
+        with (
+            patch.object(self.main, "wait_until_occur", return_value=DummyMatch((1, 1))),
+            patch.object(self.main, "sleep"),
+            patch.object(self.main, "write_pending_probe") as write_pending,
+            self.assertRaisesRegex(self.main.ProbeProtocolError, "ipv6 unblocked"),
+        ):
+            self.main._execute_probe_transaction(
+                level=1,
+                hit_map=hit_map,
+                cell=(0, 1),
+                point=(400, 300),
+                index=1,
+            )
+
+        self.assertNotIn(("click", 400, 300), self.adb.calls)
+        write_pending.assert_not_called()
+        self.assertEqual(self.main._network_fail_closed_reason, "ipv6 unblocked")
+
+    def test_blue_probe_fails_closed_when_network_verification_errors(self):
+        hit_map = [[0, 0], [0, 0]]
+        self.adb.verify_app_network_isolated = Mock(
+            side_effect=RuntimeError("adb unavailable")
+        )
+
+        with (
+            patch.object(self.main, "wait_until_occur", return_value=DummyMatch((1, 1))),
+            patch.object(self.main, "sleep"),
+            patch.object(self.main, "write_pending_probe") as write_pending,
+            self.assertRaisesRegex(self.main.ProbeProtocolError, "adb unavailable"),
+        ):
+            self.main._execute_probe_transaction(
+                level=1,
+                hit_map=hit_map,
+                cell=(0, 1),
+                point=(400, 300),
+                index=1,
+            )
+
+        self.assertNotIn(("click", 400, 300), self.adb.calls)
+        write_pending.assert_not_called()
+        self.assertIn("verification failed", self.main._network_fail_closed_reason)
+
+    def test_blue_probe_persists_pending_marker_before_click_and_clears_after_discard(self):
+        events = []
+        hit_map = [[0, 0], [0, 0]]
+
+        def click(x, y):
+            events.append(("click", x, y))
+
+        def discard(transaction):
+            transaction.advance(self.main.ProbePhase.REQUEST_DISCARDED)
+            transaction.advance(self.main.ProbePhase.LOGIN_RECOVERING)
+            transaction.advance(self.main.ProbePhase.COMPLETE)
+            return False
+
+        self.adb.click = Mock(side_effect=click)
+        with (
+            patch.object(self.main, "wait_until_occur", return_value=DummyMatch((1, 1))),
+            patch.object(self.main, "_exit_activity_after_probe_click"),
+            patch.object(self.main, "_reenter_activity_for_probe_result", return_value=False),
+            patch.object(self.main, "red_hit_marker_visible", return_value=False),
+            patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+            patch.object(self.main, "classify_diamond_hit", return_value=dummy_hit_result("miss")),
+            patch.object(self.main, "apply_wreck_template_confirmation", return_value=False),
+            patch.object(self.main, "get_configured_submarines", return_value=[]),
+            patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
+            patch.object(self.main, "_write_probe_status"),
+            patch.object(self.main, "_save_probe_result_json"),
+            patch.object(self.main, "append_recent_probe_result"),
+            patch.object(
+                self.main,
+                "write_pending_probe",
+                side_effect=lambda **kwargs: events.append(("marker", kwargs)),
+            ),
+            patch.object(self.main, "update_pending_probe", return_value=True),
+            patch.object(
+                self.main,
+                "clear_pending_probe",
+                side_effect=lambda: events.append(("clear",)),
+            ),
+            patch.object(
+                self.main,
+                "_discard_pending_request_and_prepare_next_probe",
+                side_effect=discard,
+            ),
+        ):
+            result = self.main._execute_probe_transaction(
+                level=1,
+                hit_map=hit_map,
+                cell=(0, 1),
+                point=(400, 300),
+                index=1,
+            )
+
+        self.assertEqual(result, self.main.ProbeResult.MISS)
+        marker_index = next(i for i, event in enumerate(events) if event[0] == "marker")
+        click_index = next(i for i, event in enumerate(events) if event[0] == "click")
+        clear_index = next(i for i, event in enumerate(events) if event[0] == "clear")
+        self.assertLess(marker_index, click_index)
+        self.assertLess(click_index, clear_index)
+        self.assertEqual(events[marker_index][1]["mode"], "blue_probe")
 
     def test_miss_discard_force_stops_before_network_restore(self):
         transaction = self.main.ProbeTransaction(level=1, cell=(0, 1), index=1)

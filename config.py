@@ -19,12 +19,13 @@ SCREENSHOT_DIR = BASE_DIR / "_debug" / "screenshots"
 LOG_DIR = BASE_DIR / "_debug" / "logs"
 LOG_FILE = LOG_DIR / "bbma.log"
 OUTPUT_DIR = BASE_DIR / "outputs"
+MAX_PROBE_SAMPLE_DIRS: Final[int] = 120
 
 
 # 目前支持的最大关卡
 MAX_LEVEL: Final[int] = 50
 
-# 第 10 海域及以上关卡使用的默认潜艇长度列表
+# 自动识别不可用时使用的默认回退关卡
 DEFAULT_LEVEL: Final[int] = 2
 
 # Automatic level recognition from save_points/imgs reference screenshots.
@@ -34,6 +35,7 @@ LEVEL_REFERENCE_DIR = BASE_DIR / "save_points" / "imgs"
 LEVEL_DETECTION_MIN_SCORE: Final[float] = 0.62
 LEVEL_DETECTION_MIN_MARGIN: Final[float] = 0.08
 
+# 第 11 海域及以上关卡使用的默认潜艇长度列表
 DEFAULT_SUBMARINES: Final[tuple[int, ...]] = (2, 2, 3, 4, 5)
 
 # 固定关卡对应的潜艇长度列表，供前 10 个关卡使用
@@ -60,7 +62,7 @@ LEVEL_GRID_SIZES: Final[dict[int, int]] = {
     6: 8,
     7: 9,
     8: 10,
-    9: 10,   
+    9: 10,
     10: 10,
     **{
         level: 10

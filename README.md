@@ -14,31 +14,24 @@
 - 舍弃原有全海域迭代，使用潜艇搜索策略减少实际探测次数。
 - 优先使用人工校准后的固定点位，点位缺失或数量不匹配时回退到自动识别。
 - 通过 root ADB shell 使用 iptables 按游戏 UID 控制 DROP 弱网和 REJECT 断网。
+- 蓝色离线探测与红色侦察在点击前都会核验 IPv4/IPv6 隔离状态；状态不可信时保持断网并停止。
+- 支持“仅蓝色炮弹”和“红色侦察 + 蓝色攻击”两种模式，红色次数可在控制台设置为 1 至 10。
+- 红色侦察每次得到可靠命中后，会立即切换蓝色炮弹在线提交这些点位，再继续下一次侦察。
+- 使用进程生命周期文件锁保证 `main.py` 单实例运行，并持久化待处理探测事务用于崩溃恢复。
 - 主流程通过日志输出状态、命中矩阵和结果图片路径。
 - 弱网探索使用固定在终端底部的 `tqdm` 进度条，普通日志在上方滚动；底栏显示已找到潜艇格、已确认潜艇、探测次数、最坏剩余次数和脚本累计运行时间。
+- 提供 PyQt6 运行控制台，可启动、停止、恢复网络、检查模拟器、查看实时日志和棋盘状态。
 - 提供 PyQt6 调试工具，用于实时坐标查看、鼠标手势标点、ROI 选区、完整截图保存、模板保存、人工校准点位、弱网和断网开关诊断。
+- 探测取证目录默认只保留最近 120 个批次，避免 `_debug/screenshots/probes/` 无限增长。
 
-## Update
+## 当前版本
 
-2026.7 (new)
-- 拓展支持海域到 1 至 50 号海域
----
-- 进入活动流程改为最多 5 次有限重试，失败时重启游戏、等待登录后再重新进入。
-- 主流程输出统一走日志，命中矩阵和结果图片路径会记录到 `_debug/logs/bbma.log`。
-- 补充主流程入口恢复逻辑的单元测试。
----
-- 简化海域配置生成逻辑
----
-- 更新了 _debug/debug_gui.py 添加了完整截图、跳转标记、鼠标左右键选中的快捷操作
-- 调整断网延迟，降低重试时仍断网的几率
----
-- 舍弃原有全海域逐格迭代，改用潜艇搜索策略，大幅加快探索速度。
-- 当前已完全支持 1 至 ~~11~~ 50 号海域的自动化搜索算法探索。（其实就是复用14号海域，后续海域重复无变化）
-- 添加对自动化搜索算法的单元测试。
----
-- 完全修复弱网不稳定问题使用 REJECT 断网消除本地缓存。
-- 优化程序流程，大幅加快运行速度。
-- 网络控制已区分为两类规则：DROP 弱网和 REJECT 断网。
+- 支持 1 至 50 号海域的网格、参考图和点位配置。
+- 使用潜艇搜索策略、命中邻格追击、完整潜艇安全区和保守逐格回退减少投弹次数。
+- 支持从可见残骸和左侧潜艇进度恢复中途关卡状态。
+- 支持红色炮弹离线侦察、蓝色炮弹即时提交和累计棋盘展示。
+- 网络事务使用 pending 标记、DROP/REJECT 双规则、进程退出确认和 fail-closed 恢复保护。
+- 控制台与日志均使用 UTF-8，并提供关键日志过滤和棋盘状态显示。
 
 ## 项目结构
 
@@ -46,9 +39,16 @@
 .
 ├── main.py                    # 主入口，执行自动化流程
 ├── config.py                  # 路径、ADB 设备、包名、日志、网格和模板匹配配置
+├── run_control_panel.ps1      # 启动桌面运行控制台
+├── run_with_overlay.ps1       # 启动主程序和模拟器左侧日志悬浮窗
+├── stop_all.ps1               # 安全停止主程序并恢复网络
 ├── take_screenshot.py         # 保存海域截图到 save_points/imgs/，用于新增海域点位校准
 ├── requirements.txt           # Python 依赖
 ├── template/                  # 模板匹配所需图片
+├── tools/
+│   ├── control_panel.py       # 运行控制、日志和棋盘状态桌面界面
+│   ├── log_overlay.py         # Windows 日志悬浮窗
+│   └── platform-tools/        # 项目随附的 Windows ADB 工具
 ├── save_points/
 │   ├── points.py              # 点位 JSON 读写、生成和读取工具
 │   └── points.json            # 人工/自动生成的固定点位数据
@@ -58,8 +58,13 @@
 │   ├── diamond_centers.py     # 菱形网格检测与中心点计算
 │   ├── diamond_hit.py         # 点击前后截图对比与命中判断
 │   ├── hit_map.py             # 命中矩阵投影与可视化图片输出
+│   ├── pending_probe.py       # 待处理炮弹事务的持久化安全标记
 │   ├── probe_protocol.py      # 单次弱网探测状态机与安全转换
+│   ├── red_scout.py           # 红色侦察识别、规划和弹药指纹
+│   ├── runtime_lock.py        # 主程序单实例文件锁和 PID 状态
+│   ├── sidebar_progress.py    # 左侧潜艇进度和可见命中恢复
 │   ├── submarine_strategy.py  # 潜艇搜索策略、确认和安全区推断
+│   ├── wreck_detection.py     # 红色标记、残骸和完整潜艇检测
 │   └── logger.py              # 日志配置
 ├── tests/                     # 策略和主流程单元测试
 ├── _debug/
@@ -74,7 +79,8 @@
 ## 环境要求
 
 - Python 3.10 或更高版本。
-- 已安装并可在命令行使用的 `adb`工具。
+- Windows 10/11；主程序本身可移植，但控制台、PowerShell 启动脚本和日志悬浮窗按 Windows 环境维护。
+- 仓库已包含 `tools/platform-tools/adb.exe`，通常不需要另外安装 ADB 或修改 `PATH`；缺少随附文件时才回退查找系统 `adb`。
 - 一台已开启 ADB 调试的安卓设备或模拟器。
 - 设备需要支持 `adb root`，否则脚本无法使用 iptables 自动控制弱网或断网。
 - 海岛奇兵国服（国际服未测试），如需使用请自行修改 `GAME_PACKAGE_NAME` 和流程坐标。
@@ -105,11 +111,13 @@ source .venv/bin/activate
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
 | `ADB_SERIAL` | `127.0.0.1:5555` | ADB 设备序列号或模拟器连接地址 |
+| `ADB_EXE` | `tools/platform-tools/adb.exe` | 随仓库提供的 ADB 可执行文件 |
 | `GAME_PACKAGE_NAME` | `com.tencent.tmgp.supercell.boombeach` | 默认控制的游戏包名 |
 | `TEMPLATE_DIR` | `template/` | 模板图片目录 |
 | `SCREENSHOT_DIR` | `_debug/screenshots/` | 截图和运行调试图保存目录 |
 | `LOG_FILE` | `_debug/logs/bbma.log` | 主流程日志文件路径 |
 | `OUTPUT_DIR` | `outputs/` | 命中可视化图片输出目录 |
+| `MAX_PROBE_SAMPLE_DIRS` | `120` | 最多保留的探测取证批次数量 |
 | `LEVEL_GRID_SIZES` | `1: 3` 到 `50: 10` | 各海域对应的菱形网格边长 |
 | `SUBMARINES` | `1` 到 `50` | 各海域潜艇长度列表；后续海域需手动填写 |
 | `USE_SAVED_POINTS` | `True` | 是否优先使用 `save_points/points.json` 中的人工点位 |
@@ -122,8 +130,8 @@ source .venv/bin/activate
 连接设备前可以先检查 ADB：
 
 ```powershell
-adb devices
-adb connect 127.0.0.1:5555
+.\tools\platform-tools\adb.exe devices
+.\tools\platform-tools\adb.exe connect 127.0.0.1:5555
 ```
 
 如果你的设备不是 `127.0.0.1:5555`，请把 `config.py` 中的 `ADB_SERIAL` 改成 `adb devices` 显示的设备 ID。
@@ -131,8 +139,7 @@ adb connect 127.0.0.1:5555
 弱网和断网控制依赖 root shell，运行 main.py 前建议确认：
 
 ```powershell
-
-adb -s 127.0.0.1:5555 shell id -u
+.\tools\platform-tools\adb.exe -s 127.0.0.1:5555 shell id -u
 ```
 
 第二条命令输出 `0` 才表示当前 ADB shell 已具备 root 权限。
@@ -142,26 +149,35 @@ adb -s 127.0.0.1:5555 shell id -u
 1. 启动安卓模拟器或连接安卓设备，分辨率为 `1280x720`。
 2. 确认设备已登录到游戏主界面，并且声呐活动入口可见。
 3. 确认 `template/` 目录下的模板图片能匹配当前界面。
-4. 如需运行指定关卡，在 `main.py` 底部修改 `level`。
+4. 优先通过控制台检查模拟器和选择炮弹模式，再启动主程序。
 
-```python
-if __name__ == "__main__":
-    register_exit_cleanup()
-    level = 1
-    try:
-        adb.ensure_root_shell()
-        cleanup_reject_network("主流程启动")
-        main(level)
-    finally:
-        cleanup_weak_network("主流程结束")
-        cleanup_reject_network("主流程结束")
-```
-
-运行主程序：
+启动运行控制台：
 
 ```powershell
-python main.py
+powershell -ExecutionPolicy Bypass -File .\run_control_panel.ps1
 ```
+
+也可以在 IDE 或终端中直接启动控制台：
+
+```powershell
+.\.venv\Scripts\python.exe tools\control_panel.py
+```
+
+控制台提供以下操作：
+
+- 启动和安全停止 `main.py`。
+- 恢复 DROP/REJECT 网络规则。
+- 检查目标 ADB 设备和 root 状态。
+- 选择“仅蓝色炮弹”或“红色侦察 + 蓝色攻击”，并设置红色侦察次数。
+- 查看关键日志、当前关卡、命中进度和棋盘状态。
+
+不使用控制台时可直接运行主程序：
+
+```powershell
+.\.venv\Scripts\python.exe main.py
+```
+
+默认开启关卡自动识别。`config.py` 中的 `DEFAULT_LEVEL` 只在关卡识别不可用且允许回退时使用，不需要修改 `main.py` 底部入口。主程序带单实例锁，重复启动的第二个进程会立即退出，且不会修改第一个进程的网络状态。
 
 运行结束后，命中可视化图片会保存到：
 
@@ -186,11 +202,13 @@ _debug/screenshots/run_debug/
 控制台支持两种炮弹流程：
 
 - **仅蓝色炮弹**：沿用现有的单格流程，直接使用蓝色炮弹逐格确认并攻击。
-- **红色侦察 + 蓝色攻击**：按关卡配置离线执行红色侦察，完成侦察后再使用蓝色炮弹提交可靠命中。
+- **红色侦察 + 蓝色攻击**：离线执行一次红色侦察，安全丢弃红色请求后，立即使用蓝色炮弹在线提交本次新识别到的可靠命中；随后继续下一次红色侦察，达到次数上限后再由搜索策略完成剩余格子。
 
-红色侦察数量必须为 `1..10`。红色落点后的退出、离线重新进入和结果采样与蓝色炮弹使用同一套流程；唯一差异是红色结果无论命中与否都只用于侦查，永远进入请求丢弃分支，不能进入提交分支。重启后还会复核红色炮弹数量，确认本次侦查没有消耗弹药。
+红色侦察数量必须为 `1..10`，表示每关最多尝试的红色侦察事务数。红色炮弹点击后使用 Android 返回键退出活动，再在保持断网的情况下重新进入并采集多帧结果。红色结果无论命中与否都只能进入请求丢弃分支，不能提交；重启后还会复核红色炮弹数量，确认本次侦察没有消耗弹药。
 
-如果发生网络隔离、游戏进程退出，或无法确认红色炮弹数量，流程必须停止并保持游戏断网。恢复网络前必须先检查日志，确认没有未完成的红色请求或其他异常状态。
+红色侦察命中只是蓝色炮弹的高优先目标，只有蓝色真实结果会计入投弹进度。若蓝色在线结果在追加取证帧后仍不确定，程序会停止且不会重复点击该格，避免再次浪费炮弹。
+
+如果发生网络隔离、游戏进程退出，或无法确认红色炮弹数量，流程必须停止并保持游戏断网。请使用控制台的“停止程序”或“恢复网络”；控制台会先重新阻断网络、强制停止游戏并确认进程退出，然后才清理规则。
 
 ## 支持自定义海域
 
@@ -224,13 +242,15 @@ python _debug/point_editor.py
 python _debug/point_editor.py
 ```
 
-点位校准GUI工具支持拖动外层大菱形四角、拖动每个小菱形中心点、重新规划海域棱形中心点，并保存到 `save_points/points.json`。
+点位校准 GUI 工具支持拖动外层大菱形四角、拖动每个小菱形中心点、重新规划海域菱形中心点，并保存到 `save_points/points.json`。
 
 ## 弱网控制
 
-当前主流程已通过 ADB root + iptables 自动实现游戏网络控制，不再需要 QNET。脚本在进入活动前开启游戏弱网，在重启游戏和退出脚本时关闭弱网。
+当前主流程已通过 ADB root + iptables 自动实现游戏网络控制，不再需要 QNET。离线点击前会创建 DROP 规则并核验 IPv4/IPv6 链完整性；未命中请求会在 DROP + REJECT 下强制停止游戏后丢弃，确认命中后才恢复网络提交请求。
 
 项目同时提供 REJECT 断网能力。REJECT 使用独立 `BBMA_REJECTNET` 链，它并不会关闭整机 Wi-Fi 或移动数据。
+
+检测到 pending 请求、损坏的 pending 状态或 `fail_closed` 状态时，退出清理不会自动解除网络规则。控制台恢复网络时会先安全停止游戏，避免客户端缓存请求在解网后补发。
 
 也可以单独启动弱网/断网调试工具：
 
@@ -272,7 +292,7 @@ python _debug/debug_gui.py
 - 自动点击位置不准时，查看鼠标实时坐标，左键单击标点，或输入 x/y 坐标跳转标记。
 - 需要完整模拟器画面时，直接保存当前完整截图，避免拖拽裁剪漏掉边缘像素。
 - 需要取消时，右键点标记可删除标记，右键空白或 ROI 区域可清除当前 ROI。
-- 新设备或新分辨率适配时，可根据自己的模拟器左键拖拽（亦可查看查看 ROI 的 `x, y, w, h`）选中 ROI 后保存到 `template/` 下，更新关键模板。
+- 新设备或新分辨率适配时，可根据自己的模拟器左键拖拽（也可查看 ROI 的 `x, y, w, h`）选中 ROI 后保存到 `template/` 下，更新关键模板。
 
 人工点位校准 GUI：
 
@@ -296,10 +316,16 @@ python _debug/weak_network_gui.py
 | `template/login.png` | 登录按钮 |
 | `template/quit_activity.png` | 活动详情页退出按钮 |
 | `template/ship.png` | 母舰图标 |
-| `template/retry.png` | 断网重试图标 |
-| `template/ship.png` | 战斗母舰图标(暂未使用) |
-| `template/sonar_pic_alive.png` | 声呐活动界面图标(暂未使用) |
-| `template/win.png` | 声呐海域通过图标(暂未使用) |
+| `template/retry.png` | 旧版断网重试图标 |
+| `template/connection_interrupted.png` | 连接中断弹窗 |
+| `template/connection_retry.png` | 连接中断弹窗中的重试按钮 |
+| `template/victory_banner.png` | 声呐海域胜利界面 |
+| `template/red_bomb_button.png` | 红色炮弹按钮定位和弹药指纹 |
+| `template/red_hit_marker.png` | 红色侦察命中标志 |
+| `template/visible_wreck_1.png` 至 `visible_wreck_3.png` | 可见残骸识别 |
+| `template/submarine_hit_wreck.png` | 旧版残骸模板，当前严格命中流程不直接采用 |
+| `template/sonar_pic_alive.png` | 声呐活动界面参考图标 |
+| `template/win.png` | 旧版通过界面参考图标 |
 
 `template/qnet_button_off.png`，为旧版 QNET 流程参考；当前主流程不再依赖该模板。
 
@@ -310,6 +336,9 @@ python _debug/weak_network_gui.py
 - `outputs/`：主流程结果图。
 - `_debug/screenshots/`：运行过程中的截图和中间图。
 - `_debug/screenshots/run_debug/`：点击前后截图、退出按钮匹配调试图。
+- `_debug/screenshots/probes/`：每次蓝色探测的多帧取证；默认最多保留最近 120 个批次。
+- `_debug/runtime/pending_probe.json`：可能待提交的炮弹请求安全标记；不要在游戏仍运行时手动删除。
+- `_debug/runtime/status.json`：控制台读取的当前关卡、网络、进度和棋盘状态。
 - `_debug/logs/bbma.log`：主流程日志文件。
 - `_debug/logs/weak_network_gui.log`：弱网调试 GUI 日志文件。
 
@@ -320,13 +349,13 @@ python _debug/weak_network_gui.py
 先运行：
 
 ```powershell
-adb devices
+.\tools\platform-tools\adb.exe devices
 ```
 
 如果没有设备，检查模拟器是否开启 ADB，或重新执行：
 
 ```powershell
-adb connect <设备地址>
+.\tools\platform-tools\adb.exe connect <设备地址>
 ```
 
 然后同步修改 `config.py` 中的 `ADB_SERIAL`。
@@ -348,7 +377,7 @@ adb connect <设备地址>
 
 可能原因：
 
-- 模板图片与当前分辨率不一致（请设置为1280*720）。
+- 模板图片与当前分辨率不一致（请设置为 `1280x720`）。
 - 模板区域裁剪过大或包含动态背景。
 
 可以使用 `_debug/debug_gui.py` 左键拖拽 ROI 并保存为模板，再适当调整 `DEFAULT_MATCH_THRESHOLD`。
