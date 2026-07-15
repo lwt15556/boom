@@ -116,6 +116,7 @@ PHASE_NAMES = {
     "advance_level": "进入下一关",
     "enter_activity": "进入活动",
     "strategy_scan": "智能寻路",
+    "supplemental_recheck": "命中线索优先补炸",
     "grid_scan": "逐格扫描",
     "fallback_scan": "保守扫描",
     "stopped": "已停止",
@@ -129,6 +130,7 @@ RESULT_NAMES = {
     "hit_and_level_complete": "命中并完成",
     "scout_valid": "侦察结果已累计",
     "scout_invalid": "侦察结果无效",
+    "supplemental_recheck_pending": "正在补炸侦察未命中格",
 }
 BOARD_STATE_NAMES = {
     "scout_miss": "侦察未命中",

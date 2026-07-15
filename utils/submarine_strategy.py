@@ -386,6 +386,94 @@ class SubmarineStrategy:
         """返回所有已探测且判定为未命中的格子。"""
         return self._real_miss_cells() | self.get_scout_miss_cells()
 
+    def get_priority_scout_miss_recheck_targets(
+        self,
+        already_rechecked: Iterable[Cell] = (),
+    ) -> list[Cell]:
+        """Return line ends first, then neighbors around isolated real hits."""
+        rechecked = {
+            self._normalize_scout_cell(cell, label="rechecked")
+            for cell in already_rechecked
+        }
+        scout_miss_cells = self.get_scout_miss_cells()
+        scheduled = set(rechecked)
+        targets: list[Cell] = []
+
+        clusters = sorted(
+            self._get_hit_clusters(),
+            key=lambda cluster: (-len(cluster), tuple(sorted(cluster))),
+        )
+        for cluster in clusters:
+            cells = self._straight_contiguous_cells(cluster)
+            if cells is None or len(cells) < 2:
+                continue
+
+            if len({row for row, _ in cells}) == 1:
+                candidates = (
+                    (cells[0][0], cells[0][1] - 1),
+                    (cells[-1][0], cells[-1][1] + 1),
+                )
+            else:
+                candidates = (
+                    (cells[0][0] - 1, cells[0][1]),
+                    (cells[-1][0] + 1, cells[-1][1]),
+                )
+
+            for cell in candidates:
+                if (
+                    not self._inside(cell)
+                    or cell not in scout_miss_cells
+                    or cell in self.shots
+                    or cell in scheduled
+                ):
+                    continue
+                scheduled.add(cell)
+                targets.append(cell)
+
+        if targets:
+            return targets
+        return self.get_isolated_hit_scout_miss_neighbors_for_recheck(scheduled)
+
+    def get_isolated_hit_scout_miss_neighbors_for_recheck(
+        self,
+        already_rechecked: Iterable[Cell] = (),
+    ) -> list[Cell]:
+        """Return scout-miss neighbors that fully surround an unresolved real hit."""
+        rechecked = {
+            self._normalize_scout_cell(cell, label="rechecked")
+            for cell in already_rechecked
+        }
+        scout_miss_cells = self.get_scout_miss_cells()
+        confirmed_hit_cells = set(self.accounted_hit_cells)
+        for ship in self.confirmed_ships:
+            confirmed_hit_cells.update(ship.cells)
+        known_hit_cells = (
+            {cell for cell, hit in self.shots.items() if hit}
+            | self.get_scout_hit_cells()
+            | confirmed_hit_cells
+        )
+
+        targets: list[Cell] = []
+        scheduled = set(rechecked)
+        for hit_cell in sorted(self._unconfirmed_hit_cells()):
+            neighbors = tuple(self._neighbors4(hit_cell))
+            if not neighbors or not all(
+                neighbor in scout_miss_cells for neighbor in neighbors
+            ):
+                continue
+            if any(neighbor in known_hit_cells for neighbor in neighbors):
+                continue
+
+            for neighbor in neighbors:
+                if (
+                    neighbor in self.shots
+                    or neighbor in scheduled
+                ):
+                    continue
+                scheduled.add(neighbor)
+                targets.append(neighbor)
+        return targets
+
     def _real_miss_cells(self) -> set[Cell]:
         return {cell for cell, hit in self.shots.items() if not hit}
 

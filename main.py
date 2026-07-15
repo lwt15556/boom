@@ -1705,6 +1705,7 @@ def _scan_level_by_strategy(
         unmapped_visual_hits=unmapped_visual_hits,
         board_size=grid_size,
         board_states=build_runtime_board_states(strategy, grid_size),
+        supplemental_rechecks_done=0,
         last_result="",
     )
 
@@ -1733,6 +1734,170 @@ def _scan_level_by_strategy(
                 now=monotonic(),
             ),
         )
+
+        supplemental_rechecked: set[Cell] = set()
+        supplemental_attempts = 0
+
+        def run_supplemental_neighbor_rechecks() -> bool:
+            nonlocal attempts, supplemental_attempts
+
+            getter = getattr(
+                strategy,
+                "get_priority_scout_miss_recheck_targets",
+                None,
+            )
+            if not callable(getter):
+                getter = getattr(
+                    strategy,
+                    "get_isolated_hit_scout_miss_neighbors_for_recheck",
+                    None,
+                )
+            if not callable(getter):
+                return False
+
+            while attempts < max_attempts:
+                candidates = [
+                    cell
+                    for cell in getter(supplemental_rechecked)
+                    if cell not in supplemental_rechecked
+                ]
+                if not candidates:
+                    return False
+
+                for cell in candidates:
+                    if cell in supplemental_rechecked or attempts >= max_attempts:
+                        continue
+                    supplemental_rechecked.add(cell)
+                    supplemental_attempts += 1
+                    row, col = cell
+                    index = row * grid_size + col
+                    logger.info(
+                        "level %s high-priority scout-miss recheck from hit evidence: "
+                        "cell=%s index=%s",
+                        level,
+                        cell,
+                        index,
+                    )
+                    current_hit_cells = sum(
+                        1 for shot_hit in strategy.shots.values() if shot_hit
+                    )
+                    current_display_hit_cells = progressive_hit_count(
+                        initial_visual_hit_count=initial_display_hit_cells,
+                        initial_strategy_hit_count=initial_hit_cells,
+                        current_strategy_hit_count=current_hit_cells,
+                    )
+                    write_runtime_status(
+                        phase="supplemental_recheck",
+                        level=level,
+                        current_cell=index,
+                        shots_done=len(strategy.shots),
+                        total_cells=grid_size * grid_size,
+                        hits=min(sum(submarines), current_display_hit_cells),
+                        total_ship_cells=sum(submarines),
+                        supplemental_rechecks_done=supplemental_attempts,
+                        board_size=grid_size,
+                        board_states=build_runtime_board_states(strategy, grid_size),
+                        last_result="supplemental_recheck_pending",
+                    )
+                    probe_metadata: dict[str, object] = {}
+                    probe_result = _probe_cell(
+                        level,
+                        hit_map,
+                        cell,
+                        click_points[index],
+                        index,
+                        probe_metadata=probe_metadata,
+                    )
+                    level_completed = _probe_result_completed_level(probe_result)
+                    hit = _probe_result_is_hit(probe_result)
+                    if level_completed and not hit:
+                        write_runtime_status(
+                            phase="level_complete",
+                            level=level,
+                            current_cell="--",
+                            supplemental_rechecks_done=supplemental_attempts,
+                            last_result=probe_result.value,
+                        )
+                        return True
+
+                    attempts += 1
+                    if hit:
+                        strategy.blocked_cells.discard(cell)
+                    strategy.report_result(cell, hit)
+                    if hit:
+                        hit_map[row][col] = 1
+                    else:
+                        logger.info(
+                            "level %s priority scout-miss recheck cell=%s result=%s",
+                            level,
+                            cell,
+                            probe_result.value,
+                        )
+
+                    newly_completed_lengths = tuple(
+                        int(length)
+                        for length in probe_metadata.get("sidebar_newly_completed_lengths", ())
+                    )
+                    sidebar_completed_lengths = tuple(
+                        int(length)
+                        for length in probe_metadata.get("sidebar_completed_lengths", ())
+                    )
+                    if not sidebar_completed_lengths and newly_completed_lengths:
+                        sidebar_completed_lengths = (
+                            tuple(accounted_completed_lengths()) + newly_completed_lengths
+                        )
+                    reconcile = getattr(strategy, "reconcile_completed_lengths", None)
+                    if hit and sidebar_completed_lengths and callable(reconcile):
+                        reconcile(
+                            sidebar_completed_lengths,
+                            anchor=cell,
+                            observed_completed_cells={cell},
+                        )
+
+                    save_level_shots(level, grid_size, strategy.shots)
+                    confirmed_lengths = accounted_completed_lengths()
+                    hit_cells = sum(1 for shot_hit in strategy.shots.values() if shot_hit)
+                    display_hit_cells = progressive_hit_count(
+                        initial_visual_hit_count=initial_display_hit_cells,
+                        initial_strategy_hit_count=initial_hit_cells,
+                        current_strategy_hit_count=hit_cells,
+                    )
+                    display_hit_cells = min(sum(submarines), display_hit_cells)
+                    write_runtime_status(
+                        phase=(
+                            "level_complete"
+                            if level_completed
+                            else "supplemental_recheck"
+                        ),
+                        level=level,
+                        current_cell="--" if level_completed else index,
+                        shots_done=len(strategy.shots),
+                        total_cells=grid_size * grid_size,
+                        hits=display_hit_cells,
+                        total_ship_cells=sum(submarines),
+                        supplemental_rechecks_done=supplemental_attempts,
+                        confirmed_ships=len(confirmed_lengths),
+                        total_ships=len(submarines),
+                        board_size=grid_size,
+                        board_states=build_runtime_board_states(strategy, grid_size),
+                        last_result=probe_result.value,
+                    )
+                    update_fixed_progress(
+                        bar,
+                        display_hit_cells,
+                        progress.strategy_postfix(
+                            attempts=attempts,
+                            confirmed_lengths=confirmed_lengths,
+                            remaining_lengths=list(strategy.remaining.elements()),
+                            now=monotonic(),
+                        ),
+                    )
+                    if level_completed:
+                        return True
+            return False
+
+        if not strategy.done and run_supplemental_neighbor_rechecks():
+            return True
 
         while not strategy.done and attempts < max_attempts:
             cell = strategy.choose_next_cell()
@@ -1863,6 +2028,9 @@ def _scan_level_by_strategy(
                     level,
                     index,
                 )
+                return True
+
+            if not strategy.done and run_supplemental_neighbor_rechecks():
                 return True
 
         if strategy.done:
@@ -2586,6 +2754,8 @@ def _execute_online_scout_hit(
             decision_reason,
         )
     else:
+        row, col = cell
+        hit_map[row][col] = 0
         probe_result = ProbeResult.MISS
         logger.warning(
             "scout-hit cell %s was a false positive; the online blue shot was committed as a miss",
