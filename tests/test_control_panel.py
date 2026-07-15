@@ -45,9 +45,14 @@ class ControlPanelHelperTest(unittest.TestCase):
     def test_status_formatters_are_user_facing(self):
         self.assertEqual(format_cell(76, 81), "#76（第 9 行，第 5 列）")
         self.assertEqual(format_phase("strategy_scan"), "智能寻路")
+        self.assertEqual(format_phase("supplemental_recheck"), "命中线索优先补炸")
         self.assertEqual(format_result("hit"), "命中")
         self.assertEqual(format_result("level_complete"), "关卡已完成")
         self.assertEqual(format_result("scout_valid"), "侦察结果已累计")
+        self.assertEqual(
+            format_result("supplemental_recheck_pending"),
+            "正在补炸侦察未命中格",
+        )
         self.assertEqual(format_reason("hit_votes_4"), "4 帧确认")
         self.assertEqual(
             format_reason("victory_banner_during_reentry"),

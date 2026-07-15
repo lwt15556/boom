@@ -249,6 +249,155 @@ class SubmarineStrategyTest(unittest.TestCase):
 
         self.assertIn(next_cell, {(2, 3), (4, 3), (3, 2), (3, 4)})
 
+    def test_saturated_hit_scout_miss_neighbors_are_selected_for_recheck(self):
+        strategy = SubmarineStrategy(5, [3])
+        strategy.report_result((2, 2), True)
+        neighbors = ((1, 2), (3, 2), (2, 1), (2, 3))
+        strategy.report_scout_results(hits=(), misses=neighbors)
+
+        self.assertEqual(
+            strategy.get_isolated_hit_scout_miss_neighbors_for_recheck(),
+            list(neighbors),
+        )
+        self.assertEqual(
+            strategy.get_isolated_hit_scout_miss_neighbors_for_recheck({(1, 2)}),
+            [(3, 2), (2, 1), (2, 3)],
+        )
+
+    def test_aligned_hits_select_scout_miss_cells_at_both_line_ends(self):
+        strategy = SubmarineStrategy(6, [4])
+        strategy.report_result((2, 2), True)
+        strategy.report_result((2, 3), True)
+        strategy.report_scout_results(
+            hits=(),
+            misses=((2, 1), (2, 4), (1, 2), (3, 2)),
+        )
+
+        self.assertEqual(
+            strategy.get_priority_scout_miss_recheck_targets(),
+            [(2, 1), (2, 4)],
+        )
+
+    def test_vertical_hits_select_only_top_and_bottom_scout_misses(self):
+        strategy = SubmarineStrategy(7, [5])
+        for cell in ((2, 3), (3, 3), (4, 3)):
+            strategy.report_result(cell, True)
+        strategy.report_scout_results(
+            hits=(),
+            misses=((1, 3), (5, 3), (3, 2), (3, 4)),
+        )
+
+        self.assertEqual(
+            strategy.get_priority_scout_miss_recheck_targets(),
+            [(1, 3), (5, 3)],
+        )
+
+    def test_line_end_targets_precede_isolated_hit_neighbors(self):
+        strategy = SubmarineStrategy(7, [4, 3])
+        for cell in ((1, 2), (1, 3), (5, 5)):
+            strategy.report_result(cell, True)
+        strategy.report_scout_results(
+            hits=(),
+            misses=(
+                (1, 1),
+                (1, 4),
+                (4, 5),
+                (6, 5),
+                (5, 4),
+                (5, 6),
+            ),
+        )
+
+        first_targets = strategy.get_priority_scout_miss_recheck_targets()
+        strategy.report_result((1, 1), False)
+        strategy.report_result((1, 4), False)
+
+        self.assertEqual(first_targets, [(1, 1), (1, 4)])
+        self.assertEqual(
+            strategy.get_priority_scout_miss_recheck_targets(first_targets),
+            [(4, 5), (6, 5), (5, 4), (5, 6)],
+        )
+
+    def test_line_end_recheck_continues_outward_after_a_new_hit(self):
+        strategy = SubmarineStrategy(6, [5])
+        strategy.report_result((2, 2), True)
+        strategy.report_result((2, 3), True)
+        strategy.report_scout_results(
+            hits=(),
+            misses=((2, 0), (2, 1), (2, 4), (2, 5)),
+        )
+
+        first_targets = strategy.get_priority_scout_miss_recheck_targets()
+        strategy.report_result((2, 1), True)
+        strategy.report_result((2, 4), False)
+
+        self.assertEqual(first_targets, [(2, 1), (2, 4)])
+        self.assertEqual(
+            strategy.get_priority_scout_miss_recheck_targets(first_targets),
+            [(2, 0)],
+        )
+
+    def test_non_straight_hit_cluster_does_not_create_line_end_targets(self):
+        strategy = SubmarineStrategy(6, [4])
+        for cell in ((2, 2), (2, 3), (3, 3)):
+            strategy.report_result(cell, True)
+        strategy.report_scout_results(
+            hits=(),
+            misses=((2, 1), (2, 4), (1, 3), (4, 3)),
+        )
+
+        self.assertEqual(
+            strategy.get_priority_scout_miss_recheck_targets(),
+            [],
+        )
+
+    def test_line_end_already_checked_with_blue_is_not_repeated(self):
+        strategy = SubmarineStrategy(6, [4])
+        strategy.report_result((2, 2), True)
+        strategy.report_result((2, 3), True)
+        strategy.report_result((2, 1), False)
+        strategy.report_scout_results(hits=(), misses=((2, 4),))
+
+        self.assertEqual(
+            strategy.get_priority_scout_miss_recheck_targets(),
+            [(2, 4)],
+        )
+
+    def test_saturated_hit_does_not_repeat_neighbors_already_checked_with_blue(self):
+        strategy = SubmarineStrategy(5, [3])
+        strategy.report_result((2, 2), True)
+        for cell in ((1, 2), (3, 2), (2, 1), (2, 3)):
+            strategy.report_result(cell, False)
+
+        self.assertEqual(
+            strategy.get_isolated_hit_scout_miss_neighbors_for_recheck(),
+            [],
+        )
+
+    def test_hit_requires_every_neighbor_to_be_a_scout_miss(self):
+        strategy = SubmarineStrategy(5, [3])
+        strategy.report_result((2, 2), True)
+        strategy.report_result((2, 3), False)
+        strategy.report_scout_results(
+            hits=(),
+            misses=((1, 2), (3, 2), (2, 1)),
+        )
+
+        self.assertEqual(
+            strategy.get_isolated_hit_scout_miss_neighbors_for_recheck(),
+            [],
+        )
+
+    def test_confirmed_ship_neighbors_are_not_selected_for_recheck(self):
+        strategy = SubmarineStrategy(5, [2])
+        strategy.report_result((2, 2), True)
+        strategy.report_result((2, 3), True)
+
+        self.assertEqual(
+            strategy.get_isolated_hit_scout_miss_neighbors_for_recheck(),
+            [],
+        )
+
     def test_two_hits_lock_direction_to_line_extension(self):
         strategy = SubmarineStrategy(6, [4])
         strategy.report_result((3, 2), True)

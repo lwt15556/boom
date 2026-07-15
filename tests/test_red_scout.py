@@ -332,6 +332,30 @@ class RedScoutAnalyzerTest(unittest.TestCase):
 
         return classifier
 
+    def test_default_hit_detector_rejects_clean_reference_cell(self):
+        reference_path = Path(__file__).parents[1] / "save_points" / "imgs" / "8.png"
+        reference = cv2.imread(str(reference_path))
+
+        self.assertIsNotNone(reference)
+        self.assertFalse(red_scout_module._default_hit_detector(reference, (665, 318)))
+
+    def test_change_prefilter_keeps_shifted_candidate_and_rejects_clean_cell(self):
+        before = np.zeros((200, 240, 3), dtype=np.uint8)
+        after = before.copy()
+        cv2.rectangle(after, (78, 72), (142, 128), (255, 255, 255), cv2.FILLED)
+        candidates = {(0, 0), (0, 1)}
+
+        filtered = red_scout_module._prefilter_candidates_by_change_upper_bound(
+            before_image=before,
+            after_images=(after, after.copy(), after.copy()),
+            points_by_cell={(0, 0): (100, 100), (0, 1): (200, 160)},
+            candidates=candidates,
+            minimum_change_threshold=0.45,
+        )
+
+        self.assertEqual(filtered, {(0, 0)})
+        self.assertEqual(candidates, {(0, 0), (0, 1)})
+
     def test_first_scout_keeps_disconnected_changed_cells_from_multi_point_bomb(self):
         evidence = {
             (2, 2): (0.96, "miss"),
@@ -339,14 +363,15 @@ class RedScoutAnalyzerTest(unittest.TestCase):
             (3, 2): (0.93, "miss"),
             (0, 0): (0.89, "hit"),
         }
+        after_images = tuple(np.ones((8, 8, 3), dtype=np.uint8) for _ in range(3))
         analyzer = self._analyzer(
             self._classifier_for(evidence),
-            hit_detector=lambda _image, point: point == (2, 3),
+            hit_detector=lambda image, point: image is not self.BEFORE_IMAGE and point == (2, 3),
         )
 
         result = analyzer.analyze(
             before_image=self.BEFORE_IMAGE,
-            after_images=self.AFTER_IMAGES,
+            after_images=after_images,
             grid_size=self.GRID_SIZE,
             click_points=self.CLICK_POINTS,
             center_cell=(2, 2),
@@ -375,6 +400,41 @@ class RedScoutAnalyzerTest(unittest.TestCase):
                 (3, 2): 0.93,
             },
         )
+
+    def test_first_scout_ignores_cells_visible_before_red_bomb(self):
+        evidence = {
+            (2, 2): (0.96, "miss"),
+            (2, 3): (0.94, "hit"),
+            (0, 0): (0.93, "hit"),
+        }
+        before_image = np.zeros((8, 8, 3), dtype=np.uint8)
+        after_images = tuple(np.ones((8, 8, 3), dtype=np.uint8) for _ in range(3))
+
+        def hit_detector(image, point):
+            if point == (0, 0):
+                return True
+            return image is not before_image and point == (2, 3)
+
+        analyzer = self._analyzer(
+            self._classifier_for(evidence),
+            hit_detector=hit_detector,
+        )
+
+        result = analyzer.analyze(
+            before_image=before_image,
+            after_images=after_images,
+            grid_size=self.GRID_SIZE,
+            click_points=self.CLICK_POINTS,
+            center_cell=(2, 2),
+            excluded_cells=frozenset(),
+            learned_footprint=None,
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.affected_cells, frozenset({(2, 2), (2, 3)}))
+        self.assertEqual(result.hit_cells, frozenset({(2, 3)}))
+        self.assertNotIn((-2, -2), result.footprint.offsets)
+        self.assertNotIn((0, 0), result.confidence_by_cell)
 
     def test_first_footprint_is_invalid_when_center_is_absent(self):
         evidence = {
@@ -422,7 +482,7 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         self.assertEqual(result.miss_cells, frozenset({(2, 2)}))
         self.assertIsNone(result.footprint)
 
-    def test_learned_footprint_intersects_bounds_and_change_evidence(self):
+    def test_learned_footprint_does_not_hide_changed_cells(self):
         footprint_type = getattr(red_scout_module, "RedFootprint", None)
         self.assertIsNotNone(footprint_type, "RedFootprint must be public")
         footprint = footprint_type(
@@ -456,10 +516,49 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         )
 
         self.assertTrue(result.valid)
-        self.assertEqual(result.affected_cells, frozenset({(0, 0), (2, 2)}))
-        self.assertNotIn((1, 1), result.affected_cells)
+        self.assertEqual(
+            result.affected_cells,
+            frozenset({(0, 0), (1, 1), (2, 2)}),
+        )
+        self.assertEqual(result.unknown_cells, frozenset({(1, 1)}))
+        self.assertNotIn((1, 2), result.affected_cells)
         self.assertEqual(result.footprint, footprint)
         self.assertEqual(excluded_cells, excluded_snapshot)
+
+    def test_learned_footprint_does_not_limit_result_scan(self):
+        footprint_type = getattr(red_scout_module, "RedFootprint", None)
+        self.assertIsNotNone(footprint_type, "RedFootprint must be public")
+        footprint = footprint_type(offsets=frozenset({(0, 0)}))
+        evidence = {
+            (0, 0): (0.90, "hit"),
+            (2, 2): (0.90, "miss"),
+        }
+        analyzer = self._analyzer(
+            self._classifier_for(evidence),
+            hit_detector=lambda image, point: (
+                image is not self.BEFORE_IMAGE and point == (0, 0)
+            ),
+        )
+
+        result = analyzer.analyze(
+            before_image=self.BEFORE_IMAGE,
+            after_images=self.AFTER_IMAGES,
+            grid_size=3,
+            click_points=tuple(
+                (row, col)
+                for row in range(3)
+                for col in range(3)
+            ),
+            center_cell=(2, 2),
+            excluded_cells=set(),
+            learned_footprint=footprint,
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.affected_cells, frozenset({(0, 0), (2, 2)}))
+        self.assertEqual(result.hit_cells, frozenset({(0, 0)}))
+        self.assertEqual(result.miss_cells, frozenset({(2, 2)}))
+        self.assertEqual(result.footprint, footprint)
 
     def test_hit_requires_detector_votes_in_at_least_two_frames(self):
         footprint_type = getattr(red_scout_module, "RedFootprint", None)
