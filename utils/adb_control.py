@@ -6,6 +6,7 @@ from pathlib import Path
 from time import monotonic, sleep
 
 import cv2
+import numpy as np
 
 from config import ADB_EXE, ADB_SERIAL, DEFAULT_SCREENSHOT_NAME, SCREENSHOT_DIR
 from utils.logger import get_logger
@@ -22,6 +23,18 @@ class NetworkIsolationStatus:
     ipv6_route_present: bool
     ipv6_blocked: bool
     detail: str
+
+
+@dataclass(frozen=True)
+class ScreenshotCapture:
+    image: np.ndarray
+    png_bytes: bytes
+
+    def save(self, output_path: str | Path) -> Path:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(self.png_bytes)
+        return path
 
 
 class AdbCommandError(RuntimeError):
@@ -95,6 +108,48 @@ class AdbController:
             raise AdbCommandError(command, result)
         return result
 
+    def _run_binary(
+        self,
+        args: list[str],
+        *,
+        device: bool = True,
+        check: bool = True,
+        timeout: float = ADB_COMMAND_TIMEOUT_SECONDS,
+    ) -> bytes:
+        """执行需要保留原始 stdout 字节的 adb 命令。"""
+        command = [_resolve_adb_executable()]
+        if device:
+            command.extend(["-s", self.serial])
+        command.extend(args)
+
+        logger.debug("执行二进制 adb 命令: %s", " ".join(command))
+        result = self._run_binary_once(command, timeout)
+        text_result = _decode_binary_result(result)
+        if (
+            check
+            and device
+            and result.returncode != 0
+            and self._is_recoverable_adb_error(text_result)
+        ):
+            logger.warning(
+                "ADB 连接异常，正在重连并重试二进制命令: command=%s stderr=%r",
+                " ".join(command),
+                _limit_text(text_result.stderr),
+            )
+            self._recover_connection()
+            result = self._run_binary_once(command, timeout)
+            text_result = _decode_binary_result(result)
+
+        if check and result.returncode != 0:
+            logger.error(
+                "二进制 adb 命令失败: command=%s returncode=%s stderr=%r",
+                " ".join(command),
+                result.returncode,
+                _limit_text(text_result.stderr),
+            )
+            raise AdbCommandError(command, text_result)
+        return bytes(result.stdout or b"")
+
     @staticmethod
     def _run_once(command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         try:
@@ -102,6 +157,22 @@ class AdbController:
                 command,
                 capture_output=True,
                 text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            logger.error("adb 命令超时: timeout=%ss command=%s", timeout, " ".join(command))
+            raise AdbCommandTimeoutError(command, timeout) from exc
+
+    @staticmethod
+    def _run_binary_once(
+        command: list[str],
+        timeout: float,
+    ) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return subprocess.run(
+                command,
+                capture_output=True,
+                text=False,
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
@@ -131,21 +202,49 @@ class AdbController:
     def take_screenshot(self, output_path: str | Path | None = None) -> Path:
         """使用 adb 截图并保存到本地，返回截图路径。"""
         path = Path(output_path) if output_path else SCREENSHOT_DIR / DEFAULT_SCREENSHOT_NAME
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        remote_path = "/sdcard/_bbma_screen.png"
-        self._run(["shell", "screencap", "-p", remote_path])
-        self._run(["pull", remote_path, str(path)])
-        logger.debug("截图已保存: %s", path)
+        self.read_screenshot(path)
         return path
 
     def read_screenshot(self, output_path: str | Path | None = None):
-        """截图并读取为 OpenCV 图像对象。"""
-        path = self.take_screenshot(output_path)
+        """通过 exec-out 在内存中截图，按需保存调试 PNG。"""
+        capture = self.capture_screenshot()
+        if output_path is not None:
+            path = capture.save(output_path)
+            logger.debug("截图已保存: %s", path)
+        return capture.image
+
+    def capture_screenshot(self) -> ScreenshotCapture:
+        """截图并解码，同时保留未经重新编码的 PNG 字节。"""
+        try:
+            payload = self._run_binary(["exec-out", "screencap", "-p"])
+        except AdbCommandError as exc:
+            logger.warning("exec-out 截图失败，回退到 pull: %s", exc)
+            return self._capture_screenshot_via_pull()
+
+        encoded = np.frombuffer(payload, dtype=np.uint8)
+        screen = cv2.imdecode(encoded, cv2.IMREAD_COLOR) if encoded.size else None
+        if screen is None:
+            logger.warning("exec-out 截图不是有效 PNG，回退到 pull")
+            return self._capture_screenshot_via_pull()
+        return ScreenshotCapture(image=screen, png_bytes=payload)
+
+    def _capture_screenshot_via_pull(self) -> ScreenshotCapture:
+        path = SCREENSHOT_DIR / DEFAULT_SCREENSHOT_NAME
+        screen = self._read_screenshot_via_pull(path)
+        return ScreenshotCapture(image=screen, png_bytes=path.read_bytes())
+
+    def _read_screenshot_via_pull(self, output_path: str | Path | None = None):
+        """兼容不支持 exec-out 的设备，使用远端文件截图。"""
+        path = Path(output_path) if output_path else SCREENSHOT_DIR / DEFAULT_SCREENSHOT_NAME
+        path.parent.mkdir(parents=True, exist_ok=True)
+        remote_path = "/sdcard/_bbma_screen.png"
+        self._run(["shell", "screencap", "-p", remote_path])
+        self._run(["pull", remote_path, str(path)])
         screen = cv2.imread(str(path))
         if screen is None:
             logger.error("截图读取失败: %s", path)
             raise RuntimeError(f"failed to read screenshot: {path}")
+        logger.debug("截图已保存: %s", path)
         return screen
 
     def is_landscape_by_screenshot(self) -> bool:
@@ -748,6 +847,24 @@ def _limit_text(text: str, limit: int = 500) -> str:
     if len(stripped) <= limit:
         return stripped
     return stripped[:limit] + "...(truncated)"
+
+
+def _decode_binary_result(
+    result: subprocess.CompletedProcess[bytes],
+) -> subprocess.CompletedProcess[str]:
+    def decode(value: bytes | str | None) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return value.decode("utf-8", errors="replace")
+
+    return subprocess.CompletedProcess(
+        result.args,
+        result.returncode,
+        stdout=decode(result.stdout),
+        stderr=decode(result.stderr),
+    )
 
 
 def _build_weak_network_script(command: str, uid: int, enabled: bool) -> str:

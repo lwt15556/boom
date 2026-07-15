@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -12,9 +13,14 @@ from types import MappingProxyType
 import cv2
 import numpy as np
 
-from config import TEMPLATE_DIR
+from config import RED_SCOUT_MAX_COUNT, TEMPLATE_DIR
 from utils.diamond_hit import DiamondHitConfig, classify_diamond_hit, make_diamond_mask
 from utils.image_match import MatchResult, find_template_multi_scale
+from utils.sidebar_progress import (
+    detect_sidebar_progress,
+    newly_completed_lengths,
+    resolve_completed_ship_cells,
+)
 
 
 Cell = tuple[int, int]
@@ -29,6 +35,10 @@ RED_BOMB_SELECTION_MIN_AVERAGE_RATIO = 0.30
 FIRST_FOOTPRINT_CHANGE_THRESHOLD = 0.72
 LEARNED_FOOTPRINT_CHANGE_THRESHOLD = 0.45
 MINIMUM_FRAME_VOTES = 2
+RED_SCOUT_RESULT_CELL_COUNT = 6
+RED_SCOUT_MISS_MIN_CHANGE = 0.88
+RED_SCOUT_MISS_MIN_VOTES = 3
+RED_SCOUT_MISS_FALLBACK_MIN_CHANGE = 0.60
 
 
 class ProbeMode(str, Enum):
@@ -58,6 +68,8 @@ class RedScoutResult:
     valid: bool
     confidence_by_cell: Mapping[Cell, float]
     level_completed: bool = False
+    invalid_reason: str | None = None
+    diagnostics: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -65,6 +77,18 @@ class RedScoutResult:
             "confidence_by_cell",
             MappingProxyType(dict(self.confidence_by_cell)),
         )
+        object.__setattr__(
+            self,
+            "diagnostics",
+            MappingProxyType(dict(self.diagnostics or {})),
+        )
+
+
+@dataclass(frozen=True)
+class _CompletedShipEvidence:
+    new_hit_cells: frozenset[Cell]
+    ship_cells: frozenset[Cell]
+    perimeter_cells: frozenset[Cell]
 
 
 @dataclass(frozen=True)
@@ -89,7 +113,7 @@ def load_red_scout_settings(
         count = int(raw_count)
     except ValueError:
         count = 2
-    if not 1 <= count <= 10:
+    if not 1 <= count <= RED_SCOUT_MAX_COUNT:
         count = 2
     return RedScoutSettings(mode=mode, count=count)
 
@@ -131,7 +155,12 @@ def _default_hit_detector(image: np.ndarray, point: tuple[int, int]) -> bool:
     # Match the visible wreck to the requested cell instead of searching the
     # whole crop for a template that can also occur in ordinary water tiles.
     try:
-        result = classify_diamond_hit(image, image, point)
+        result = classify_diamond_hit(
+            image,
+            image,
+            point,
+            config=DiamondHitConfig(search_radius=2),
+        )
     except Exception:
         return False
     return str(getattr(result, "state", "")).strip().lower() == "hit"
@@ -259,6 +288,7 @@ class RedScoutAnalyzer:
         center_cell: Cell,
         excluded_cells: Sequence[Cell] | set[Cell] | frozenset[Cell] = (),
         learned_footprint: RedFootprint | None = None,
+        submarine_lengths: Sequence[int] = (),
     ) -> RedScoutResult:
         normalized_center = _normalize_pair(center_cell)
         result_center = normalized_center if normalized_center is not None else (0, 0)
@@ -272,9 +302,23 @@ class RedScoutAnalyzer:
             learned_footprint=learned_footprint,
         )
         if preflight is None:
-            return self._invalid_result(result_center)
+            return self._invalid_result(
+                result_center,
+                reason="preflight_failed",
+                diagnostics={"stage": "preflight"},
+            )
 
         frames, points_by_cell, excluded, learned_offsets = preflight
+        diagnostics: dict[str, object] = {
+            "stage": "candidate_detection",
+            "center": result_center,
+            "excluded_cells": tuple(sorted(excluded)),
+            "learned_footprint": (
+                tuple(sorted(learned_offsets))
+                if learned_offsets is not None
+                else ()
+            ),
+        }
         # A learned footprint is a planning hint, not a fixed description of
         # every later red-bomb result. The affected cells can vary with the
         # target position, so every unknown cell must be considered by analysis.
@@ -284,29 +328,175 @@ class RedScoutAnalyzer:
             if cell not in excluded
         }
 
-        minimum_change_threshold = (
+        minimum_change_threshold = min(
             FIRST_FOOTPRINT_CHANGE_THRESHOLD
             if learned_offsets is None
-            else LEARNED_FOOTPRINT_CHANGE_THRESHOLD
+            else LEARNED_FOOTPRINT_CHANGE_THRESHOLD,
+            RED_SCOUT_MISS_FALLBACK_MIN_CHANGE,
         )
+        before_visible = self._before_visible_hit_cells(
+            before_image=before_image,
+            points_by_cell=points_by_cell,
+            candidates=candidates,
+        )
+        if before_visible is None:
+            diagnostics["stage"] = "before_visible_hits"
+            return self._invalid_result(
+                result_center,
+                reason="before_hit_detection_failed",
+                diagnostics=diagnostics,
+            )
+        diagnostics["before_visible"] = tuple(sorted(before_visible))
+        raw_stable_result_hits = self._stable_visible_hit_cells(
+            after_images=frames,
+            points_by_cell=points_by_cell,
+            candidates=candidates - before_visible,
+        )
+        if raw_stable_result_hits is None:
+            diagnostics["stage"] = "stable_result_hits"
+            return self._invalid_result(
+                result_center,
+                reason="stable_hit_detection_failed",
+                diagnostics=diagnostics,
+            )
+        diagnostics["raw_stable_hits"] = tuple(sorted(raw_stable_result_hits))
         evidence = self._collect_evidence(
             before_image=before_image,
             after_images=frames,
             points_by_cell=points_by_cell,
             candidates=candidates,
             minimum_change_threshold=minimum_change_threshold,
+            mandatory_candidates=raw_stable_result_hits,
         )
         if evidence is None:
-            return self._invalid_result(result_center)
+            diagnostics["stage"] = "cell_evidence"
+            return self._invalid_result(
+                result_center,
+                reason="evidence_collection_failed",
+                diagnostics=diagnostics,
+            )
         median_change_by_cell, states_by_cell = evidence
+        diagnostics["cell_evidence"] = tuple(
+            {
+                "cell": cell,
+                "median_change": float(median_change_by_cell[cell]),
+                "states": states_by_cell[cell],
+            }
+            for cell in sorted(median_change_by_cell)
+        )
+        completed_diagnostics: dict[str, object] = {}
+        completed_ship = self._completed_ship_evidence(
+            before_image=before_image,
+            after_images=frames,
+            submarine_lengths=submarine_lengths,
+            before_visible=before_visible,
+            raw_stable_result_hits=raw_stable_result_hits,
+            grid_size=grid_size,
+            diagnostics=completed_diagnostics,
+        )
+        diagnostics.update(completed_diagnostics)
+        completed_visual_zone: set[Cell] = set()
+        independent_stable_hits = set(raw_stable_result_hits)
+        if completed_ship is not None:
+            completed_visual_zone = set(
+                completed_ship.ship_cells | completed_ship.perimeter_cells
+            )
+            independent_stable_hits.difference_update(completed_visual_zone)
+
+        stable_result_hits = self._collapse_completed_submarine_hits(
+            independent_stable_hits,
+            center_cell=result_center,
+            confidence_by_cell=median_change_by_cell,
+        )
+        if completed_ship is not None:
+            stable_result_hits.update(completed_ship.new_hit_cells)
+        diagnostics["resolved_ship_hits"] = tuple(sorted(stable_result_hits))
+
+        strong_result_misses = {
+            cell
+            for cell, changed_ratio in median_change_by_cell.items()
+            if (
+                cell not in raw_stable_result_hits
+                and cell not in completed_visual_zone
+                and changed_ratio >= RED_SCOUT_MISS_MIN_CHANGE
+                and states_by_cell[cell].count("miss") >= RED_SCOUT_MISS_MIN_VOTES
+            )
+        }
+        diagnostics["strong_misses"] = tuple(sorted(strong_result_misses))
+        affected = stable_result_hits | strong_result_misses
+        if before_visible:
+            affected = affected - before_visible
+        diagnostics["affected_before_limit"] = tuple(sorted(affected))
+        if len(affected) > RED_SCOUT_RESULT_CELL_COUNT:
+            diagnostics["stage"] = "limit_strong_cells"
+            return self._invalid_result(
+                result_center,
+                reason="too_many_strong_cells",
+                diagnostics=diagnostics,
+            )
+
+        consistent_misses: list[Cell] = []
+        if len(affected) < RED_SCOUT_RESULT_CELL_COUNT:
+            consistent_misses = sorted(
+                (
+                    cell
+                    for cell, changed_ratio in median_change_by_cell.items()
+                    if (
+                        cell not in affected
+                        and cell not in before_visible
+                        and cell not in raw_stable_result_hits
+                        and cell not in completed_visual_zone
+                        and changed_ratio >= RED_SCOUT_MISS_FALLBACK_MIN_CHANGE
+                        and states_by_cell[cell]
+                        and states_by_cell[cell].count("miss")
+                        == len(states_by_cell[cell])
+                    )
+                ),
+                key=lambda cell: (
+                    -median_change_by_cell[cell],
+                    cell[0],
+                    cell[1],
+                ),
+            )
+            missing_count = RED_SCOUT_RESULT_CELL_COUNT - len(affected)
+            affected.update(consistent_misses[:missing_count])
+        diagnostics["moderate_misses"] = tuple(consistent_misses)
+
+        safe_perimeter_misses: list[Cell] = []
+        if (
+            completed_ship is not None
+            and len(affected) < RED_SCOUT_RESULT_CELL_COUNT
+        ):
+            safe_perimeter_misses = sorted(
+                (
+                    cell
+                    for cell in completed_ship.perimeter_cells
+                    if (
+                        cell in median_change_by_cell
+                        and cell not in before_visible
+                        and cell not in raw_stable_result_hits
+                        and median_change_by_cell[cell]
+                        >= RED_SCOUT_MISS_FALLBACK_MIN_CHANGE
+                        and states_by_cell[cell]
+                        and states_by_cell[cell].count("miss")
+                        == len(states_by_cell[cell])
+                    )
+                ),
+                key=lambda cell: (
+                    -median_change_by_cell[cell],
+                    cell[0],
+                    cell[1],
+                ),
+            )
+            missing_count = RED_SCOUT_RESULT_CELL_COUNT - len(affected)
+            affected.update(safe_perimeter_misses[:missing_count])
+        diagnostics["completed_perimeter_candidates"] = tuple(
+            safe_perimeter_misses
+        )
+        diagnostics["final_affected"] = tuple(sorted(affected))
 
         if learned_offsets is None:
-            affected = {
-                cell
-                for cell, changed_ratio in median_change_by_cell.items()
-                if changed_ratio >= minimum_change_threshold
-            }
-            valid = result_center in affected and len(affected) >= 2
+            valid = len(affected) >= 2
             footprint = (
                 RedFootprint(
                     offsets=frozenset(
@@ -321,40 +511,8 @@ class RedScoutAnalyzer:
                 else None
             )
         else:
-            affected = {
-                cell
-                for cell, changed_ratio in median_change_by_cell.items()
-                if changed_ratio >= minimum_change_threshold
-            }
             valid = bool(affected)
             footprint = learned_footprint
-
-        before_visible = self._before_visible_hit_cells(
-            before_image=before_image,
-            points_by_cell=points_by_cell,
-            candidates=affected,
-        )
-        if before_visible is None:
-            return self._invalid_result(result_center)
-        if before_visible:
-            affected = affected - before_visible
-            if learned_offsets is None:
-                valid = result_center in affected and len(affected) >= 2
-                footprint = (
-                    RedFootprint(
-                        offsets=frozenset(
-                            (
-                                row - result_center[0],
-                                col - result_center[1],
-                            )
-                            for row, col in affected
-                        )
-                    )
-                    if valid
-                    else None
-                )
-            else:
-                valid = bool(affected)
 
         classified = self._classify_affected_cells(
             after_images=frames,
@@ -363,13 +521,31 @@ class RedScoutAnalyzer:
             states_by_cell=states_by_cell,
         )
         if classified is None:
-            return self._invalid_result(result_center)
+            diagnostics["stage"] = "classify_affected_cells"
+            return self._invalid_result(
+                result_center,
+                reason="result_classification_failed",
+                diagnostics=diagnostics,
+            )
         hit_cells, miss_cells, unknown_cells = classified
+        if completed_ship is not None:
+            authoritative_hits = set(completed_ship.new_hit_cells) & affected
+            hit_cells.update(authoritative_hits)
+            miss_cells.difference_update(authoritative_hits)
+            unknown_cells.difference_update(authoritative_hits)
 
         confidence_by_cell = {
             cell: median_change_by_cell[cell]
             for cell in sorted(affected)
         }
+        diagnostics.update(
+            {
+                "stage": "complete" if valid else "insufficient_changes",
+                "final_hits": tuple(sorted(hit_cells)),
+                "final_misses": tuple(sorted(miss_cells)),
+                "final_unknown": tuple(sorted(unknown_cells)),
+            }
+        )
         return RedScoutResult(
             center_cell=result_center,
             affected_cells=frozenset(affected),
@@ -379,6 +555,106 @@ class RedScoutAnalyzer:
             footprint=footprint,
             valid=valid,
             confidence_by_cell=MappingProxyType(dict(confidence_by_cell)),
+            invalid_reason=None if valid else "insufficient_changed_cells",
+            diagnostics=diagnostics,
+        )
+
+    @staticmethod
+    def _completed_ship_evidence(
+        *,
+        before_image: np.ndarray,
+        after_images: tuple[np.ndarray, ...],
+        submarine_lengths: Sequence[int],
+        before_visible: set[Cell],
+        raw_stable_result_hits: set[Cell],
+        grid_size: int,
+        diagnostics: dict[str, object] | None = None,
+    ) -> _CompletedShipEvidence | None:
+        details = diagnostics if diagnostics is not None else {}
+        details.update(
+            {
+                "completed_sidebar_votes": (),
+                "completed_lengths": (),
+                "resolved_ship_placements": (),
+                "completed_perimeter": (),
+                "completed_ship_failure": None,
+            }
+        )
+        try:
+            lengths = tuple(int(length) for length in submarine_lengths)
+        except (TypeError, ValueError):
+            details["completed_ship_failure"] = "invalid_submarine_lengths"
+            return None
+        if not lengths or any(length <= 0 for length in lengths):
+            details["completed_ship_failure"] = "submarine_lengths_unavailable"
+            return None
+
+        before_progress = detect_sidebar_progress(before_image, lengths)
+        if before_progress is None or not before_progress.valid:
+            details["completed_ship_failure"] = "before_sidebar_unavailable"
+            return None
+
+        completion_votes: Counter[tuple[int, ...]] = Counter()
+        for after_image in after_images:
+            after_progress = detect_sidebar_progress(after_image, lengths)
+            completed = newly_completed_lengths(before_progress, after_progress)
+            if completed:
+                completion_votes[completed] += 1
+        details["completed_sidebar_votes"] = tuple(
+            {
+                "lengths": completed_lengths,
+                "votes": int(votes),
+            }
+            for completed_lengths, votes in sorted(completion_votes.items())
+        )
+        if not completion_votes:
+            details["completed_ship_failure"] = "no_sidebar_completion"
+            return None
+
+        completed_lengths, votes = min(
+            completion_votes.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+        details["completed_lengths"] = completed_lengths
+        if votes < MINIMUM_FRAME_VOTES:
+            details["completed_ship_failure"] = "insufficient_sidebar_votes"
+            return None
+
+        resolution = resolve_completed_ship_cells(
+            before_visible | raw_stable_result_hits,
+            completed_lengths,
+            grid_size=grid_size,
+        )
+        details["resolved_ship_placements"] = resolution.placements
+        details["unresolved_ship_lengths"] = resolution.unresolved_lengths
+        details["discarded_ship_cells"] = tuple(sorted(resolution.discarded_cells))
+        if resolution.unresolved_lengths:
+            details["completed_ship_failure"] = "ship_geometry_unresolved"
+            return None
+
+        new_hit_cells = set(resolution.cells) - before_visible
+        if not new_hit_cells:
+            details["completed_ship_failure"] = "no_new_completed_ship_cells"
+            return None
+
+        perimeter_cells: set[Cell] = set()
+        for row, col in resolution.cells:
+            for row_offset in (-1, 0, 1):
+                for col_offset in (-1, 0, 1):
+                    neighbor = (row + row_offset, col + col_offset)
+                    if (
+                        neighbor not in resolution.cells
+                        and _inside_grid(neighbor, grid_size)
+                    ):
+                        perimeter_cells.add(neighbor)
+
+        details["completed_perimeter"] = tuple(sorted(perimeter_cells))
+        details["completed_ship_failure"] = None
+
+        return _CompletedShipEvidence(
+            new_hit_cells=frozenset(new_hit_cells),
+            ship_cells=resolution.cells,
+            perimeter_cells=frozenset(perimeter_cells),
         )
 
     def _preflight(
@@ -468,6 +744,7 @@ class RedScoutAnalyzer:
         points_by_cell: Mapping[Cell, tuple[int, int]],
         candidates: set[Cell],
         minimum_change_threshold: float,
+        mandatory_candidates: frozenset[Cell] | set[Cell] = frozenset(),
     ) -> tuple[dict[Cell, float], dict[Cell, tuple[str, ...]]] | None:
         if self._classifier is classify_diamond_hit:
             filtered = _prefilter_candidates_by_change_upper_bound(
@@ -478,7 +755,7 @@ class RedScoutAnalyzer:
                 minimum_change_threshold=minimum_change_threshold,
             )
             if filtered is not None:
-                candidates = filtered
+                candidates = filtered | mandatory_candidates
 
         median_change_by_cell: dict[Cell, float] = {}
         states_by_cell: dict[Cell, tuple[str, ...]] = {}
@@ -500,6 +777,71 @@ class RedScoutAnalyzer:
             median_change_by_cell[cell] = float(median(changes))
             states_by_cell[cell] = tuple(states)
         return median_change_by_cell, states_by_cell
+
+    def _stable_visible_hit_cells(
+        self,
+        *,
+        after_images: tuple[np.ndarray, ...],
+        points_by_cell: Mapping[Cell, tuple[int, int]],
+        candidates: set[Cell],
+    ) -> set[Cell] | None:
+        visible: set[Cell] = set()
+        for cell in sorted(candidates):
+            detector_votes = 0
+            for after_image in after_images:
+                try:
+                    detector_votes += bool(
+                        self._hit_detector(after_image, points_by_cell[cell])
+                    )
+                except Exception:
+                    return None
+            if detector_votes >= MINIMUM_FRAME_VOTES:
+                visible.add(cell)
+        return visible
+
+    @staticmethod
+    def _collapse_completed_submarine_hits(
+        hit_cells: set[Cell],
+        *,
+        center_cell: Cell,
+        confidence_by_cell: Mapping[Cell, float],
+    ) -> set[Cell]:
+        remaining = set(hit_cells)
+        collapsed: set[Cell] = set()
+        while remaining:
+            first = min(remaining)
+            remaining.remove(first)
+            component = {first}
+            pending = [first]
+            while pending:
+                row, col = pending.pop()
+                for neighbor in (
+                    (row - 1, col),
+                    (row + 1, col),
+                    (row, col - 1),
+                    (row, col + 1),
+                ):
+                    if neighbor in remaining:
+                        remaining.remove(neighbor)
+                        component.add(neighbor)
+                        pending.append(neighbor)
+            if len(component) == 1:
+                collapsed.update(component)
+                continue
+            if center_cell in component:
+                collapsed.add(center_cell)
+                continue
+            collapsed.add(
+                min(
+                    component,
+                    key=lambda cell: (
+                        -float(confidence_by_cell.get(cell, 0.0)),
+                        cell[0],
+                        cell[1],
+                    ),
+                )
+            )
+        return collapsed
 
     def _before_visible_hit_cells(
         self,
@@ -547,7 +889,12 @@ class RedScoutAnalyzer:
         return hit_cells, miss_cells, unknown_cells
 
     @staticmethod
-    def _invalid_result(center_cell: Cell) -> RedScoutResult:
+    def _invalid_result(
+        center_cell: Cell,
+        *,
+        reason: str = "analysis_failed",
+        diagnostics: Mapping[str, object] | None = None,
+    ) -> RedScoutResult:
         return RedScoutResult(
             center_cell=center_cell,
             affected_cells=frozenset(),
@@ -557,6 +904,8 @@ class RedScoutAnalyzer:
             footprint=None,
             valid=False,
             confidence_by_cell=MappingProxyType({}),
+            invalid_reason=reason,
+            diagnostics=diagnostics,
         )
 
 

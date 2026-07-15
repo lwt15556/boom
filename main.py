@@ -19,6 +19,7 @@ from config import (
     LEVEL_REFERENCE_DIR,
     MAX_LEVEL,
     MAX_PROBE_SAMPLE_DIRS,
+    MAX_RED_SCOUT_SAMPLE_DIRS,
     OUTPUT_DIR,
     REQUIRE_CONFIDENT_LEVEL_DETECTION,
     SCREENSHOT_DIR,
@@ -28,6 +29,10 @@ from config import (
 )
 from save_points.points import read_saved_points, read_saved_quad
 from utils import AdbController, MatchResult, find_template, get_logger
+from utils.adaptive_frames import (
+    ADAPTIVE_HIT_MIN_FRAMES,
+    can_stop_after_stable_hit_frames,
+)
 from utils.diamond_centers import detect_diamond_centers
 from utils.diamond_hit import classify_diamond_hit
 from utils.hit_map import save_hit_map_image
@@ -82,6 +87,8 @@ adb = AdbController()
 ACTIVITY_BUTTON_TEMPLATE = TEMPLATE_DIR / "activity_button.png"
 LOGIN_TEMPLATE = TEMPLATE_DIR / "login.png"
 QUIT_ACTIVITY_TEMPLATE = TEMPLATE_DIR / "quit_activity.png"
+ACTIVITY_QUIT_ROI_REFERENCE_SIZE = (100, 100)
+SCREEN_REFERENCE_SIZE = (1280, 720)
 RETRY_TEMPLATE = TEMPLATE_DIR / "retry.png"
 CONNECTION_INTERRUPTED_TEMPLATE = TEMPLATE_DIR / "connection_interrupted.png"
 CONNECTION_RETRY_TEMPLATE = TEMPLATE_DIR / "connection_retry.png"
@@ -93,11 +100,14 @@ CONNECTION_DIALOG_THRESHOLD = 0.78
 CONNECTION_RETRY_THRESHOLD = 0.74
 VICTORY_TEMPLATE_SCALES = (0.75, 0.85, 0.95, 1.0, 1.05, 1.15, 1.3, 1.5, 1.65, 1.8)
 VICTORY_BANNER_THRESHOLD = 0.80
+VICTORY_SEARCH_REGION = (0.18, 0.06, 0.82, 0.70)
 VICTORY_WAIT_AFTER_HIT_SECONDS = 10.0
+VICTORY_WAIT_AFTER_CONFIRMED_INCOMPLETE_SECONDS = 2.0
 VICTORY_WAIT_BEFORE_LEVEL_SECONDS = 3.0
 VICTORY_SKIP_SETTLE_SECONDS = 2.0
 LEVEL_ADVANCE_RETRIES = 3
 HIT_RESULT_FRAME_DELAYS = (1.0, 0.35, 0.45, 0.55)
+ADAPTIVE_HIT_FRAMES_ENABLED = True
 SUSPECT_HIT_EXTRA_FRAME_DELAYS = (0.45, 0.55, 0.65)
 MIN_HIT_RESULT_VOTES = 2
 SUSPECT_HIT_SCORE_THRESHOLD = 0.78
@@ -135,6 +145,7 @@ SCREEN_CONTINUE_POINT = (640, 360)
 BLUE_BOMB_POINT = (1120, 660)
 RUN_DEBUG_DIR = SCREENSHOT_DIR / "run_debug"
 PROBE_SAMPLE_DIR = SCREENSHOT_DIR / "probes"
+RED_SCOUT_SAMPLE_DIR = SCREENSHOT_DIR.parent / "red_scout_samples"
 RUNTIME_DIR = SCREENSHOT_DIR.parent / "runtime"
 STATUS_FILE = RUNTIME_DIR / "status.json"
 LEVEL_STATE_FILE = RUNTIME_DIR / "level_state.json"
@@ -369,6 +380,131 @@ def _create_probe_sample_dir(level: int, cell: Cell, index: int) -> Path:
     return sample_dir
 
 
+def _create_red_scout_sample_dir(
+    level: int,
+    center: Cell,
+    index: int,
+    attempt: int,
+) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    row, col = center
+    sample_dir = RED_SCOUT_SAMPLE_DIR / (
+        f"level_{level}_attempt_{attempt:02d}_cell_{index}_"
+        f"r{row}_c{col}_{timestamp}"
+    )
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    _prune_red_scout_sample_dirs()
+    return sample_dir
+
+
+def _prune_red_scout_sample_dirs(
+    max_directories: int = MAX_RED_SCOUT_SAMPLE_DIRS,
+) -> None:
+    if max_directories < 1:
+        return
+
+    try:
+        root = RED_SCOUT_SAMPLE_DIR.resolve(strict=False)
+        children = tuple(RED_SCOUT_SAMPLE_DIR.iterdir())
+    except (FileNotFoundError, OSError):
+        return
+
+    managed: list[tuple[int, Path]] = []
+    for path in children:
+        try:
+            if (
+                path.is_symlink()
+                or not path.is_dir()
+                or not path.name.startswith("level_")
+                or "_attempt_" not in path.name
+                or path.resolve(strict=False).parent != root
+            ):
+                continue
+            managed.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue
+
+    managed.sort(key=lambda item: item[0], reverse=True)
+    removed = 0
+    for _mtime, path in managed[max_directories:]:
+        try:
+            entries = tuple(path.iterdir())
+            if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+                logger.warning(
+                    "red scout sample retention skipped unsafe directory: %s",
+                    path,
+                )
+                continue
+            for entry in entries:
+                entry.unlink()
+            path.rmdir()
+            removed += 1
+        except OSError as exc:
+            logger.warning("failed to prune red scout sample directory %s: %s", path, exc)
+    if removed:
+        logger.info(
+            "red scout sample retention removed %s old directories; keeping newest %s",
+            removed,
+            max_directories,
+        )
+
+
+def _red_scout_json_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _red_scout_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (tuple, list, set, frozenset)):
+        return [_red_scout_json_value(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Enum):
+        return value.value
+    return value
+
+
+def _write_red_scout_analysis(
+    sample_dir: Path,
+    result: RedScoutResult,
+    *,
+    level: int,
+    index: int,
+    attempt: int,
+) -> None:
+    complete_six = _red_scout_result_is_complete_six(result)
+    payload = {
+        "version": 1,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "level": int(level),
+        "attempt": int(attempt),
+        "index": int(index),
+        "center": list(result.center_cell),
+        "valid": bool(result.valid),
+        "complete_six": complete_six,
+        "invalid_reason": result.invalid_reason,
+        "affected": [list(cell) for cell in sorted(result.affected_cells)],
+        "hits": [list(cell) for cell in sorted(result.hit_cells)],
+        "misses": [list(cell) for cell in sorted(result.miss_cells)],
+        "unknown": [list(cell) for cell in sorted(result.unknown_cells)],
+        "confidence": [
+            {
+                "cell": list(cell),
+                "value": float(result.confidence_by_cell[cell]),
+            }
+            for cell in sorted(result.confidence_by_cell)
+        ],
+        "diagnostics": _red_scout_json_value(result.diagnostics),
+    }
+    output_path = sample_dir / "analysis.json"
+    temp_path = output_path.with_suffix(".tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temp_path.replace(output_path)
+
+
 def _prune_probe_sample_dirs(
     max_directories: int = MAX_PROBE_SAMPLE_DIRS,
 ) -> None:
@@ -461,6 +597,7 @@ def _save_probe_result_json(
     frames: list[dict],
     suspect_extra_checked: bool,
     decision_reason: str = "",
+    adaptive_frames_stopped: bool = False,
 ) -> None:
     payload = {
         "level": level,
@@ -473,12 +610,76 @@ def _save_probe_result_json(
         "frame_count": len(frames),
         "min_hit_votes": MIN_HIT_RESULT_VOTES,
         "suspect_extra_checked": suspect_extra_checked,
+        "adaptive_frames_stopped": adaptive_frames_stopped,
         "frames": frames,
     }
     (sample_dir / "result.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _should_preserve_all_probe_images(
+    frame_records: Sequence[Mapping[str, object]],
+    *,
+    suspect_extra_checked: bool,
+    victory_detected: bool,
+) -> bool:
+    if suspect_extra_checked or victory_detected or not frame_records:
+        return True
+    if any(bool(record.get("dynamic_hit_vetoed")) for record in frame_records):
+        return True
+    if any(bool(record.get("victory_banner")) for record in frame_records):
+        return True
+
+    states = {
+        str(result.get("state", ""))
+        for record in frame_records
+        if isinstance((result := record.get("result")), Mapping)
+    }
+    if len(states) != 1:
+        return True
+
+    sidebar_states = {
+        tuple(record.get("sidebar_completed_lengths", ()))
+        for record in frame_records
+    }
+    return len(sidebar_states) > 1
+
+
+def _persist_probe_debug_images(
+    sample_dir: Path,
+    before_capture,
+    frame_captures: Sequence[tuple[Path, object]],
+    frame_records: list[dict],
+    *,
+    preserve_all: bool,
+) -> None:
+    if before_capture is not None:
+        before_capture.save(sample_dir / "before.png")
+
+    for record in frame_records:
+        record["saved"] = False
+    if not frame_captures:
+        return
+
+    if preserve_all or len(frame_captures) != len(frame_records):
+        selected = set(range(len(frame_captures)))
+    else:
+        best_index = max(
+            range(len(frame_records)),
+            key=lambda index: float(
+                frame_records[index].get("result", {}).get("score", 0.0)
+            ),
+        )
+        selected = {best_index}
+
+    for capture_index, (path, capture) in enumerate(frame_captures):
+        if capture_index not in selected:
+            continue
+        capture.save(path)
+        if capture_index < len(frame_records):
+            frame_records[capture_index]["saved"] = True
 
 
 def _is_near_hit_frame(result) -> bool:
@@ -629,33 +830,60 @@ def latch_network_fail_closed(reason: str) -> None:
     write_runtime_status(network="fail_closed", network_fail_closed_reason=_network_fail_closed_reason)
 
 
-def _capture_red_ammo_state():
-    frames = [adb.read_screenshot(RUN_DEBUG_DIR / f"red_ammo_{i}.png") for i in range(3)]
+def _capture_red_ammo_state(
+    sample_dir: Path | None = None,
+    *,
+    prefix: str = "red_ammo",
+    include_frames: bool = False,
+):
+    frames = [
+        adb.read_screenshot(
+            (
+                sample_dir / f"{prefix}_{i}.png"
+                if sample_dir is not None
+                else RUN_DEBUG_DIR / f"red_ammo_{i}.png"
+            )
+        )
+        for i in range(3)
+    ]
     match = locate_red_bomb_button(frames[0])
     fingerprint = build_ammo_fingerprint(frames, match) if match is not None else None
     if match is None or fingerprint is None:
         raise RedScoutSafetyError("red bomb button or ammo fingerprint unavailable")
-    return frames[0], fingerprint, match
+    return (frames if include_frames else frames[0]), fingerprint, match
 
 
-def _select_red_bomb(match: MatchResult) -> bool:
+def _select_red_bomb(
+    match: MatchResult,
+    output_path: Path | None = None,
+) -> bool:
     adb.click(*match.center)
     adb.delay(0.25)
-    return red_bomb_selected(adb.read_screenshot(RUN_DEBUG_DIR / "red_selected.png"), match)
+    return red_bomb_selected(
+        adb.read_screenshot(output_path or RUN_DEBUG_DIR / "red_selected.png"),
+        match,
+    )
 
 
-def _capture_red_result_frames():
+def _capture_red_result_frames(sample_dir: Path | None = None):
     return [
         adb.delay(frame_delay).read_screenshot(
-            RUN_DEBUG_DIR / f"red_result_{frame_index}.png"
+            (
+                sample_dir / f"after_{frame_index}.png"
+                if sample_dir is not None
+                else RUN_DEBUG_DIR / f"red_result_{frame_index}.png"
+            )
         )
         for frame_index, frame_delay in enumerate(HIT_RESULT_FRAME_DELAYS)
     ]
 
 
-def _verify_red_ammo_unchanged(before_fingerprint: AmmoFingerprint) -> None:
+def _verify_red_ammo_unchanged(
+    before_fingerprint: AmmoFingerprint,
+    sample_dir: Path | None = None,
+) -> None:
     write_runtime_status(phase="red_scout_verify_ammo")
-    after_state = _capture_red_ammo_state()
+    after_state = _capture_red_ammo_state(sample_dir=sample_dir, prefix="verify")
     if not ammo_fingerprint_matches(before_fingerprint, after_state[1]):
         _stop_and_latch_red_safety_failure("red ammo fingerprint mismatch")
     clear_pending_probe()
@@ -670,7 +898,7 @@ def _wait_until_activity_detail_closed(
     while monotonic() - start_time < timeout:
         screenshot = adb.read_screenshot()
         if isinstance(screenshot, np.ndarray):
-            detail_open = find_template(screenshot, QUIT_ACTIVITY_TEMPLATE) is not None
+            detail_open = _activity_quit_button_visible(screenshot)
             absent_frames = 0 if detail_open else absent_frames + 1
             if absent_frames >= ACTIVITY_EXIT_STABLE_FRAMES:
                 logger.info("activity detail exit confirmed; starting offline re-entry")
@@ -679,8 +907,33 @@ def _wait_until_activity_detail_closed(
             absent_frames = 0
         sleep(FAST_POLL_INTERVAL_SECONDS)
 
+    if absent_frames:
+        screenshot = adb.read_screenshot()
+        if (
+            isinstance(screenshot, np.ndarray)
+            and not _activity_quit_button_visible(screenshot)
+        ):
+            logger.info(
+                "activity detail exit confirmed by final frame after timeout"
+            )
+            return True
+
     logger.warning("activity detail did not close within %.1f seconds", timeout)
     return False
+
+
+def _activity_quit_button_visible(screenshot: np.ndarray) -> bool:
+    if not isinstance(screenshot, np.ndarray) or screenshot.ndim < 2:
+        return False
+    height, width = screenshot.shape[:2]
+    reference_width, reference_height = SCREEN_REFERENCE_SIZE
+    roi_width, roi_height = ACTIVITY_QUIT_ROI_REFERENCE_SIZE
+    x2 = min(width, max(1, round(width * roi_width / reference_width)))
+    y2 = min(height, max(1, round(height * roi_height / reference_height)))
+    return (
+        find_template(screenshot[:y2, :x2], QUIT_ACTIVITY_TEMPLATE)
+        is not None
+    )
 
 
 def _exit_activity_after_probe_click(
@@ -761,6 +1014,7 @@ def _analyze_red_result(
     center_cell,
     excluded_cells: Sequence[Cell] | set[Cell] | frozenset[Cell] | None = None,
     learned_footprint: RedFootprint | None = None,
+    submarine_lengths: Sequence[int] = (),
 ):
     return RedScoutAnalyzer().analyze(
         before_image=before_image,
@@ -770,6 +1024,133 @@ def _analyze_red_result(
         center_cell=center_cell,
         excluded_cells=set() if excluded_cells is None else excluded_cells,
         learned_footprint=learned_footprint,
+        submarine_lengths=submarine_lengths,
+    )
+
+
+def _red_scout_result_is_complete_six(result: RedScoutResult) -> bool:
+    return (
+        result.valid
+        and len(result.affected_cells) == 6
+        and not result.unknown_cells
+        and result.affected_cells == result.hit_cells | result.miss_cells
+    )
+
+
+def _red_scout_result_signature(result: RedScoutResult) -> tuple[object, ...]:
+    return (
+        bool(result.valid),
+        result.affected_cells,
+        result.hit_cells,
+        result.miss_cells,
+        result.unknown_cells,
+    )
+
+
+def _red_scout_result_quality(result: RedScoutResult) -> tuple[int, int, int, int]:
+    classified = len(result.hit_cells | result.miss_cells)
+    return (
+        int(_red_scout_result_is_complete_six(result)),
+        int(result.valid),
+        classified,
+        len(result.affected_cells) - len(result.unknown_cells),
+    )
+
+
+def _analyze_red_result_with_baseline_consensus(
+    *,
+    before_images: Sequence[object],
+    after_images: Sequence[object],
+    click_points: Sequence[tuple[int, int]],
+    grid_size: int,
+    center_cell: Cell,
+    excluded_cells: Sequence[Cell] | set[Cell] | frozenset[Cell] | None = None,
+    learned_footprint: RedFootprint | None = None,
+    submarine_lengths: Sequence[int] = (),
+) -> RedScoutResult:
+    baselines = tuple(before_images)
+    if not baselines:
+        raise ValueError("red scout analysis requires at least one baseline frame")
+
+    def analyze(baseline: object) -> RedScoutResult:
+        return _analyze_red_result(
+            baseline,
+            after_images,
+            click_points,
+            grid_size,
+            center_cell,
+            excluded_cells=excluded_cells,
+            learned_footprint=learned_footprint,
+            submarine_lengths=submarine_lengths,
+        )
+
+    primary = analyze(baselines[0])
+    if _red_scout_result_is_complete_six(primary) or len(baselines) == 1:
+        return primary
+
+    results = [primary]
+    for baseline_index, baseline in enumerate(baselines[1:], start=1):
+        try:
+            results.append(analyze(baseline))
+        except Exception as exc:
+            logger.warning(
+                "red scout secondary baseline %s analysis failed; keeping safer primary "
+                "result: %s",
+                baseline_index,
+                exc,
+            )
+    groups: dict[tuple[object, ...], list[RedScoutResult]] = {}
+    for result in results:
+        groups.setdefault(_red_scout_result_signature(result), []).append(result)
+
+    agreed_groups = [group for group in groups.values() if len(group) >= 2]
+    if not agreed_groups:
+        return primary
+    consensus_group = max(
+        agreed_groups,
+        key=lambda group: _red_scout_result_quality(group[0]),
+    )
+    consensus = consensus_group[0]
+    if _red_scout_result_quality(consensus) <= _red_scout_result_quality(primary):
+        return primary
+
+    logger.info(
+        "red scout baseline consensus recovered a stronger result: affected=%s hits=%s "
+        "misses=%s",
+        sorted(consensus.affected_cells),
+        sorted(consensus.hit_cells),
+        sorted(consensus.miss_cells),
+    )
+    diagnostics = dict(consensus.diagnostics)
+    diagnostics.update(
+        {
+            "baseline_count": len(results),
+            "baseline_consensus_votes": len(consensus_group),
+            "baseline_results": tuple(
+                {
+                    "valid": bool(result.valid),
+                    "affected": tuple(sorted(result.affected_cells)),
+                    "hits": tuple(sorted(result.hit_cells)),
+                    "misses": tuple(sorted(result.miss_cells)),
+                    "unknown": tuple(sorted(result.unknown_cells)),
+                    "invalid_reason": result.invalid_reason,
+                }
+                for result in results
+            ),
+        }
+    )
+    return RedScoutResult(
+        center_cell=consensus.center_cell,
+        affected_cells=consensus.affected_cells,
+        hit_cells=consensus.hit_cells,
+        miss_cells=consensus.miss_cells,
+        unknown_cells=consensus.unknown_cells,
+        footprint=consensus.footprint,
+        valid=consensus.valid,
+        confidence_by_cell=consensus.confidence_by_cell,
+        level_completed=consensus.level_completed,
+        invalid_reason=consensus.invalid_reason,
+        diagnostics=diagnostics,
     )
 
 
@@ -888,20 +1269,45 @@ def _execute_red_scout_transaction(
     all_click_points: Sequence[tuple[int, int]],
     excluded_cells: Sequence[Cell] | set[Cell] | frozenset[Cell] = (),
     learned_footprint: RedFootprint | None = None,
+    submarine_lengths: Sequence[int] = (),
+    attempt: int | None = None,
 ):
     global _active_probe
     transaction = None
     grid_clicked = False
     pending_marker_written = False
+    sample_dir: Path | None = None
+    if attempt is not None:
+        try:
+            sample_dir = _create_red_scout_sample_dir(
+                level,
+                center_cell,
+                index,
+                attempt,
+            )
+        except OSError as exc:
+            logger.warning("could not create red scout sample directory: %s", exc)
     try:
         write_runtime_status(phase="red_scout_preflight", level=level)
         enable_weak_network(PROBE_DROP_SETTLE_SECONDS)
         _verify_network_isolated_or_fail_closed(red_scout=True)
-        before_image, before_fingerprint, match = _capture_red_ammo_state()
+        before_capture, before_fingerprint, match = _capture_red_ammo_state(
+            sample_dir=sample_dir,
+            prefix="before",
+            include_frames=True,
+        )
+        before_images = (
+            list(before_capture)
+            if isinstance(before_capture, (list, tuple))
+            else [before_capture]
+        )
         transaction = ProbeTransaction(level, center_cell, index)
         _active_probe = transaction
         transaction.advance(ProbePhase.REQUEST_PENDING)
-        if not _select_red_bomb(match):
+        if not _select_red_bomb(
+            match,
+            output_path=(sample_dir / "selected.png" if sample_dir is not None else None),
+        ):
             raise RedScoutSafetyError("red bomb selection not confirmed")
         write_pending_probe(
             mode=ProbeMode.RED_SCOUT.value,
@@ -916,22 +1322,18 @@ def _execute_red_scout_transaction(
         grid_clicked = True
         adb.click(*point)
         _exit_activity_after_probe_click(
-            RUN_DEBUG_DIR / "red_debug_back.png",
+            (
+                sample_dir / "exit_attempt.png"
+                if sample_dir is not None
+                else RUN_DEBUG_DIR / "red_debug_back.png"
+            ),
             use_system_back=True,
         )
         if _reenter_activity_for_probe_result():
             transaction.advance(ProbePhase.RESULT_VISIBLE)
             transaction.advance(ProbePhase.RESULT_RECORDED)
             update_pending_probe(phase=ProbePhase.RESULT_RECORDED.name, local_victory=True)
-            logger.warning(
-                "red scout displayed a local victory; discarding it and continuing with blue "
-                "attacks because the red request must never be committed"
-            )
-            _discard_pending_request_and_prepare_next_probe(transaction)
-            _verify_red_ammo_unchanged(before_fingerprint)
-            pending_marker_written = False
-            _active_probe = None
-            return RedScoutResult(
+            local_victory_result = RedScoutResult(
                 center_cell=center_cell,
                 affected_cells=frozenset(),
                 hit_cells=frozenset(),
@@ -941,22 +1343,56 @@ def _execute_red_scout_transaction(
                 valid=False,
                 confidence_by_cell={},
                 level_completed=False,
+                invalid_reason="local_victory_screen",
+                diagnostics={"stage": "local_victory"},
             )
+            if sample_dir is not None and attempt is not None:
+                try:
+                    _write_red_scout_analysis(
+                        sample_dir,
+                        local_victory_result,
+                        level=level,
+                        index=index,
+                        attempt=attempt,
+                    )
+                except OSError as exc:
+                    logger.warning("could not write red scout analysis: %s", exc)
+            logger.warning(
+                "red scout displayed a local victory; discarding it and continuing with blue "
+                "attacks because the red request must never be committed"
+            )
+            _discard_pending_request_and_prepare_next_probe(transaction)
+            _verify_red_ammo_unchanged(before_fingerprint, sample_dir=sample_dir)
+            pending_marker_written = False
+            _active_probe = None
+            return local_victory_result
         transaction.advance(ProbePhase.RESULT_VISIBLE)
         update_pending_probe(phase=ProbePhase.RESULT_VISIBLE.name)
         write_runtime_status(phase="red_scout_capture", level=level)
-        after_images = _capture_red_result_frames()
+        after_images = _capture_red_result_frames(sample_dir=sample_dir)
         transaction.advance(ProbePhase.RESULT_RECORDED)
         update_pending_probe(phase=ProbePhase.RESULT_RECORDED.name)
-        analysis = _analyze_red_result(
-            before_image,
-            after_images,
-            all_click_points,
-            grid_size,
-            center_cell,
+        analysis = _analyze_red_result_with_baseline_consensus(
+            before_images=before_images,
+            after_images=after_images,
+            click_points=all_click_points,
+            grid_size=grid_size,
+            center_cell=center_cell,
             excluded_cells=excluded_cells,
             learned_footprint=learned_footprint,
+            submarine_lengths=submarine_lengths,
         )
+        if sample_dir is not None and attempt is not None:
+            try:
+                _write_red_scout_analysis(
+                    sample_dir,
+                    analysis,
+                    level=level,
+                    index=index,
+                    attempt=attempt,
+                )
+            except OSError as exc:
+                logger.warning("could not write red scout analysis: %s", exc)
         write_runtime_status(phase="red_scout_discard", level=level)
         _discard_pending_request_and_prepare_next_probe(transaction)
         if (
@@ -966,7 +1402,7 @@ def _execute_red_scout_transaction(
             _stop_and_latch_red_safety_failure(
                 f"red discard contract violated: phase={transaction.phase.name}"
             )
-        _verify_red_ammo_unchanged(before_fingerprint)
+        _verify_red_ammo_unchanged(before_fingerprint, sample_dir=sample_dir)
         pending_marker_written = False
         _active_probe = None
         return analysis
@@ -1205,6 +1641,8 @@ def reset_runtime_level_status(level: int) -> None:
         last_result="",
         red_scout_current=0,
         red_scout_total=0,
+        red_scout_valid=0,
+        red_scout_complete_six=0,
     )
 
 
@@ -2184,6 +2622,8 @@ def _run_red_scout_and_blue_strategy(
     initial_real_hits = set(initial_hits)
     attempted_centers: set[Cell] = set()
     attempts_completed = 0
+    valid_attempts = 0
+    complete_six_attempts = 0
     online_sidebar_completed_lengths: tuple[int, ...] = ()
 
     def current_board_states() -> list[list[str]]:
@@ -2247,12 +2687,25 @@ def _run_red_scout_and_blue_strategy(
             index,
             grid_size,
             click_points,
-            excluded_cells=known_cells,
+            excluded_cells=(),
             learned_footprint=footprint,
+            submarine_lengths=submarines,
+            attempt=attempts_completed + 1,
         )
         attempts_completed += 1
+        if result.valid:
+            valid_attempts += 1
+        complete_six = (
+            result.valid
+            and len(result.affected_cells) == 6
+            and not result.unknown_cells
+            and result.affected_cells == result.hit_cells | result.miss_cells
+        )
+        if complete_six:
+            complete_six_attempts += 1
         logger.info(
-            "red scout %s/%s center=%s affected=%s hits=%s misses=%s unknown=%s valid=%s",
+            "red scout %s/%s center=%s affected=%s hits=%s misses=%s unknown=%s "
+            "valid=%s complete_six=%s invalid_reason=%s",
             attempts_completed,
             settings.count,
             center,
@@ -2261,6 +2714,8 @@ def _run_red_scout_and_blue_strategy(
             sorted(result.miss_cells),
             sorted(result.unknown_cells),
             result.valid,
+            complete_six,
+            result.invalid_reason,
         )
         if result.level_completed:
             write_runtime_status(
@@ -2269,6 +2724,8 @@ def _run_red_scout_and_blue_strategy(
                 current_cell="--",
                 red_scout_current=attempts_completed,
                 red_scout_total=settings.count,
+                red_scout_valid=valid_attempts,
+                red_scout_complete_six=complete_six_attempts,
                 board_size=grid_size,
                 board_states=current_board_states(),
                 last_result="level_complete",
@@ -2294,6 +2751,8 @@ def _run_red_scout_and_blue_strategy(
             current_cell=index,
             red_scout_current=attempts_completed,
             red_scout_total=settings.count,
+            red_scout_valid=valid_attempts,
+            red_scout_complete_six=complete_six_attempts,
             board_size=grid_size,
             board_states=current_board_states(),
             last_result="scout_valid" if result.valid else "scout_invalid",
@@ -2317,6 +2776,8 @@ def _run_red_scout_and_blue_strategy(
                 current_cell=direct_index,
                 red_scout_current=attempts_completed,
                 red_scout_total=settings.count,
+                red_scout_valid=valid_attempts,
+                red_scout_complete_six=complete_six_attempts,
                 board_size=grid_size,
                 board_states=current_board_states(),
             )
@@ -2344,6 +2805,8 @@ def _run_red_scout_and_blue_strategy(
                     current_cell="--",
                     red_scout_current=attempts_completed,
                     red_scout_total=settings.count,
+                    red_scout_valid=valid_attempts,
+                    red_scout_complete_six=complete_six_attempts,
                     board_size=grid_size,
                     board_states=current_board_states(),
                     last_result=probe_result.value,
@@ -2374,6 +2837,8 @@ def _run_red_scout_and_blue_strategy(
                 current_cell="--" if level_completed else direct_index,
                 red_scout_current=attempts_completed,
                 red_scout_total=settings.count,
+                red_scout_valid=valid_attempts,
+                red_scout_complete_six=complete_six_attempts,
                 hits=current_display_hit_count(),
                 total_ship_cells=sum(submarines),
                 board_size=grid_size,
@@ -2386,6 +2851,8 @@ def _run_red_scout_and_blue_strategy(
     write_runtime_status(phase="blue_attack", level=level,
                          red_scout_current=attempts_completed,
                          red_scout_total=settings.count,
+                         red_scout_valid=valid_attempts,
+                         red_scout_complete_six=complete_six_attempts,
                          current_cell="--",
                          board_size=grid_size,
                          board_states=current_board_states())
@@ -2433,6 +2900,68 @@ def _sidebar_confirms_all_submarines(
         and progress.valid
         and sorted(progress.completed_lengths) == sorted(int(length) for length in submarines)
     )
+
+
+def _victory_wait_timeout_for_sidebar_samples(
+    samples: Sequence[SidebarProgress | None],
+    submarines: Sequence[int],
+    *,
+    required_frames: int | None = None,
+) -> float:
+    required_frames = len(HIT_RESULT_FRAME_DELAYS) if required_frames is None else required_frames
+    progress = _consistent_sidebar_progress(
+        samples,
+        submarines,
+        required_frames=required_frames,
+    )
+    if progress is None or not progress.active_lengths:
+        return VICTORY_WAIT_AFTER_HIT_SECONDS
+    return VICTORY_WAIT_AFTER_CONFIRMED_INCOMPLETE_SECONDS
+
+
+def _consistent_sidebar_progress(
+    samples: Sequence[SidebarProgress | None],
+    submarines: Sequence[int],
+    *,
+    required_frames: int,
+) -> SidebarProgress | None:
+    required_frames = max(1, int(required_frames))
+    expected_fleet = tuple(sorted((int(length) for length in submarines), reverse=True))
+    if not expected_fleet or len(samples) < required_frames:
+        return None
+
+    signatures: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    for progress in samples:
+        if progress is None or not progress.valid:
+            return None
+        active = tuple(sorted((int(length) for length in progress.active_lengths), reverse=True))
+        completed = tuple(
+            sorted((int(length) for length in progress.completed_lengths), reverse=True)
+        )
+        if tuple(sorted(active + completed, reverse=True)) != expected_fleet:
+            return None
+        signatures.append((active, completed))
+
+    if any(signature != signatures[0] for signature in signatures[1:]):
+        return None
+    return samples[0]
+
+
+def _can_stop_probe_frames_early(
+    frame_records: Sequence[Mapping[str, object]],
+    sidebar_samples: Sequence[SidebarProgress | None],
+    submarines: Sequence[int],
+) -> bool:
+    if not ADAPTIVE_HIT_FRAMES_ENABLED:
+        return False
+    if not can_stop_after_stable_hit_frames(frame_records):
+        return False
+    progress = _consistent_sidebar_progress(
+        sidebar_samples,
+        submarines,
+        required_frames=ADAPTIVE_HIT_MIN_FRAMES,
+    )
+    return progress is not None and bool(progress.active_lengths)
 
 
 def _select_blue_bomb_for_online_scout(
@@ -2600,15 +3129,24 @@ def _execute_online_scout_hit(
 
     hit_results = []
     frame_records = []
+    frame_captures: list[tuple[Path, object]] = []
     latest_sidebar_progress: SidebarProgress | None = None
+    sidebar_progress_samples: list[SidebarProgress | None] = []
     sidebar_newly_completed: tuple[int, ...] = ()
     victory_screenshot: np.ndarray | None = None
 
     def capture_online_frame(frame_index: int, frame_delay: float) -> None:
         nonlocal latest_sidebar_progress, sidebar_newly_completed, victory_screenshot
         screenshot_path = sample_dir / f"after_{frame_index}.png"
-        after_img = adb.delay(frame_delay).read_screenshot(screenshot_path)
-        result = classify_diamond_hit(before_img, after_img, point)
+        frame_capture = adb.delay(frame_delay).capture_screenshot()
+        frame_captures.append((screenshot_path, frame_capture))
+        after_img = frame_capture.image
+        try:
+            result = classify_diamond_hit(before_img, after_img, point)
+        except Exception:
+            for captured_path, captured_frame in frame_captures:
+                captured_frame.save(captured_path)
+            raise
         victory_hit = find_victory_banner(after_img) is not None
         if victory_hit:
             victory_screenshot = after_img
@@ -2633,6 +3171,7 @@ def _execute_online_scout_hit(
                 latest_sidebar_progress = frame_sidebar_progress
             if frame_newly_completed:
                 sidebar_newly_completed = frame_newly_completed
+        sidebar_progress_samples.append(frame_sidebar_progress)
 
         dynamic_hit_vetoed = enforce_positive_hit_evidence(
             result,
@@ -2666,8 +3205,20 @@ def _execute_online_scout_hit(
             score=float(result.score),
         )
 
+    adaptive_frames_stopped = False
     for frame_index, frame_delay in enumerate(HIT_RESULT_FRAME_DELAYS, start=1):
         capture_online_frame(frame_index, frame_delay)
+        if _can_stop_probe_frames_early(
+            frame_records,
+            sidebar_progress_samples,
+            submarines,
+        ):
+            adaptive_frames_stopped = True
+            logger.info(
+                "online scout hit stabilized after %s frames; skipping the remaining result frame",
+                len(hit_results),
+            )
+            break
 
     hit_votes = sum(1 for result in hit_results if result.state == "hit")
     suspect_extra_checked = False
@@ -2699,6 +3250,18 @@ def _execute_online_scout_hit(
         hit_votes == 1
         or any(_is_suspect_hit_frame(result) for result in hit_results)
     )
+    preserve_all_images = _should_preserve_all_probe_images(
+        frame_records,
+        suspect_extra_checked=suspect_extra_checked,
+        victory_detected=victory_screenshot is not None,
+    )
+    _persist_probe_debug_images(
+        sample_dir,
+        None,
+        frame_captures,
+        frame_records,
+        preserve_all=preserve_all_images,
+    )
     _save_probe_result_json(
         sample_dir,
         level=level,
@@ -2710,6 +3273,7 @@ def _execute_online_scout_hit(
         frames=frame_records,
         suspect_extra_checked=suspect_extra_checked,
         decision_reason=decision_reason,
+        adaptive_frames_stopped=adaptive_frames_stopped,
     )
 
     if uncertain:
@@ -2895,6 +3459,9 @@ def _execute_probe_transaction(
     _active_probe = transaction
     x, y = point
     sample_dir: Path | None = None
+    before_capture = None
+    frame_captures: list[tuple[Path, object]] = []
+    frame_records: list[dict] = []
 
     try:
         sample_dir = _create_probe_sample_dir(level, cell, index)
@@ -2907,7 +3474,8 @@ def _execute_probe_transaction(
             point=list(point),
             phase=transaction.phase.name,
         )
-        before_img = adb.read_screenshot(sample_dir / "before.png")
+        before_capture = adb.capture_screenshot()
+        before_img = before_capture.image
         before_wreck_visible = (
             red_hit_marker_visible(before_img, (x, y))
             or visible_wreck_static_detected(before_img, (x, y))
@@ -2957,6 +3525,13 @@ def _execute_probe_transaction(
                 current_cell="--",
                 last_result=ProbeResult.HIT_AND_LEVEL_COMPLETE.value,
             )
+            _persist_probe_debug_images(
+                sample_dir,
+                before_capture,
+                frame_captures,
+                frame_records,
+                preserve_all=True,
+            )
             _commit_hit_request_and_prepare_next_probe(transaction)
             clear_pending_probe()
             _write_probe_status(
@@ -2977,13 +3552,16 @@ def _execute_probe_transaction(
         _write_probe_status(sample_dir, "activity_reentered", phase=transaction.phase.name)
         submarines = get_configured_submarines(level, SUBMARINES) or []
         hit_results = []
-        frame_records = []
         latest_sidebar_progress: SidebarProgress | None = None
+        sidebar_progress_samples: list[SidebarProgress | None] = []
         sidebar_newly_completed: tuple[int, ...] = ()
         victory_frame_detected = False
+        adaptive_frames_stopped = False
         for frame_index, frame_delay in enumerate(HIT_RESULT_FRAME_DELAYS, start=1):
             screenshot_path = sample_dir / f"after_{frame_index}.png"
-            after_img = adb.delay(frame_delay).read_screenshot(screenshot_path)
+            frame_capture = adb.delay(frame_delay).capture_screenshot()
+            frame_captures.append((screenshot_path, frame_capture))
+            after_img = frame_capture.image
             result = classify_diamond_hit(before_img, after_img, (x, y))
             victory_hit = find_victory_banner(after_img) is not None
             if victory_hit:
@@ -3014,6 +3592,7 @@ def _execute_probe_transaction(
                     latest_sidebar_progress = frame_sidebar_progress
                 if frame_newly_completed:
                     sidebar_newly_completed = frame_newly_completed
+            sidebar_progress_samples.append(frame_sidebar_progress)
             new_wreck_hit = template_hit and not before_wreck_visible
             dynamic_hit_vetoed = enforce_positive_hit_evidence(
                 result,
@@ -3040,6 +3619,18 @@ def _execute_probe_transaction(
                     "result": _hit_result_to_dict(result),
                 }
             )
+            if _can_stop_probe_frames_early(
+                frame_records,
+                sidebar_progress_samples,
+                submarines,
+            ):
+                adaptive_frames_stopped = True
+                logger.info(
+                    "stable hit and sidebar evidence confirmed after %s frames; "
+                    "skipping the remaining result frame",
+                    len(hit_results),
+                )
+                break
             _write_probe_status(
                 sample_dir,
                 "frame_captured",
@@ -3070,7 +3661,9 @@ def _execute_probe_transaction(
                 start=len(hit_results) + 1,
             ):
                 screenshot_path = sample_dir / f"after_{extra_index}.png"
-                after_img = adb.delay(frame_delay).read_screenshot(screenshot_path)
+                frame_capture = adb.delay(frame_delay).capture_screenshot()
+                frame_captures.append((screenshot_path, frame_capture))
+                after_img = frame_capture.image
                 result = classify_diamond_hit(before_img, after_img, (x, y))
                 victory_hit = find_victory_banner(after_img) is not None
                 if victory_hit:
@@ -3101,6 +3694,7 @@ def _execute_probe_transaction(
                         latest_sidebar_progress = frame_sidebar_progress
                     if frame_newly_completed:
                         sidebar_newly_completed = frame_newly_completed
+                sidebar_progress_samples.append(frame_sidebar_progress)
                 new_wreck_hit = template_hit and not before_wreck_visible
                 dynamic_hit_vetoed = enforce_positive_hit_evidence(
                     result,
@@ -3154,6 +3748,18 @@ def _execute_probe_transaction(
             hit, decision_reason = True, "victory_banner_frame"
         else:
             hit, decision_reason = decide_hit_from_frames(hit_results)
+        preserve_all_images = _should_preserve_all_probe_images(
+            frame_records,
+            suspect_extra_checked=suspect_extra_checked,
+            victory_detected=victory_frame_detected,
+        )
+        _persist_probe_debug_images(
+            sample_dir,
+            before_capture,
+            frame_captures,
+            frame_records,
+            preserve_all=preserve_all_images,
+        )
         logger.info(
             "hit check cell=%s index=%s votes=%s/%s states=%s scores=%s changed=%s "
             "best_gray=%.3f best_excess=%.3f best_component=%.3f best_s_drop=%.1f best_edge=%.3f "
@@ -3185,6 +3791,7 @@ def _execute_probe_transaction(
             frames=frame_records,
             suspect_extra_checked=suspect_extra_checked,
             decision_reason=decision_reason,
+            adaptive_frames_stopped=adaptive_frames_stopped,
         )
         transaction.hit = hit
         transaction.advance(ProbePhase.RESULT_RECORDED)
@@ -3201,7 +3808,27 @@ def _execute_probe_transaction(
             row, col = cell
             hit_map[row][col] = 1
             logger.info("level %s cell %s result: hit", level, index)
-            level_complete = _commit_hit_request_and_prepare_next_probe(transaction)
+            victory_wait_timeout = VICTORY_WAIT_AFTER_HIT_SECONDS
+            if not victory_frame_detected:
+                victory_wait_timeout = _victory_wait_timeout_for_sidebar_samples(
+                    sidebar_progress_samples,
+                    submarines,
+                    required_frames=(
+                        ADAPTIVE_HIT_MIN_FRAMES
+                        if adaptive_frames_stopped
+                        else len(HIT_RESULT_FRAME_DELAYS)
+                    ),
+                )
+            if victory_wait_timeout < VICTORY_WAIT_AFTER_HIT_SECONDS:
+                logger.info(
+                    "consistent sidebar frames confirm unfinished submarines; "
+                    "limiting victory wait to %.1f seconds",
+                    victory_wait_timeout,
+                )
+            level_complete = _commit_hit_request_and_prepare_next_probe(
+                transaction,
+                victory_wait_timeout=victory_wait_timeout,
+            )
             probe_result = (
                 ProbeResult.HIT_AND_LEVEL_COMPLETE
                 if level_complete or victory_frame_detected
@@ -3260,6 +3887,16 @@ def _execute_probe_transaction(
         return probe_result
     except Exception as exc:
         if sample_dir is not None:
+            try:
+                _persist_probe_debug_images(
+                    sample_dir,
+                    before_capture,
+                    frame_captures,
+                    frame_records,
+                    preserve_all=True,
+                )
+            except OSError as save_exc:
+                logger.warning("failed to preserve interrupted probe images: %s", save_exc)
             _write_probe_status(
                 sample_dir,
                 "interrupted",
@@ -3281,13 +3918,15 @@ def _execute_probe_transaction(
 
 def _commit_hit_request_and_prepare_next_probe(
     transaction: ProbeTransaction,
+    *,
+    victory_wait_timeout: float = VICTORY_WAIT_AFTER_HIT_SECONDS,
 ) -> bool:
     """Restore network immediately on hit so the pending request is submitted."""
     transaction.advance(ProbePhase.REQUEST_COMMITTED)
     update_pending_probe(phase=transaction.phase.name, request_committed=True)
     logger.info("hit detected; restoring network immediately to submit the pending request")
     transaction.advance(ProbePhase.LOGIN_RECOVERING)
-    level_complete = restart_process() is True
+    level_complete = restart_process(victory_wait_timeout=victory_wait_timeout) is True
     transaction.advance(ProbePhase.COMPLETE)
     return level_complete
 
@@ -3324,7 +3963,12 @@ def _discard_pending_request_and_prepare_next_probe(
     return level_complete
 
 
-def restart_process(reopen_game: bool = False, app_already_closed: bool = False) -> bool:
+def restart_process(
+    reopen_game: bool = False,
+    app_already_closed: bool = False,
+    *,
+    victory_wait_timeout: float = VICTORY_WAIT_AFTER_HIT_SECONDS,
+) -> bool:
     """在请求确认丢弃后恢复网络登录，并进入下一轮探测页靃69"""
     if reopen_game:
         logger.info("pending probe request discarded; reopening game before next probe")
@@ -3343,29 +3987,54 @@ def restart_process(reopen_game: bool = False, app_already_closed: bool = False)
         ) is True
 
     disable_weak_network()
-    level_complete = handle_victory_prompt(timeout=VICTORY_WAIT_AFTER_HIT_SECONDS)
+    level_complete = handle_victory_prompt(timeout=victory_wait_timeout)
     recovered_level_complete = enter_activity() is True
     return level_complete or recovered_level_complete
 
 
-def find_victory_banner(screenshot: np.ndarray) -> MatchResult | None:
+def find_victory_banner(
+    screenshot: np.ndarray,
+    *,
+    full_screen: bool = False,
+) -> MatchResult | None:
     """Detect the victory banner in a screenshot."""
     if not isinstance(screenshot, np.ndarray):
         return None
 
-    victory = find_template(
-        screenshot,
-        VICTORY_BANNER_TEMPLATE,
-        threshold=VICTORY_BANNER_THRESHOLD,
-    )
-    if victory is not None:
-        return victory
+    search_image = screenshot
+    offset_x = 0
+    offset_y = 0
+    if not full_screen:
+        height, width = screenshot.shape[:2]
+        left, top, right, bottom = VICTORY_SEARCH_REGION
+        x1 = max(0, min(width, int(round(width * left))))
+        y1 = max(0, min(height, int(round(height * top))))
+        x2 = max(x1, min(width, int(round(width * right))))
+        y2 = max(y1, min(height, int(round(height * bottom))))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        search_image = screenshot[y1:y2, x1:x2]
+        offset_x = x1
+        offset_y = y1
 
-    return find_template_multi_scale(
-        screenshot,
+    victory = find_template_multi_scale(
+        search_image,
         VICTORY_BANNER_TEMPLATE,
         scales=VICTORY_TEMPLATE_SCALES,
         threshold=VICTORY_BANNER_THRESHOLD,
+    )
+    if victory is None or (offset_x == 0 and offset_y == 0):
+        return victory
+
+    return MatchResult(
+        template_path=victory.template_path,
+        top_left=(victory.top_left[0] + offset_x, victory.top_left[1] + offset_y),
+        bottom_right=(
+            victory.bottom_right[0] + offset_x,
+            victory.bottom_right[1] + offset_y,
+        ),
+        center=(victory.center[0] + offset_x, victory.center[1] + offset_y),
+        score=victory.score,
     )
 
 
@@ -3420,12 +4089,15 @@ def handle_connection_interrupted_prompt(timeout: float = 20.0) -> bool:
 def wait_until_victory_banner(timeout: float = 4.0) -> MatchResult | None:
     """Wait briefly for the victory banner shown after the final submarine is hit."""
     deadline = monotonic() + max(0.0, float(timeout))
+    last_screenshot: np.ndarray | None = None
     while monotonic() < deadline:
-        screenshot = adb.read_screenshot()
-        victory = find_victory_banner(screenshot)
+        last_screenshot = adb.read_screenshot()
+        victory = find_victory_banner(last_screenshot)
         if victory is not None:
             return victory
         sleep(0.3)
+    if last_screenshot is not None:
+        return find_victory_banner(last_screenshot, full_screen=True)
     return None
 
 
@@ -3719,8 +4391,11 @@ def main(level: int | None = None) -> Path | None:
             profile=get_state_profile() or "",
             probe_mode=settings.mode.value,
             red_scout_total=settings.count,
+            red_scout_valid=0,
+            red_scout_complete_six=0,
         )
         _prune_probe_sample_dirs()
+        _prune_red_scout_sample_dirs()
         disable_weak_network()
 
         screenshot = adb.read_screenshot()

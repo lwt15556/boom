@@ -1,3 +1,4 @@
+import inspect
 import os
 import unittest
 from pathlib import Path
@@ -261,8 +262,9 @@ class RedScoutSettingsTest(unittest.TestCase):
         cases = (
             ("1", 1),
             ("10", 10),
+            ("50", 50),
             ("0", 2),
-            ("11", 2),
+            ("51", 2),
             ("", 2),
             ("invalid", 2),
         )
@@ -319,6 +321,32 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         analyzer_type = getattr(red_scout_module, "RedScoutAnalyzer", None)
         self.assertIsNotNone(analyzer_type, "RedScoutAnalyzer must be public")
         return analyzer_type(classifier=classifier, hit_detector=hit_detector)
+
+    def test_analyzer_accepts_submarine_lengths_for_completion_evidence(self):
+        parameters = inspect.signature(
+            red_scout_module.RedScoutAnalyzer.analyze
+        ).parameters
+
+        self.assertIn("submarine_lengths", parameters)
+
+    def test_invalid_result_reports_preflight_failure_without_cell_evidence(self):
+        analyzer = self._analyzer(
+            classifier=lambda *_args: None,
+            hit_detector=lambda *_args: False,
+        )
+
+        result = analyzer.analyze(
+            before_image=None,
+            after_images=self.AFTER_IMAGES,
+            grid_size=self.GRID_SIZE,
+            click_points=self.CLICK_POINTS,
+            center_cell=(2, 2),
+        )
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.invalid_reason, "preflight_failed")
+        self.assertEqual(result.diagnostics["stage"], "preflight")
+        self.assertEqual(result.affected_cells, frozenset())
 
     @staticmethod
     def _classifier_for(evidence):
@@ -382,19 +410,18 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         self.assertTrue(result.valid)
         self.assertEqual(
             result.affected_cells,
-            frozenset({(0, 0), (2, 2), (2, 3), (3, 2)}),
+            frozenset({(2, 2), (2, 3), (3, 2)}),
         )
         self.assertEqual(result.hit_cells, frozenset({(2, 3)}))
         self.assertEqual(result.miss_cells, frozenset({(2, 2), (3, 2)}))
-        self.assertEqual(result.unknown_cells, frozenset({(0, 0)}))
+        self.assertEqual(result.unknown_cells, frozenset())
         self.assertEqual(
             result.footprint.offsets,
-            frozenset({(-2, -2), (0, 0), (0, 1), (1, 0)}),
+            frozenset({(0, 0), (0, 1), (1, 0)}),
         )
         self.assertEqual(
             result.confidence_by_cell,
             {
-                (0, 0): 0.89,
                 (2, 2): 0.96,
                 (2, 3): 0.94,
                 (3, 2): 0.93,
@@ -436,10 +463,14 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         self.assertNotIn((-2, -2), result.footprint.offsets)
         self.assertNotIn((0, 0), result.confidence_by_cell)
 
-    def test_first_footprint_is_invalid_when_center_is_absent(self):
+    def test_first_scout_is_valid_when_random_scatter_excludes_clicked_center(self):
         evidence = {
-            (2, 3): (0.90, "miss"),
-            (3, 2): (0.90, "miss"),
+            (0, 0): (0.96, "miss"),
+            (0, 4): (0.95, "miss"),
+            (1, 3): (0.94, "miss"),
+            (3, 1): (0.93, "miss"),
+            (4, 0): (0.92, "miss"),
+            (4, 4): (0.91, "miss"),
         }
         analyzer = self._analyzer(
             self._classifier_for(evidence),
@@ -456,10 +487,10 @@ class RedScoutAnalyzerTest(unittest.TestCase):
             learned_footprint=None,
         )
 
-        self.assertFalse(result.valid)
-        self.assertEqual(result.affected_cells, frozenset({(2, 3), (3, 2)}))
-        self.assertEqual(result.miss_cells, frozenset({(2, 3), (3, 2)}))
-        self.assertIsNone(result.footprint)
+        self.assertTrue(result.valid)
+        self.assertEqual(result.affected_cells, frozenset(evidence))
+        self.assertEqual(result.miss_cells, frozenset(evidence))
+        self.assertIsNotNone(result.footprint)
 
     def test_first_footprint_is_invalid_with_only_center_changed(self):
         analyzer = self._analyzer(
@@ -489,9 +520,9 @@ class RedScoutAnalyzerTest(unittest.TestCase):
             offsets=frozenset({(-2, -2), (0, -1), (0, 0), (0, 1), (1, 0)})
         )
         evidence = {
-            (0, 0): (0.45, "miss"),
+            (0, 0): (0.95, "miss"),
             (2, 1): (0.44, "miss"),
-            (2, 2): (0.80, "miss"),
+            (2, 2): (0.96, "miss"),
             (1, 1): (0.99, "hit"),
         }
         analyzer = self._analyzer(
@@ -518,9 +549,10 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         self.assertTrue(result.valid)
         self.assertEqual(
             result.affected_cells,
-            frozenset({(0, 0), (1, 1), (2, 2)}),
+            frozenset({(0, 0), (2, 2)}),
         )
-        self.assertEqual(result.unknown_cells, frozenset({(1, 1)}))
+        self.assertEqual(result.miss_cells, frozenset({(0, 0), (2, 2)}))
+        self.assertEqual(result.unknown_cells, frozenset())
         self.assertNotIn((1, 2), result.affected_cells)
         self.assertEqual(result.footprint, footprint)
         self.assertEqual(excluded_cells, excluded_snapshot)
@@ -583,6 +615,327 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         self.assertEqual(result.hit_cells, frozenset({(2, 2)}))
         self.assertEqual(result.miss_cells, frozenset())
         self.assertEqual(result.unknown_cells, frozenset())
+
+    def test_new_stable_wreck_is_hit_even_when_whole_cell_change_is_small(self):
+        footprint_type = getattr(red_scout_module, "RedFootprint", None)
+        self.assertIsNotNone(footprint_type, "RedFootprint must be public")
+        footprint = footprint_type(offsets=frozenset({(0, 0)}))
+        target = (2, 2)
+        analyzer = self._analyzer(
+            self._classifier_for({target: (0.30, "hit")}),
+            hit_detector=lambda image, point: (
+                point == target
+                and id(image) in {
+                    id(self.AFTER_IMAGES[0]),
+                    id(self.AFTER_IMAGES[1]),
+                    id(self.AFTER_IMAGES[2]),
+                }
+            ),
+        )
+
+        result = analyzer.analyze(
+            before_image=self.BEFORE_IMAGE,
+            after_images=self.AFTER_IMAGES,
+            grid_size=self.GRID_SIZE,
+            click_points=self.CLICK_POINTS,
+            center_cell=target,
+            excluded_cells=set(),
+            learned_footprint=footprint,
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.affected_cells, frozenset({target}))
+        self.assertEqual(result.hit_cells, frozenset({target}))
+        self.assertEqual(result.miss_cells, frozenset())
+        self.assertEqual(result.unknown_cells, frozenset())
+        self.assertEqual(result.confidence_by_cell, {target: 0.30})
+
+    def test_scout_rejects_ambiguous_more_than_six_strong_result_cells(self):
+        footprint_type = getattr(red_scout_module, "RedFootprint", None)
+        self.assertIsNotNone(footprint_type, "RedFootprint must be public")
+        footprint = footprint_type(offsets=frozenset({(0, 0)}))
+        center = (1, 1)
+        stable_hit = (0, 0)
+        evidence = {
+            stable_hit: (0.20, "hit"),
+            (0, 1): (0.99, "miss"),
+            (0, 2): (0.98, "miss"),
+            (1, 0): (0.97, "miss"),
+            center: (0.50, "miss"),
+            (1, 2): (0.96, "miss"),
+            (2, 0): (0.95, "miss"),
+            (2, 1): (0.94, "miss"),
+        }
+        analyzer = self._analyzer(
+            self._classifier_for(evidence),
+            hit_detector=lambda image, point: (
+                point == stable_hit and image is not self.BEFORE_IMAGE
+            ),
+        )
+
+        result = analyzer.analyze(
+            before_image=self.BEFORE_IMAGE,
+            after_images=self.AFTER_IMAGES,
+            grid_size=3,
+            click_points=tuple(
+                (row, col)
+                for row in range(3)
+                for col in range(3)
+            ),
+            center_cell=center,
+            excluded_cells=set(),
+            learned_footprint=footprint,
+        )
+
+        self.assertFalse(result.valid)
+        self.assertEqual(result.affected_cells, frozenset())
+        self.assertEqual(result.hit_cells, frozenset())
+        self.assertEqual(result.miss_cells, frozenset())
+        self.assertEqual(result.unknown_cells, frozenset())
+        self.assertEqual(result.confidence_by_cell, {})
+        self.assertEqual(result.invalid_reason, "too_many_strong_cells")
+        self.assertEqual(result.diagnostics["stage"], "limit_strong_cells")
+        self.assertEqual(
+            set(result.diagnostics["raw_stable_hits"]),
+            {stable_hit},
+        )
+        self.assertEqual(len(result.diagnostics["affected_before_limit"]), 7)
+
+    def test_scout_keeps_only_six_strong_results_and_discards_moderate_noise(self):
+        footprint_type = getattr(red_scout_module, "RedFootprint", None)
+        self.assertIsNotNone(footprint_type, "RedFootprint must be public")
+        footprint = footprint_type(offsets=frozenset({(0, 0)}))
+        center = (1, 1)
+        stable_hit = (0, 0)
+        expected = {stable_hit, center, (0, 1), (0, 2), (1, 0), (1, 2)}
+        evidence = {
+            stable_hit: (0.20, "hit"),
+            (0, 1): (0.99, "miss"),
+            (0, 2): (0.98, "miss"),
+            (1, 0): (0.97, "miss"),
+            center: (0.96, "miss"),
+            (1, 2): (0.95, "miss"),
+            (2, 0): (0.70, "miss"),
+            (2, 1): (0.60, "miss"),
+        }
+        analyzer = self._analyzer(
+            self._classifier_for(evidence),
+            hit_detector=lambda image, point: (
+                point == stable_hit and image is not self.BEFORE_IMAGE
+            ),
+        )
+
+        result = analyzer.analyze(
+            before_image=self.BEFORE_IMAGE,
+            after_images=self.AFTER_IMAGES,
+            grid_size=3,
+            click_points=tuple(
+                (row, col)
+                for row in range(3)
+                for col in range(3)
+            ),
+            center_cell=center,
+            excluded_cells=set(),
+            learned_footprint=footprint,
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.affected_cells, frozenset(expected))
+        self.assertEqual(result.hit_cells, frozenset({stable_hit}))
+        self.assertEqual(result.miss_cells, frozenset(expected - {stable_hit}))
+        self.assertEqual(result.unknown_cells, frozenset())
+
+    def test_completed_submarine_body_collapses_to_one_attackable_hit_cell(self):
+        footprint_type = getattr(red_scout_module, "RedFootprint", None)
+        self.assertIsNotNone(footprint_type, "RedFootprint must be public")
+        footprint = footprint_type(offsets=frozenset({(0, 0)}))
+        submarine = {(2, 1), (2, 2), (2, 3)}
+        center = (2, 2)
+        misses = {(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)}
+        evidence = {
+            **{cell: (0.95, "hit") for cell in submarine},
+            **{cell: (0.96, "miss") for cell in misses},
+        }
+        analyzer = self._analyzer(
+            self._classifier_for(evidence),
+            hit_detector=lambda image, point: (
+                point in submarine and image is not self.BEFORE_IMAGE
+            ),
+        )
+
+        result = analyzer.analyze(
+            before_image=self.BEFORE_IMAGE,
+            after_images=self.AFTER_IMAGES,
+            grid_size=self.GRID_SIZE,
+            click_points=self.CLICK_POINTS,
+            center_cell=center,
+            excluded_cells=set(),
+            learned_footprint=footprint,
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.affected_cells, frozenset({center} | misses))
+        self.assertEqual(result.hit_cells, frozenset({center}))
+        self.assertEqual(result.miss_cells, frozenset(misses))
+        self.assertEqual(result.unknown_cells, frozenset())
+
+    def test_completed_submarine_hit_cells_are_not_readded_as_misses(self):
+        footprint_type = getattr(red_scout_module, "RedFootprint", None)
+        self.assertIsNotNone(footprint_type, "RedFootprint must be public")
+        footprint = footprint_type(offsets=frozenset({(0, 0)}))
+        submarine = {(2, 1), (2, 2), (2, 3)}
+        misses = {(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)}
+        evidence = {
+            **{cell: (0.95, "miss") for cell in submarine},
+            **{cell: (0.96, "miss") for cell in misses},
+        }
+        analyzer = self._analyzer(
+            self._classifier_for(evidence),
+            hit_detector=lambda image, point: (
+                point in submarine and image is not self.BEFORE_IMAGE
+            ),
+        )
+
+        result = analyzer.analyze(
+            before_image=self.BEFORE_IMAGE,
+            after_images=self.AFTER_IMAGES,
+            grid_size=self.GRID_SIZE,
+            click_points=self.CLICK_POINTS,
+            center_cell=(4, 4),
+            excluded_cells=set(),
+            learned_footprint=footprint,
+        )
+
+        expected_hit = min(submarine)
+        self.assertTrue(result.valid)
+        self.assertEqual(result.affected_cells, frozenset({expected_hit} | misses))
+        self.assertEqual(result.hit_cells, frozenset({expected_hit}))
+        self.assertEqual(result.miss_cells, frozenset(misses))
+        self.assertEqual(result.unknown_cells, frozenset())
+
+    def test_sidebar_completion_removes_surfaced_ship_visual_spill(self):
+        fleet = (5, 4, 3, 2, 2)
+
+        def make_sidebar_frame(*, completed_row: int | None = None):
+            image = np.zeros((720, 1280, 3), dtype=np.uint8)
+            active_bgr = cv2.cvtColor(
+                np.uint8([[[26, 20, 250]]]),
+                cv2.COLOR_HSV2BGR,
+            )[0, 0]
+            complete_bgr = cv2.cvtColor(
+                np.uint8([[[99, 99, 108]]]),
+                cv2.COLOR_HSV2BGR,
+            )[0, 0]
+            for row_index in range(len(fleet)):
+                center_y = 275 + row_index * 35
+                color = complete_bgr if row_index == completed_row else active_bgr
+                image[center_y - 13:center_y + 14, 20:145] = color
+            return image
+
+        before_image = make_sidebar_frame()
+        after_images = tuple(
+            make_sidebar_frame(completed_row=1)
+            for _ in range(4)
+        )
+        partial_ship = {(0, 3), (1, 3), (2, 3)}
+        new_ship_hit = (3, 3)
+        visual_spill_hit = (1, 2)
+        ship_perimeter = {
+            (0, 2), (0, 4),
+            (1, 2), (1, 4),
+            (2, 2), (2, 4),
+            (3, 2), (3, 4),
+            (4, 2), (4, 3), (4, 4),
+        }
+        outside_misses = {(0, 1), (4, 8), (7, 6), (9, 0)}
+        evidence = {
+            new_ship_hit: (0.95, "hit"),
+            visual_spill_hit: (0.95, "miss"),
+            **{cell: (0.96, "miss") for cell in ship_perimeter},
+            **{cell: (0.97, "miss") for cell in outside_misses},
+        }
+        analyzer = self._analyzer(
+            self._classifier_for(evidence),
+            hit_detector=lambda image, point: (
+                point in partial_ship
+                or (
+                    image is not before_image
+                    and point in {new_ship_hit, visual_spill_hit}
+                )
+            ),
+        )
+
+        result = analyzer.analyze(
+            before_image=before_image,
+            after_images=after_images,
+            grid_size=10,
+            click_points=tuple(
+                (row, col)
+                for row in range(10)
+                for col in range(10)
+            ),
+            center_cell=(5, 5),
+            excluded_cells=set(),
+            learned_footprint=None,
+            submarine_lengths=fleet,
+        )
+
+        expected_fallback_miss = (0, 2)
+        self.assertTrue(result.valid)
+        self.assertEqual(len(result.affected_cells), 6)
+        self.assertEqual(result.hit_cells, frozenset({new_ship_hit}))
+        self.assertEqual(
+            result.miss_cells,
+            frozenset(outside_misses | {expected_fallback_miss}),
+        )
+        self.assertNotIn(visual_spill_hit, result.affected_cells)
+        self.assertEqual(result.unknown_cells, frozenset())
+
+    def test_consistent_moderate_miss_fills_the_sixth_result_cell(self):
+        footprint_type = getattr(red_scout_module, "RedFootprint", None)
+        self.assertIsNotNone(footprint_type, "RedFootprint must be public")
+        footprint = footprint_type(offsets=frozenset({(0, 0)}))
+        stable_hit = (3, 1)
+        strong_misses = {(0, 2), (8, 1), (8, 8), (9, 9)}
+        moderate_miss = (0, 1)
+        noise = (0, 0)
+        evidence = {
+            stable_hit: (0.86, "hit"),
+            **{cell: (0.97, "miss") for cell in strong_misses},
+            moderate_miss: (0.62, "miss"),
+            noise: (0.55, "miss"),
+        }
+        after_images = tuple(
+            np.ones((8, 8, 3), dtype=np.uint8)
+            for _ in range(4)
+        )
+        analyzer = self._analyzer(
+            self._classifier_for(evidence),
+            hit_detector=lambda image, point: (
+                point == stable_hit and image is not self.BEFORE_IMAGE
+            ),
+        )
+
+        result = analyzer.analyze(
+            before_image=self.BEFORE_IMAGE,
+            after_images=after_images,
+            grid_size=10,
+            click_points=tuple(
+                (row, col)
+                for row in range(10)
+                for col in range(10)
+            ),
+            center_cell=(5, 5),
+            excluded_cells=set(),
+            learned_footprint=footprint,
+        )
+
+        expected = {stable_hit, moderate_miss} | strong_misses
+        self.assertTrue(result.valid)
+        self.assertEqual(result.affected_cells, frozenset(expected))
+        self.assertEqual(result.hit_cells, frozenset({stable_hit}))
+        self.assertEqual(result.miss_cells, frozenset(expected - {stable_hit}))
+        self.assertNotIn(noise, result.affected_cells)
 
     def test_single_positive_hit_frame_is_unknown_not_miss(self):
         footprint_type = getattr(red_scout_module, "RedFootprint", None)

@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import tools.control_panel as control_panel
@@ -21,10 +22,26 @@ class ControlPanelHelperTest(unittest.TestCase):
         self.assertEqual(environment["BBMA_PROBE_MODE"], "red_scout")
         self.assertEqual(environment["BBMA_RED_SCOUT_COUNT"], "3")
 
+    def test_build_main_environment_caps_red_scout_count_at_fifty(self):
+        environment = build_main_environment("red_scout", 80)
+
+        self.assertEqual(environment["BBMA_RED_SCOUT_COUNT"], "50")
+
     def test_probe_mode_formatter_has_fallback(self):
         self.assertEqual(format_probe_mode("blue_only"), "仅蓝色炮弹")
         self.assertEqual(format_probe_mode("red_scout"), "红色侦察 + 蓝色攻击")
         self.assertEqual(format_probe_mode("bad"), "仅蓝色炮弹")
+
+    def test_red_scout_progress_distinguishes_valid_and_complete_six_results(self):
+        self.assertEqual(
+            control_panel.format_red_scout_progress(
+                current=4,
+                total=6,
+                valid=3,
+                complete_six=2,
+            ),
+            "4 / 6 · 有效 3 · 完整六格 2",
+        )
 
     def test_decode_log_bytes_handles_utf8_and_removes_ansi(self):
         data = "\x1b[32mINFO\x1b[0m 网络已恢复".encode("utf-8")
@@ -41,6 +58,75 @@ class ControlPanelHelperTest(unittest.TestCase):
         self.assertFalse(should_show_log_line("DEBUG frame score=0.5", show_detail=False))
         self.assertTrue(should_show_log_line("INFO level 7 cell 76 result: hit", show_detail=False))
         self.assertTrue(should_show_log_line("INFO 截图已保存", show_detail=True))
+
+    def test_incremental_log_render_appends_only_new_matching_lines(self):
+        append_lines = getattr(
+            control_panel.ControlPanel,
+            "append_rendered_log_lines",
+            None,
+        )
+        self.assertIsNotNone(append_lines)
+
+        class FakeLogView:
+            def __init__(self):
+                self.appended = []
+                self.cursor_moves = []
+
+            def appendPlainText(self, text):
+                self.appended.append(text)
+
+            def setPlainText(self, _text):
+                raise AssertionError("incremental rendering must not replace the whole log")
+
+            def moveCursor(self, operation):
+                self.cursor_moves.append(operation)
+
+        view = FakeLogView()
+        window = SimpleNamespace(
+            log_filter_combo=SimpleNamespace(currentData=lambda: False),
+            log_search=SimpleNamespace(text=lambda: "result"),
+            auto_scroll_combo=SimpleNamespace(currentData=lambda: True),
+            log_view=view,
+        )
+        window._filter_log_lines = lambda lines: control_panel.ControlPanel._filter_log_lines(
+            window,
+            lines,
+        )
+
+        append_lines(
+            window,
+            [
+                "DEBUG result frame score=0.5",
+                "INFO level 7 cell 76 result: hit",
+                "INFO unrelated status",
+            ],
+        )
+
+        self.assertEqual(view.appended, ["INFO level 7 cell 76 result: hit"])
+        self.assertEqual(len(view.cursor_moves), 1)
+
+    def test_runtime_status_render_guard_only_invalidates_on_visible_change(self):
+        needs_render = getattr(
+            control_panel.ControlPanel,
+            "_runtime_status_needs_render",
+            None,
+        )
+        self.assertIsNotNone(needs_render)
+        window = SimpleNamespace(
+            runtime_status={"phase": "scan", "board_states": [["unknown"]]},
+            network_status="未检测",
+            last_runtime_render_signature=None,
+        )
+
+        self.assertTrue(needs_render(window))
+        window.runtime_status = {
+            "board_states": [["unknown"]],
+            "phase": "scan",
+        }
+        self.assertFalse(needs_render(window))
+
+        window.network_status = "已连接"
+        self.assertTrue(needs_render(window))
 
     def test_status_formatters_are_user_facing(self):
         self.assertEqual(format_cell(76, 81), "#76（第 9 行，第 5 列）")

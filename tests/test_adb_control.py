@@ -1,11 +1,82 @@
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
+
+import cv2
+import numpy as np
 
 from utils.adb_control import AdbController, NetworkIsolationStatus
 
 
 class AdbControlTest(unittest.TestCase):
+    @staticmethod
+    def _png_bytes(image: np.ndarray) -> bytes:
+        encoded, buffer = cv2.imencode(".png", image)
+        if not encoded:
+            raise AssertionError("test image could not be encoded")
+        return buffer.tobytes()
+
+    def test_read_screenshot_uses_exec_out_without_remote_file_or_pull(self):
+        controller = AdbController.__new__(AdbController)
+        expected = np.zeros((3, 4, 3), dtype=np.uint8)
+        expected[1, 2] = (10, 80, 220)
+        controller._run_binary = Mock(return_value=self._png_bytes(expected))
+        controller._run = Mock()
+
+        actual = controller.read_screenshot()
+
+        np.testing.assert_array_equal(actual, expected)
+        controller._run_binary.assert_called_once_with(["exec-out", "screencap", "-p"])
+        controller._run.assert_not_called()
+
+    def test_read_screenshot_writes_requested_debug_png_from_memory(self):
+        controller = AdbController.__new__(AdbController)
+        expected = np.full((2, 5, 3), 123, dtype=np.uint8)
+        payload = self._png_bytes(expected)
+        controller._run_binary = Mock(return_value=payload)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "nested" / "frame.png"
+            actual = controller.read_screenshot(output_path)
+
+            self.assertEqual(output_path.read_bytes(), payload)
+            np.testing.assert_array_equal(actual, expected)
+
+    def test_capture_screenshot_defers_writing_and_preserves_original_png(self):
+        controller = AdbController.__new__(AdbController)
+        expected = np.full((3, 5, 3), 91, dtype=np.uint8)
+        payload = self._png_bytes(expected)
+        controller._run_binary = Mock(return_value=payload)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "deferred" / "frame.png"
+            capture = controller.capture_screenshot()
+
+            self.assertFalse(output_path.exists())
+            np.testing.assert_array_equal(capture.image, expected)
+            self.assertEqual(capture.png_bytes, payload)
+
+            capture.save(output_path)
+
+            self.assertEqual(output_path.read_bytes(), payload)
+
+    def test_read_screenshot_falls_back_to_pull_when_exec_out_is_not_decodable(self):
+        controller = AdbController.__new__(AdbController)
+        expected = np.full((2, 2, 3), 77, dtype=np.uint8)
+        controller._run_binary = Mock(return_value=b"not-a-png")
+        controller._read_screenshot_via_pull = Mock(return_value=expected)
+
+        actual = controller.read_screenshot()
+
+        np.testing.assert_array_equal(actual, expected)
+        controller._read_screenshot_via_pull.assert_called_once()
+        self.assertEqual(
+            controller._read_screenshot_via_pull.call_args.args[0].name,
+            "screen.png",
+        )
+
     def _controller_for_isolation(self, *, ipv4_blocked, ipv6_result):
         controller = AdbController.__new__(AdbController)
         controller._get_package_uid = Mock(return_value=10042)
