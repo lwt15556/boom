@@ -1,5 +1,6 @@
 # BoomBeachSonarAuto
 基于GameMainKH的海岛奇兵声呐潜艇自动化工具的二次开发
+
 基于 **Python、ADB、OpenCV 和 PyQt6** 的《海岛奇兵》声呐活动自动化工具。程序通过 ADB 控制安卓模拟器，识别声呐棋盘、潜艇残骸、侧栏进度和胜利界面，并使用带安全约束的断网事务执行蓝色炮弹探测或红色炮弹侦察。
 
 当前项目以以下环境为主要适配目标：
@@ -62,6 +63,7 @@ flowchart TD
 | 操作系统 | Windows 10/11 |
 | Python | 3.10 或更高版本，推荐 3.11 |
 | 模拟器分辨率 | `1280x720`，不要手动缩放活动棋盘 |
+| 模拟器版本 | 雷电模拟器9 |
 | ADB | 仓库已包含 Windows Platform Tools |
 | Root | `adb shell id -u` 必须输出 `0` |
 | 网络工具 | 模拟器内需要可用的 `iptables` 和 `ip6tables` |
@@ -132,7 +134,7 @@ py -3.11 -m venv .venv
 ![alt text](<屏幕截图 2026-07-15 101010.png>)
 ### 5. 启动控制台
 
-推荐使用控制台启动主程序：
+推荐使用控制台启动主程序在IDE终端运行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\run_control_panel.ps1
