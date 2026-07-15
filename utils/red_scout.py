@@ -424,10 +424,13 @@ class RedScoutPlanner:
         covered_cells: Sequence[Cell] | set[Cell] | frozenset[Cell] = (),
         known_cells: Sequence[Cell] | set[Cell] | frozenset[Cell] = (),
         cell_scores: Mapping[Cell, float] | None = None,
+        excluded_centers: Sequence[Cell] | set[Cell] | frozenset[Cell] = (),
     ) -> Cell | None:
+        excluded = self._snapshot_cells(excluded_centers)
+        if excluded is None:
+            return None
         if footprint is None:
-            center = self.grid_size // 2
-            return (center, center)
+            return self._choose_untried_center(excluded)
         if not isinstance(footprint, RedFootprint):
             return None
 
@@ -448,6 +451,8 @@ class RedScoutPlanner:
         best_score = float("-inf")
         for row in range(self.grid_size):
             for col in range(self.grid_size):
+                if (row, col) in excluded:
+                    continue
                 projected = {
                     (row + row_offset, col + col_offset)
                     for row_offset, col_offset in offsets
@@ -478,6 +483,34 @@ class RedScoutPlanner:
                     best_score = score
                     best_center = (row, col)
         return best_center
+
+    def _choose_untried_center(self, excluded: frozenset[Cell]) -> Cell | None:
+        candidates = [
+            (row, col)
+            for row in range(self.grid_size)
+            for col in range(self.grid_size)
+            if (row, col) not in excluded
+        ]
+        if not candidates:
+            return None
+
+        center = self.grid_size // 2
+        preferred = (center, center)
+        if not excluded and preferred in candidates:
+            return preferred
+
+        board_center = (self.grid_size - 1) / 2
+
+        def spread_score(cell: Cell) -> tuple[float, float, int, int]:
+            row, col = cell
+            nearest_attempt = min(
+                abs(row - old_row) + abs(col - old_col)
+                for old_row, old_col in excluded
+            )
+            edge_spread = abs(row - board_center) + abs(col - board_center)
+            return (nearest_attempt, edge_spread, -row, -col)
+
+        return max(candidates, key=spread_score)
 
     @staticmethod
     def _snapshot_cells(cells: object) -> frozenset[Cell] | None:

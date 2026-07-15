@@ -104,7 +104,7 @@ def _load_single_digit_templates(reference_dir_text: str) -> tuple[tuple[str, np
         digits = str(number)
         if len(components) != len(digits):
             continue
-        templates.extend(zip(digits, components))
+        templates.extend(zip(digits, components, strict=True))
     return tuple(templates)
 
 

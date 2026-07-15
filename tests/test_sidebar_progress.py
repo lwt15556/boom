@@ -90,7 +90,11 @@ class SidebarProgressTest(unittest.TestCase):
         template_paths = sorted(
             (Path(__file__).resolve().parents[1] / "template").glob("visible_wreck_*.png")
         )[:2]
-        for path, top_left in zip(template_paths, ((180, 180), (380, 380))):
+        for path, top_left in zip(
+            template_paths,
+            ((180, 180), (380, 380)),
+            strict=True,
+        ):
             template = cv2.imread(str(path))
             x, y = top_left
             image[y:y + template.shape[0], x:x + template.shape[1]] = template
@@ -216,6 +220,28 @@ class SidebarProgressTest(unittest.TestCase):
         self.assertEqual(resolution.placements, ())
         self.assertEqual(resolution.unresolved_lengths, (4,))
         self.assertEqual(resolution.discarded_cells, frozenset(candidates))
+
+    def test_completed_ship_resolution_uses_global_solution_instead_of_greedy_noise(self):
+        candidates = {
+            (0, 0),
+            (1, 0),
+            (0, 1),  # False-positive wreck pixel creates a tempting greedy segment.
+            (0, 2),
+            (0, 3),
+        }
+
+        resolution = sidebar_progress.resolve_completed_ship_cells(
+            candidates,
+            completed_lengths=(2, 2),
+            grid_size=4,
+        )
+
+        self.assertEqual(resolution.unresolved_lengths, ())
+        self.assertEqual(
+            resolution.cells,
+            frozenset({(0, 0), (1, 0), (0, 2), (0, 3)}),
+        )
+        self.assertEqual(resolution.discarded_cells, frozenset({(0, 1)}))
 
 
 if __name__ == "__main__":

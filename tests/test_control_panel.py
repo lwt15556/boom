@@ -70,6 +70,17 @@ class ControlPanelHelperTest(unittest.TestCase):
 
         adb_controller.assert_not_called()
 
+    def test_fail_closed_runtime_status_requires_safe_offline_recovery(self):
+        with (
+            patch.object(control_panel, "has_pending_probe", return_value=False),
+            patch.object(
+                control_panel,
+                "read_runtime_status",
+                return_value={"network": "fail_closed"},
+            ),
+        ):
+            self.assertTrue(control_panel._runtime_status_is_offline())
+
     def test_stop_program_discards_pending_request_before_restoring_network(self):
         events = []
 
@@ -104,8 +115,7 @@ class ControlPanelHelperTest(unittest.TestCase):
                 events.append(("disable_reject", package_name))
 
         with (
-            patch.object(control_panel, "read_pid", return_value=1234),
-            patch.object(control_panel, "is_pid_running", return_value=True),
+            patch.object(control_panel, "get_main_process", return_value=(1234, True)),
             patch.object(control_panel, "AdbController", FakeAdb),
             patch.object(
                 control_panel,
@@ -185,8 +195,7 @@ class ControlPanelHelperTest(unittest.TestCase):
                 events.append(("disable_reject", package_name))
 
         with (
-            patch.object(control_panel, "read_pid", return_value=1234),
-            patch.object(control_panel, "is_pid_running", return_value=True),
+            patch.object(control_panel, "get_main_process", return_value=(1234, True)),
             patch.object(control_panel, "AdbController", FakeAdb),
             patch.object(control_panel, "stop_pid"),
         ):
@@ -194,6 +203,21 @@ class ControlPanelHelperTest(unittest.TestCase):
                 control_panel.stop_program()
 
         self.assertFalse(any(event[0].startswith("disable_") for event in events))
+
+    def test_stop_program_never_kills_stale_unowned_pid(self):
+        with (
+            patch.object(control_panel, "get_main_process", return_value=(1234, False)),
+            patch.object(control_panel, "remove_pid") as remove_pid,
+            patch.object(control_panel, "restore_network", return_value="网络已恢复"),
+            patch.object(control_panel, "stop_pid") as stop_pid,
+            patch.object(control_panel, "AdbController") as adb_controller,
+        ):
+            message = control_panel.stop_program()
+
+        self.assertIn("过期 PID", message)
+        remove_pid.assert_called_once_with(pid=1234)
+        stop_pid.assert_not_called()
+        adb_controller.assert_not_called()
 
     def test_restore_network_discards_stale_offline_request_after_main_dies(self):
         events = []

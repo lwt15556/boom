@@ -663,6 +663,27 @@ class RedScoutPlannerTest(unittest.TestCase):
         self.assertEqual(covered_cells, covered_snapshot)
         self.assertEqual(cell_scores, scores_snapshot)
 
+    def test_invalid_first_result_still_moves_to_a_different_center(self):
+        planner = self._planner(5)
+
+        first = planner.choose_center(
+            footprint=None,
+            excluded_centers=set(),
+        )
+        second = planner.choose_center(
+            footprint=None,
+            excluded_centers={first},
+        )
+        third = planner.choose_center(
+            footprint=None,
+            excluded_centers={first, second},
+        )
+
+        self.assertEqual(first, (2, 2))
+        self.assertEqual(len({first, second, third}), 3)
+        self.assertNotEqual(second, first)
+        self.assertNotEqual(third, first)
+
     def test_planner_breaks_equal_scores_in_row_major_order(self):
         planner = self._planner(5)
         footprint = self._footprint({(0, 0)})

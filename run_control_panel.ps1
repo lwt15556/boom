@@ -14,4 +14,5 @@ $env:PYTHONIOENCODING = "utf-8"
 Start-Process `
     -FilePath $python `
     -ArgumentList @($panel) `
-    -WorkingDirectory $root
+    -WorkingDirectory $root `
+    -WindowStyle Hidden

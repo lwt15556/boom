@@ -18,6 +18,7 @@ from config import (
     LEVEL_GRID_SIZES,
     LEVEL_REFERENCE_DIR,
     MAX_LEVEL,
+    MAX_PROBE_SAMPLE_DIRS,
     OUTPUT_DIR,
     REQUIRE_CONFIDENT_LEVEL_DETECTION,
     SCREENSHOT_DIR,
@@ -51,7 +52,7 @@ from utils.pending_probe import (
     update_pending_probe,
     write_pending_probe,
 )
-from utils.runtime_lock import AlreadyRunningError, acquire_main_lock, remove_pid
+from utils.runtime_lock import AlreadyRunningError, acquire_main_lock, release_main_lock
 from utils.sidebar_progress import (
     SidebarProgress,
     calculate_visible_hit_count,
@@ -68,10 +69,9 @@ from utils.wreck_detection import (
     detect_visible_wreck_cells,
     red_hit_marker_visible,
     visible_wreck_static_detected,
-    wreck_template_visible,
 )
 from utils.red_scout import (
-    AmmoFingerprint, ProbeMode, RedFootprint, RedScoutAnalyzer, RedScoutResult,
+    AmmoFingerprint, ProbeMode, RedFootprint as RedFootprint, RedScoutAnalyzer, RedScoutResult,
     RedScoutSettings, RedScoutPlanner, ammo_fingerprint_matches, build_ammo_fingerprint,
     load_red_scout_settings, locate_red_bomb_button, red_bomb_selected,
 )
@@ -122,12 +122,17 @@ ACTIVITY_DETAIL_WAIT_SECONDS = 8.0
 ACTIVITY_EXIT_WAIT_SECONDS = 1.0
 ACTIVITY_EXIT_STABLE_FRAMES = 2
 ACTIVITY_EXIT_CLICK_ATTEMPTS = 5
+ONLINE_SCOUT_NETWORK_SETTLE_SECONDS = 0.3
+ONLINE_SCOUT_BLUE_SELECT_SETTLE_SECONDS = 0.25
+ONLINE_SCOUT_BLUE_SELECT_FAST_SETTLE_SECONDS = 0.1
+ONLINE_SCOUT_BLUE_SELECT_RETRY_SECONDS = 0.15
 STATUS_REPLACE_RETRIES = 5
 STATUS_REPLACE_RETRY_SECONDS = 0.05
 
 ACTIVITY_DETAIL_POINT = (1205, 644)
 ACTIVITY_LIST_SWIPE = (1000, 660, 1000, 180)
 SCREEN_CONTINUE_POINT = (640, 360)
+BLUE_BOMB_POINT = (1120, 660)
 RUN_DEBUG_DIR = SCREENSHOT_DIR / "run_debug"
 PROBE_SAMPLE_DIR = SCREENSHOT_DIR / "probes"
 RUNTIME_DIR = SCREENSHOT_DIR.parent / "runtime"
@@ -191,6 +196,7 @@ def build_red_scout_board_states(
     hits: set[Cell],
     misses: set[Cell],
     initial_hits: set[Cell] | None = None,
+    initial_misses: set[Cell] | None = None,
 ) -> list[list[str]]:
     states = [["unknown" for _col in range(grid_size)] for _row in range(grid_size)]
     for row, col in misses - hits:
@@ -199,6 +205,9 @@ def build_red_scout_board_states(
     for row, col in hits:
         if 0 <= row < grid_size and 0 <= col < grid_size:
             states[row][col] = "scout_hit"
+    for row, col in initial_misses or set():
+        if 0 <= row < grid_size and 0 <= col < grid_size:
+            states[row][col] = "miss"
     for row, col in initial_hits or set():
         if 0 <= row < grid_size and 0 <= col < grid_size:
             states[row][col] = "hit"
@@ -337,7 +346,18 @@ def save_level_shots(level: int, grid_size: int, shots: Mapping[Cell, bool]) -> 
 
 
 def _has_pending_probe_request() -> bool:
-    return _active_probe is not None and _active_probe.request_may_be_pending
+    if _active_probe is not None and _active_probe.request_may_be_pending:
+        return True
+
+    persisted = read_pending_probe()
+    if persisted is None:
+        return False
+    return str(persisted.get("phase", "")).upper() in {
+        ProbePhase.REQUEST_PENDING.name,
+        ProbePhase.RESULT_VISIBLE.name,
+        ProbePhase.RESULT_RECORDED.name,
+        "INTERRUPTED",
+    }
 
 
 def _create_probe_sample_dir(level: int, cell: Cell, index: int) -> Path:
@@ -345,7 +365,56 @@ def _create_probe_sample_dir(level: int, cell: Cell, index: int) -> Path:
     row, col = cell
     sample_dir = PROBE_SAMPLE_DIR / f"level_{level}_cell_{index}_r{row}_c{col}_{timestamp}"
     sample_dir.mkdir(parents=True, exist_ok=True)
+    _prune_probe_sample_dirs()
     return sample_dir
+
+
+def _prune_probe_sample_dirs(
+    max_directories: int = MAX_PROBE_SAMPLE_DIRS,
+) -> None:
+    if max_directories < 1:
+        return
+
+    try:
+        root = PROBE_SAMPLE_DIR.resolve(strict=False)
+        children = tuple(PROBE_SAMPLE_DIR.iterdir())
+    except (FileNotFoundError, OSError):
+        return
+
+    managed: list[tuple[int, Path]] = []
+    for path in children:
+        try:
+            if (
+                path.is_symlink()
+                or not path.is_dir()
+                or not path.name.startswith("level_")
+                or path.resolve(strict=False).parent != root
+            ):
+                continue
+            managed.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue
+
+    managed.sort(key=lambda item: item[0], reverse=True)
+    removed = 0
+    for _mtime, path in managed[max_directories:]:
+        try:
+            entries = tuple(path.iterdir())
+            if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+                logger.warning("probe sample retention skipped unsafe directory: %s", path)
+                continue
+            for entry in entries:
+                entry.unlink()
+            path.rmdir()
+            removed += 1
+        except OSError as exc:
+            logger.warning("failed to prune old probe sample directory %s: %s", path, exc)
+    if removed:
+        logger.info(
+            "probe sample retention removed %s old directories; keeping newest %s",
+            removed,
+            max_directories,
+        )
 
 
 def _write_probe_status(sample_dir: Path, stage: str, **extra) -> None:
@@ -504,7 +573,7 @@ def enforce_positive_hit_evidence(
 
 
 def enable_weak_network(second: float = 0) -> None:
-    """弢启游戏弱网，并按霢等待网络状生效"""
+    """开启游戏弱网，并按需等待网络规则生效。"""
     adb.enable_weak_network(GAME_PACKAGE_NAME)
     write_runtime_status(network="断网中")
     if second > 0:
@@ -702,7 +771,10 @@ def _analyze_red_result(
     )
 
 
-def _stop_and_latch_red_safety_failure(reason: str) -> None:
+def _stop_and_latch_safety_failure(
+    reason: str,
+    error_type: type[RuntimeError],
+) -> None:
     global _network_fail_closed_reason
     first_reason = str(reason)
     # Latch before any safety operation can fail; cleanup must never restore it.
@@ -733,11 +805,36 @@ def _stop_and_latch_red_safety_failure(reason: str) -> None:
             if name == "wait for app stop":
                 stopped = bool(result)
         except Exception as exc:
-            logger.error("red safety stop operation failed (%s): %s", name, exc)
+            logger.error("network safety stop operation failed (%s): %s", name, exc)
     final_reason = first_reason
     if not stopped:
         final_reason = f"{final_reason}; process did not exit"
-    raise RedScoutSafetyError(final_reason)
+    raise error_type(final_reason)
+
+
+def _stop_and_latch_red_safety_failure(reason: str) -> None:
+    _stop_and_latch_safety_failure(reason, RedScoutSafetyError)
+
+
+def _stop_and_latch_blue_safety_failure(reason: str) -> None:
+    _stop_and_latch_safety_failure(reason, ProbeProtocolError)
+
+
+def _verify_network_isolated_or_fail_closed(*, red_scout: bool) -> None:
+    mode_label = "red scout" if red_scout else "blue probe"
+    try:
+        isolation = adb.verify_app_network_isolated(GAME_PACKAGE_NAME)
+    except Exception as exc:
+        reason = f"{mode_label} network isolation verification failed: {exc}"
+    else:
+        if bool(getattr(isolation, "safe", False)):
+            return
+        reason = str(getattr(isolation, "detail", "network isolation unsafe"))
+
+    if red_scout:
+        _stop_and_latch_red_safety_failure(reason)
+    else:
+        _stop_and_latch_blue_safety_failure(reason)
 
 
 def recover_interrupted_probe_at_startup() -> bool:
@@ -795,11 +892,7 @@ def _execute_red_scout_transaction(
     try:
         write_runtime_status(phase="red_scout_preflight", level=level)
         enable_weak_network(PROBE_DROP_SETTLE_SECONDS)
-        isolation = adb.verify_app_network_isolated(GAME_PACKAGE_NAME)
-        if not bool(getattr(isolation, "safe", False)):
-            _stop_and_latch_red_safety_failure(
-                getattr(isolation, "detail", "network isolation unsafe")
-            )
+        _verify_network_isolated_or_fail_closed(red_scout=True)
         before_image, before_fingerprint, match = _capture_red_ammo_state()
         transaction = ProbeTransaction(level, center_cell, index)
         _active_probe = transaction
@@ -890,6 +983,17 @@ def _execute_red_scout_transaction(
 
 def cleanup_reject_network(reason: str = "脚本退出") -> None:
     """关闭游戏 REJECT 断网残留，避免影响本次或下次运行。"""
+    if _network_fail_closed_reason is not None:
+        logger.critical("REJECT cleanup refused: %s", _network_fail_closed_reason)
+        return
+    if _has_pending_probe_request():
+        transaction = _active_probe
+        logger.critical(
+            "%s，但格子 %s 的探测仍可能待提交；保留 REJECT 断网",
+            reason,
+            transaction.cell if transaction else None,
+        )
+        return
     try:
         logger.info("%s，正在清理 REJECT 断网", reason)
         adb.disable_reject_network(GAME_PACKAGE_NAME)
@@ -898,7 +1002,7 @@ def cleanup_reject_network(reason: str = "脚本退出") -> None:
 
 
 def handle_exit_signal(signum: int, _frame) -> None:
-    """收到逢出信号时先关闭弱网再逢出"""
+    """收到退出信号时先执行安全清理，再退出进程。"""
     cleanup_weak_network(f"收到退出信号 {signum}")
     raise SystemExit(128 + signum)
 
@@ -978,7 +1082,7 @@ def enter_activity(
         adb.click(*res.center)  # 点击活动按钮进入活动界面
         if not re_enter:
             enable_weak_network(0.2)
-            adb.delay(0.4).swipe(*ACTIVITY_LIST_SWIPE)  # 首次进入霢要展示全部项
+            adb.delay(0.4).swipe(*ACTIVITY_LIST_SWIPE)  # 首次进入需要展示全部项
             adb.delay(0.2).swipe(*ACTIVITY_LIST_SWIPE)
 
         adb.delay(0.35).click(*ACTIVITY_DETAIL_POINT)
@@ -1098,10 +1202,62 @@ def reset_runtime_level_status(level: int) -> None:
     )
 
 
+def _grid_calibration_error(
+    click_points: Sequence[tuple[int, int]],
+    quad: np.ndarray,
+    image: np.ndarray,
+    grid_size: int,
+) -> str | None:
+    if not isinstance(image, np.ndarray) or image.ndim < 2 or image.size == 0:
+        return "screenshot is invalid"
+    if len(click_points) != grid_size * grid_size:
+        return f"expected {grid_size * grid_size} points, got {len(click_points)}"
+
+    try:
+        normalized_quad = np.asarray(quad, dtype=np.float32)
+    except (TypeError, ValueError):
+        return "quad is not numeric"
+    if normalized_quad.shape != (4, 2) or not np.isfinite(normalized_quad).all():
+        return "quad must contain four finite points"
+
+    height, width = image.shape[:2]
+    if any(
+        x < 0 or x >= width or y < 0 or y >= height
+        for x, y in normalized_quad
+    ):
+        return "quad extends outside the screenshot"
+    contour = normalized_quad.reshape((-1, 1, 2))
+    if not cv2.isContourConvex(contour):
+        return "quad is not convex"
+    minimum_area = max(100.0, float(width * height) * 0.01)
+    if abs(float(cv2.contourArea(contour))) < minimum_area:
+        return "quad area is too small"
+
+    normalized_points: list[tuple[int, int]] = []
+    for raw_point in click_points:
+        try:
+            raw_x, raw_y = raw_point
+            x = float(raw_x)
+            y = float(raw_y)
+        except (TypeError, ValueError):
+            return f"invalid click point: {raw_point!r}"
+        if not np.isfinite(x) or not np.isfinite(y):
+            return f"non-finite click point: {raw_point!r}"
+        if not 0 <= x < width or not 0 <= y < height:
+            return f"click point is outside the screenshot: {raw_point!r}"
+        if cv2.pointPolygonTest(contour, (x, y), False) < 0:
+            return f"click point is outside the grid quad: {raw_point!r}"
+        normalized_points.append((int(round(x)), int(round(y))))
+
+    if len(set(normalized_points)) != len(normalized_points):
+        return "click points contain duplicates"
+    return None
+
+
 def get_click_points(
     level: int, grid_img: np.ndarray
 ) -> tuple[list[tuple[int, int]], np.ndarray]:
-    """按配置读取人工点位，失败时回逢到自动识别"""
+    """按配置读取人工点位，失败时回退到自动识别。"""
     grid_size = get_level_grid_size(level)
 
     if USE_SAVED_POINTS:
@@ -1112,11 +1268,33 @@ def get_click_points(
             logger.warning("failed to read saved points for level %s; falling back to auto detection: %s", level, exc)
         else:
             if saved_points is not None and saved_quad is not None:
-                logger.info("level %s uses saved calibration points: %s", level, len(saved_points))
-                return saved_points, saved_quad
+                calibration_error = _grid_calibration_error(
+                    saved_points,
+                    saved_quad,
+                    grid_img,
+                    grid_size,
+                )
+                if calibration_error is None:
+                    logger.info("level %s uses saved calibration points: %s", level, len(saved_points))
+                    return saved_points, saved_quad
+                logger.warning(
+                    "level %s saved calibration is unsafe; falling back to auto detection: %s",
+                    level,
+                    calibration_error,
+                )
             logger.warning("第 %s 关人工点位不存在或数量不正确，回退自动识别", level)
 
     grid_result = detect_diamond_centers(grid_img, grid_size)
+    calibration_error = _grid_calibration_error(
+        grid_result.points,
+        grid_result.global_quad,
+        grid_img,
+        grid_size,
+    )
+    if calibration_error is not None:
+        raise RuntimeError(
+            f"unsafe grid calibration for level {level}; refusing to probe: {calibration_error}"
+        )
     logger.info("level %s uses auto-detected points: %s", level, len(grid_result.points))
     return grid_result.points, grid_result.global_quad
 
@@ -1127,7 +1305,7 @@ def handle_game_level(
     run_started_at: float | None = None,
     settings: RedScoutSettings | None = None,
 ) -> tuple[np.ndarray, np.ndarray, bool]:
-    """处理单个关卡：有潜艇配置时策略点，缺少配置时回逐格扫描"""
+    """处理单个关卡：有潜艇配置时使用策略，缺少配置时逐格扫描。"""
     adb.delay(1.5)
     grid_img = adb.read_screenshot()
     click_points, grid_quad = get_click_points(level, grid_img)
@@ -1392,14 +1570,16 @@ def _scan_level_by_strategy(
     submarines: list[int],
     run_started_at: float | None = None,
     initial_hits: set[Cell] | None = None,
+    initial_misses: set[Cell] | None = None,
     initial_sidebar_progress: SidebarProgress | None = None,
     initial_visual_hit_count: int | None = None,
     initial_completed_visual_hits: set[Cell] | None = None,
     initial_completed_lengths: Sequence[int] | None = None,
     initial_scout_hits: set[Cell] | None = None,
     initial_scout_misses: set[Cell] | None = None,
+    commit_scout_hits_online: bool = False,
 ) -> bool:
-    """使用潜艇策略选择探测格；策略无法完成时回逢扫描剩余未探测格"""
+    """使用潜艇策略选择探测格；策略无法完成时回退扫描剩余格。"""
     grid_size = get_level_grid_size(level)
     strategy = SubmarineStrategy(grid_size, submarines)
     saved_shots = load_saved_level_shots(level, grid_size)
@@ -1416,10 +1596,14 @@ def _scan_level_by_strategy(
                 row, col = cell
                 hit_map[row][col] = 1
 
-    for cell in initial_hits or set():
+    real_initial_hits = set(initial_hits or set())
+    real_initial_misses = set(initial_misses or set()) - real_initial_hits
+    for cell in real_initial_hits:
         if cell not in strategy.shots:
             strategy.report_result(cell, True)
-    initial_real_observation_count = len(strategy.shots)
+    for cell in real_initial_misses:
+        if cell not in strategy.shots:
+            strategy.report_result(cell, False)
     if initial_scout_hits or initial_scout_misses:
         strategy.report_scout_results(
             hits=initial_scout_hits or set(), misses=initial_scout_misses or set()
@@ -1530,14 +1714,34 @@ def _scan_level_by_strategy(
                 current_cell=index,
             )
             probe_metadata: dict[str, object] = {}
-            probe_result = _probe_cell(
-                level,
-                hit_map,
-                cell,
-                click_points[index],
-                index,
-                probe_metadata=probe_metadata,
+            direct_scout_hit = (
+                commit_scout_hits_online
+                and cell in strategy.get_scout_hit_cells()
             )
+            if direct_scout_hit:
+                write_runtime_status(
+                    phase="blue_online_scout_hits",
+                    level=level,
+                    current_cell=index,
+                )
+                probe_result = _execute_online_scout_hit(
+                    level=level,
+                    hit_map=hit_map,
+                    cell=cell,
+                    point=click_points[index],
+                    index=index,
+                    submarines=submarines,
+                    probe_metadata=probe_metadata,
+                )
+            else:
+                probe_result = _probe_cell(
+                    level,
+                    hit_map,
+                    cell,
+                    click_points[index],
+                    index,
+                    probe_metadata=probe_metadata,
+                )
             level_completed = _probe_result_completed_level(probe_result)
             hit = _probe_result_is_hit(probe_result)
             if level_completed and not hit:
@@ -1581,7 +1785,7 @@ def _scan_level_by_strategy(
                     )
             save_level_shots(level, grid_size, strategy.shots)
             confirmed_lengths = accounted_completed_lengths()
-            hit_cells = initial_hit_cells + (len(strategy.shots) - initial_real_observation_count)
+            hit_cells = sum(1 for shot_hit in strategy.shots.values() if shot_hit)
             display_hit_cells = progressive_hit_count(
                 initial_visual_hit_count=initial_display_hit_cells,
                 initial_strategy_hit_count=initial_hit_cells,
@@ -1589,7 +1793,13 @@ def _scan_level_by_strategy(
             )
             display_hit_cells = min(sum(submarines), display_hit_cells)
             write_runtime_status(
-                phase="level_complete" if level_completed else "strategy_scan",
+                phase=(
+                    "level_complete"
+                    if level_completed
+                    else "blue_online_scout_hits"
+                    if direct_scout_hit
+                    else "strategy_scan"
+                ),
                 level=level,
                 current_cell="--" if level_completed else index,
                 shots_done=len(strategy.shots),
@@ -1648,7 +1858,7 @@ def _scan_level_by_strategy(
             strategy.report_result(cell, hit)
             save_level_shots(level, grid_size, strategy.shots)
             confirmed_lengths = accounted_completed_lengths()
-            hit_cells = initial_hit_cells + (len(strategy.shots) - initial_real_observation_count)
+            hit_cells = sum(1 for shot_hit in strategy.shots.values() if shot_hit)
             display_hit_cells = progressive_hit_count(
                 initial_visual_hit_count=initial_display_hit_cells,
                 initial_strategy_hit_count=initial_hit_cells,
@@ -1764,14 +1974,56 @@ def _run_red_scout_and_blue_strategy(
     planner = RedScoutPlanner(grid_size)
     footprint = None
     covered: set[Cell] = set()
-    hits: set[Cell] = set()
-    misses: set[Cell] = set()
+    scout_hits: set[Cell] = set()
+    scout_misses: set[Cell] = set()
+    committed_hits: set[Cell] = set()
+    committed_misses: set[Cell] = set()
+    direct_attempted_cells: set[Cell] = set()
+    initial_real_hits = set(initial_hits)
+    attempted_centers: set[Cell] = set()
     attempts_completed = 0
+    online_sidebar_completed_lengths: tuple[int, ...] = ()
+
+    def current_board_states() -> list[list[str]]:
+        return build_red_scout_board_states(
+            grid_size,
+            hits=scout_hits,
+            misses=scout_misses,
+            initial_hits=initial_real_hits | committed_hits,
+            initial_misses=committed_misses,
+        )
+
+    def current_display_hit_count() -> int:
+        initial_visual_count = scan_kwargs.get("initial_visual_hit_count")
+        base_count = (
+            len(initial_real_hits)
+            if initial_visual_count is None
+            else max(0, int(initial_visual_count))
+        )
+        return min(sum(submarines), base_count + len(committed_hits))
+
     for _ in range(settings.count):
-        center = planner.choose_center(footprint, known_cells=hits | misses,
-                                       covered_cells=covered, cell_scores={})
+        known_cells = (
+            scout_hits
+            | scout_misses
+            | initial_real_hits
+            | committed_hits
+            | committed_misses
+        )
+        center = planner.choose_center(
+            footprint,
+            known_cells=known_cells,
+            covered_cells=covered,
+            cell_scores={},
+            excluded_centers=attempted_centers,
+        )
         if center is None:
             break
+        if center in attempted_centers:
+            raise RedScoutSafetyError(
+                f"red scout planner repeated an already used center: {center}"
+            )
+        attempted_centers.add(center)
         index = center[0] * grid_size + center[1]
         result = _execute_red_scout_transaction(
             level,
@@ -1801,12 +2053,7 @@ def _run_red_scout_and_blue_strategy(
                 red_scout_current=attempts_completed,
                 red_scout_total=settings.count,
                 board_size=grid_size,
-                board_states=build_red_scout_board_states(
-                    grid_size,
-                    hits=hits,
-                    misses=misses,
-                    initial_hits=initial_hits,
-                ),
+                board_states=current_board_states(),
                 last_result="level_complete",
             )
             return True
@@ -1814,12 +2061,16 @@ def _run_red_scout_and_blue_strategy(
         # containing reliable per-cell hit/miss evidence. Keep that evidence on the
         # cumulative board instead of discarding the whole scout attempt.
         if result.affected_cells:
-            merge_red_scout_observations(hits, misses, result)
+            merge_red_scout_observations(scout_hits, scout_misses, result)
             covered.update(result.affected_cells)
         if result.valid:
             # The first valid footprint is the approved shape for every later attempt.
             if footprint is None:
                 footprint = result.footprint
+
+        real_cells = initial_real_hits | committed_hits | committed_misses
+        scout_hits.difference_update(real_cells)
+        scout_misses.difference_update(real_cells)
         write_runtime_status(
             phase="red_scout_capture",
             level=level,
@@ -1827,29 +2078,506 @@ def _run_red_scout_and_blue_strategy(
             red_scout_current=attempts_completed,
             red_scout_total=settings.count,
             board_size=grid_size,
-            board_states=build_red_scout_board_states(
-                grid_size,
-                hits=hits,
-                misses=misses,
-                initial_hits=initial_hits,
-            ),
+            board_states=current_board_states(),
             last_result="scout_valid" if result.valid else "scout_invalid",
         )
+
+        excluded_direct_cells = (
+            initial_real_hits
+            | committed_hits
+            | committed_misses
+            | direct_attempted_cells
+        )
+        new_scout_hits = sorted(set(result.hit_cells) - excluded_direct_cells)
+        for cell in new_scout_hits:
+            direct_attempted_cells.add(cell)
+            row, col = cell
+            direct_index = row * grid_size + col
+            probe_metadata: dict[str, object] = {}
+            write_runtime_status(
+                phase="blue_online_scout_hits",
+                level=level,
+                current_cell=direct_index,
+                red_scout_current=attempts_completed,
+                red_scout_total=settings.count,
+                board_size=grid_size,
+                board_states=current_board_states(),
+            )
+            probe_result = _execute_online_scout_hit(
+                level=level,
+                hit_map=hit_map,
+                cell=cell,
+                point=click_points[direct_index],
+                index=direct_index,
+                submarines=submarines,
+                probe_metadata=probe_metadata,
+                activity_ready=True,
+            )
+            level_completed = _probe_result_completed_level(probe_result)
+            hit = _probe_result_is_hit(probe_result)
+
+            if probe_result is ProbeResult.UNKNOWN:
+                raise ProbeProtocolError(
+                    f"online scout-hit result for cell {cell} is unknown; refusing to retry it"
+                )
+            if level_completed and not hit:
+                write_runtime_status(
+                    phase="level_complete",
+                    level=level,
+                    current_cell="--",
+                    red_scout_current=attempts_completed,
+                    red_scout_total=settings.count,
+                    board_size=grid_size,
+                    board_states=current_board_states(),
+                    last_result=probe_result.value,
+                )
+                return True
+            if hit:
+                committed_hits.add(cell)
+                committed_misses.discard(cell)
+            elif probe_result is ProbeResult.MISS:
+                committed_misses.add(cell)
+                committed_hits.discard(cell)
+            else:
+                raise ProbeProtocolError(
+                    f"unexpected online scout-hit result for cell {cell}: {probe_result!r}"
+                )
+
+            scout_hits.discard(cell)
+            scout_misses.discard(cell)
+            completed_lengths = tuple(
+                int(length)
+                for length in probe_metadata.get("sidebar_completed_lengths", ())
+            )
+            if completed_lengths:
+                online_sidebar_completed_lengths = completed_lengths
+            write_runtime_status(
+                phase="level_complete" if level_completed else "blue_online_scout_hits",
+                level=level,
+                current_cell="--" if level_completed else direct_index,
+                red_scout_current=attempts_completed,
+                red_scout_total=settings.count,
+                hits=current_display_hit_count(),
+                total_ship_cells=sum(submarines),
+                board_size=grid_size,
+                board_states=current_board_states(),
+                last_result=probe_result.value,
+            )
+            if level_completed:
+                return True
+
     write_runtime_status(phase="blue_attack", level=level,
                          red_scout_current=attempts_completed,
                          red_scout_total=settings.count,
                          current_cell="--",
                          board_size=grid_size,
-                         board_states=build_red_scout_board_states(
-                             grid_size,
-                             hits=hits,
-                             misses=misses,
-                             initial_hits=initial_hits,
-                         ))
-    return _scan_level_by_strategy(level, hit_map, click_points, submarines,
-                                   run_started_at=run_started_at, initial_hits=initial_hits,
-                                   initial_scout_hits=hits, initial_scout_misses=misses,
-                                   **scan_kwargs)
+                         board_states=current_board_states())
+
+    final_scan_kwargs = dict(scan_kwargs)
+    initial_visual_count = final_scan_kwargs.get("initial_visual_hit_count")
+    if initial_visual_count is not None:
+        final_scan_kwargs["initial_visual_hit_count"] = min(
+            sum(submarines),
+            max(0, int(initial_visual_count)) + len(committed_hits),
+        )
+    if online_sidebar_completed_lengths:
+        remaining_lengths = list(submarines)
+        for length in online_sidebar_completed_lengths:
+            if length in remaining_lengths:
+                remaining_lengths.remove(length)
+        final_scan_kwargs["initial_sidebar_progress"] = SidebarProgress(
+            active_lengths=tuple(remaining_lengths),
+            completed_lengths=online_sidebar_completed_lengths,
+        )
+        final_scan_kwargs["initial_completed_lengths"] = online_sidebar_completed_lengths
+    final_scan_kwargs.update(
+        initial_hits=initial_real_hits | committed_hits,
+        initial_misses=committed_misses,
+        initial_scout_hits=scout_hits,
+        initial_scout_misses=scout_misses,
+        commit_scout_hits_online=True,
+    )
+    return _scan_level_by_strategy(
+        level,
+        hit_map,
+        click_points,
+        submarines,
+        run_started_at=run_started_at,
+        **final_scan_kwargs,
+    )
+
+
+def _sidebar_confirms_all_submarines(
+    progress: SidebarProgress | None,
+    submarines: Sequence[int],
+) -> bool:
+    return bool(
+        progress is not None
+        and progress.valid
+        and sorted(progress.completed_lengths) == sorted(int(length) for length in submarines)
+    )
+
+
+def _select_blue_bomb_for_online_scout(
+    sample_dir: Path,
+    selection_screen: np.ndarray,
+    *,
+    fast: bool,
+) -> np.ndarray:
+    red_match = locate_red_bomb_button(selection_screen)
+    if red_match is None:
+        raise ProbeNotReadyError(
+            "red bomb button could not be located; blue selection cannot be verified"
+        )
+    use_fast_confirmation = fast
+    adb.click(*BLUE_BOMB_POINT)
+    settle_seconds = (
+        ONLINE_SCOUT_BLUE_SELECT_FAST_SETTLE_SECONDS
+        if use_fast_confirmation
+        else ONLINE_SCOUT_BLUE_SELECT_SETTLE_SECONDS
+    )
+    before_img = adb.delay(settle_seconds).read_screenshot(sample_dir / "before.png")
+
+    red_still_selected = (
+        red_match is not None and red_bomb_selected(before_img, red_match)
+    )
+    if red_still_selected and use_fast_confirmation:
+        before_img = adb.delay(ONLINE_SCOUT_BLUE_SELECT_RETRY_SECONDS).read_screenshot(
+            sample_dir / "before_retry.png"
+        )
+        red_still_selected = red_bomb_selected(before_img, red_match)
+    if red_still_selected:
+        raise ProbeNotReadyError("blue bomb selection was not confirmed")
+    return before_img
+
+
+def _execute_online_scout_hit(
+    *,
+    level: int,
+    hit_map: list[list[int]],
+    cell: Cell,
+    point: tuple[int, int],
+    index: int,
+    submarines: Sequence[int],
+    probe_metadata: dict[str, object] | None = None,
+    activity_ready: bool = False,
+) -> ProbeResult:
+    """Commit one scout-confirmed blue hit online without the offline replay flow."""
+    if probe_metadata is not None:
+        probe_metadata.clear()
+    if _active_probe is not None:
+        raise ProbeProtocolError(
+            f"cannot commit online scout hit while probe {getattr(_active_probe, 'cell', None)} is active"
+        )
+
+    adb.disable_reject_network(GAME_PACKAGE_NAME)
+    disable_weak_network()
+    if not activity_ready:
+        adb.delay(ONLINE_SCOUT_NETWORK_SETTLE_SECONDS)
+    write_runtime_status(
+        phase="blue_online_scout_hits",
+        level=level,
+        current_cell=index,
+        network="已连接",
+    )
+
+    initial_screen = adb.read_screenshot()
+    if handle_victory_prompt(timeout=0.0, screenshot=initial_screen):
+        if probe_metadata is not None:
+            probe_metadata["level_completed"] = True
+        return ProbeResult.LEVEL_COMPLETE
+    initial_sidebar_progress = detect_sidebar_progress(initial_screen, submarines)
+    if _sidebar_confirms_all_submarines(initial_sidebar_progress, submarines):
+        logger.info(
+            "sidebar already shows every submarine complete before online scout cell %s; "
+            "waiting for the victory screen instead of firing",
+            cell,
+        )
+        handle_victory_prompt(timeout=VICTORY_WAIT_AFTER_HIT_SECONDS)
+        if probe_metadata is not None:
+            probe_metadata.update(
+                level_completed=True,
+                sidebar_completed_lengths=tuple(initial_sidebar_progress.completed_lengths),
+                sidebar_completed_cells=initial_sidebar_progress.completed_cells,
+            )
+        return ProbeResult.LEVEL_COMPLETE
+
+    detail_open = (
+        isinstance(initial_screen, np.ndarray)
+        and find_template(initial_screen, QUIT_ACTIVITY_TEMPLATE) is not None
+    )
+    fast_activity_path = bool(activity_ready and detail_open)
+    if not detail_open and wait_until_occur(QUIT_ACTIVITY_TEMPLATE, timeout=2.0) is None:
+        fast_activity_path = False
+        if enter_activity() is True:
+            if probe_metadata is not None:
+                probe_metadata["level_completed"] = True
+            return ProbeResult.LEVEL_COMPLETE
+        adb.disable_reject_network(GAME_PACKAGE_NAME)
+        disable_weak_network()
+        adb.delay(ONLINE_SCOUT_NETWORK_SETTLE_SECONDS)
+        if wait_until_occur(QUIT_ACTIVITY_TEMPLATE, timeout=6.0) is None:
+            raise ProbeNotReadyError("online scout-hit commit could not reach activity detail")
+
+    sample_dir = _create_probe_sample_dir(level, cell, index)
+    _write_probe_status(
+        sample_dir,
+        "online_scout_started",
+        level=level,
+        cell=list(cell),
+        index=index,
+        point=list(point),
+    )
+
+    selection_screen = initial_screen if fast_activity_path else adb.read_screenshot()
+    already_visible = (
+        red_hit_marker_visible(selection_screen, point)
+        or visible_wreck_static_detected(selection_screen, point)
+    )
+    before_img = (
+        selection_screen
+        if already_visible
+        else _select_blue_bomb_for_online_scout(
+            sample_dir,
+            selection_screen,
+            fast=fast_activity_path,
+        )
+    )
+
+    before_wreck_visible = (
+        already_visible
+        or red_hit_marker_visible(before_img, point)
+        or visible_wreck_static_detected(before_img, point)
+    )
+    if before_wreck_visible:
+        row, col = cell
+        hit_map[row][col] = 1
+        logger.info(
+            "scout-hit cell %s is already visible; recording it without firing another blue bomb",
+            cell,
+        )
+        _write_probe_status(
+            sample_dir,
+            "complete",
+            decision=ProbeResult.HIT.value,
+            reason="already_visible",
+        )
+        append_recent_probe_result(
+            level=level,
+            index=index,
+            result=ProbeResult.HIT,
+            reason="online_scout_already_visible",
+        )
+        if probe_metadata is not None:
+            probe_metadata["online_committed"] = False
+            probe_metadata["already_visible"] = True
+        return ProbeResult.HIT
+
+    logger.info(
+        "committing scout-confirmed hit online: level=%s cell=%s index=%s",
+        level,
+        cell,
+        index,
+    )
+    adb.click(*point)
+
+    hit_results = []
+    frame_records = []
+    latest_sidebar_progress: SidebarProgress | None = None
+    sidebar_newly_completed: tuple[int, ...] = ()
+    victory_screenshot: np.ndarray | None = None
+
+    def capture_online_frame(frame_index: int, frame_delay: float) -> None:
+        nonlocal latest_sidebar_progress, sidebar_newly_completed, victory_screenshot
+        screenshot_path = sample_dir / f"after_{frame_index}.png"
+        after_img = adb.delay(frame_delay).read_screenshot(screenshot_path)
+        result = classify_diamond_hit(before_img, after_img, point)
+        victory_hit = find_victory_banner(after_img) is not None
+        if victory_hit:
+            victory_screenshot = after_img
+            result.state = "hit"
+            result.score = max(float(result.score), 1.0)
+            result.confidence = max(float(result.confidence), 1.0)
+
+        template_hit = apply_wreck_template_confirmation(after_img, point, result)
+        sidebar_hit = False
+        frame_sidebar_progress: SidebarProgress | None = None
+        frame_newly_completed: tuple[int, ...] = ()
+        if submarines:
+            sidebar_hit, frame_sidebar_progress, frame_newly_completed = (
+                apply_sidebar_completion_confirmation(
+                    before_img,
+                    after_img,
+                    submarines,
+                    result,
+                )
+            )
+            if frame_sidebar_progress is not None and frame_sidebar_progress.valid:
+                latest_sidebar_progress = frame_sidebar_progress
+            if frame_newly_completed:
+                sidebar_newly_completed = frame_newly_completed
+
+        dynamic_hit_vetoed = enforce_positive_hit_evidence(
+            result,
+            wreck_hit=template_hit,
+            sidebar_hit=sidebar_hit or victory_hit,
+        )
+        hit_results.append(result)
+        frame_records.append(
+            {
+                "frame": frame_index,
+                "delay": frame_delay,
+                "path": str(screenshot_path),
+                "template_hit": template_hit,
+                "dynamic_hit_vetoed": dynamic_hit_vetoed,
+                "sidebar_hit": sidebar_hit,
+                "sidebar_completed_lengths": (
+                    list(frame_sidebar_progress.completed_lengths)
+                    if frame_sidebar_progress is not None and frame_sidebar_progress.valid
+                    else []
+                ),
+                "sidebar_newly_completed_lengths": list(frame_newly_completed),
+                "victory_banner": victory_hit,
+                "result": _hit_result_to_dict(result),
+            }
+        )
+        _write_probe_status(
+            sample_dir,
+            "online_frame_captured",
+            frame=frame_index,
+            state=result.state,
+            score=float(result.score),
+        )
+
+    for frame_index, frame_delay in enumerate(HIT_RESULT_FRAME_DELAYS, start=1):
+        capture_online_frame(frame_index, frame_delay)
+
+    hit_votes = sum(1 for result in hit_results if result.state == "hit")
+    suspect_extra_checked = False
+    if (
+        victory_screenshot is None
+        and hit_votes < MIN_HIT_RESULT_VOTES
+        and any(_is_suspect_hit_frame(result) for result in hit_results)
+    ):
+        suspect_extra_checked = True
+        logger.info(
+            "online scout-hit cell=%s index=%s is uncertain after %s frames; "
+            "collecting extra evidence without firing again",
+            cell,
+            index,
+            len(hit_results),
+        )
+        for extra_index, frame_delay in enumerate(
+            SUSPECT_HIT_EXTRA_FRAME_DELAYS,
+            start=len(hit_results) + 1,
+        ):
+            capture_online_frame(extra_index, frame_delay)
+        hit_votes = sum(1 for result in hit_results if result.state == "hit")
+
+    if victory_screenshot is not None:
+        hit, decision_reason = True, "victory_banner_frame"
+    else:
+        hit, decision_reason = decide_hit_from_frames(hit_results)
+    uncertain = not hit and (
+        hit_votes == 1
+        or any(_is_suspect_hit_frame(result) for result in hit_results)
+    )
+    _save_probe_result_json(
+        sample_dir,
+        level=level,
+        cell=cell,
+        index=index,
+        point=point,
+        hit=hit,
+        hit_votes=hit_votes,
+        frames=frame_records,
+        suspect_extra_checked=suspect_extra_checked,
+        decision_reason=decision_reason,
+    )
+
+    if uncertain:
+        _write_probe_status(
+            sample_dir,
+            "complete",
+            decision=ProbeResult.UNKNOWN.value,
+            reason=decision_reason,
+        )
+        append_recent_probe_result(
+            level=level,
+            index=index,
+            result=ProbeResult.UNKNOWN,
+            reason=f"online_scout_{decision_reason}",
+        )
+        raise ProbeProtocolError(
+            f"online scout-hit result for cell {cell} is uncertain; the blue request is already "
+            "committed, so the cell will not be clicked again"
+        )
+
+    if hit:
+        row, col = cell
+        hit_map[row][col] = 1
+        level_completed = victory_screenshot is not None or _sidebar_confirms_all_submarines(
+            latest_sidebar_progress,
+            submarines,
+        )
+        if victory_screenshot is not None:
+            handle_victory_prompt(timeout=0.0, screenshot=victory_screenshot)
+        elif level_completed:
+            handle_victory_prompt(timeout=VICTORY_WAIT_AFTER_HIT_SECONDS)
+        probe_result = (
+            ProbeResult.HIT_AND_LEVEL_COMPLETE
+            if level_completed
+            else ProbeResult.HIT
+        )
+        logger.info(
+            "online scout-hit result: level=%s cell=%s result=%s reason=%s",
+            level,
+            cell,
+            probe_result.value,
+            decision_reason,
+        )
+    else:
+        probe_result = ProbeResult.MISS
+        logger.warning(
+            "scout-hit cell %s was a false positive; the online blue shot was committed as a miss",
+            cell,
+        )
+
+    if latest_sidebar_progress is not None:
+        write_runtime_status(
+            sidebar_completed_cells=latest_sidebar_progress.completed_cells,
+            sidebar_completed_lengths=list(latest_sidebar_progress.completed_lengths),
+        )
+    if probe_metadata is not None:
+        probe_metadata.update(
+            online_committed=True,
+            sidebar_newly_completed_lengths=tuple(sidebar_newly_completed),
+            sidebar_completed_lengths=(
+                tuple(latest_sidebar_progress.completed_lengths)
+                if latest_sidebar_progress is not None and latest_sidebar_progress.valid
+                else ()
+            ),
+            sidebar_completed_cells=(
+                latest_sidebar_progress.completed_cells
+                if latest_sidebar_progress is not None and latest_sidebar_progress.valid
+                else 0
+            ),
+            level_completed=_probe_result_completed_level(probe_result),
+        )
+    _write_probe_status(
+        sample_dir,
+        "complete",
+        decision=probe_result.value,
+        reason=decision_reason,
+        hit_votes=hit_votes,
+    )
+    append_recent_probe_result(
+        level=level,
+        index=index,
+        result=probe_result,
+        reason=f"online_scout_{decision_reason}",
+    )
+    return probe_result
 
 
 def _probe_cell(
@@ -1942,6 +2670,7 @@ def _execute_probe_transaction(
     # Activity-entry recovery may return through an already-open fast path after
     # a committed hit. Enforce DROP here so no target click can bypass isolation.
     enable_weak_network(PROBE_DROP_SETTLE_SECONDS)
+    _verify_network_isolated_or_fail_closed(red_scout=False)
 
     transaction = ProbeTransaction(level=level, cell=cell, index=index)
     _active_probe = transaction
@@ -1969,17 +2698,26 @@ def _execute_probe_transaction(
         # 点击命令一旦发出，就保守地认为客户端可能已经暂存验证请求。
         transaction.advance(ProbePhase.REQUEST_PENDING)
         _write_probe_status(sample_dir, "request_pending", phase=transaction.phase.name)
+        write_pending_probe(
+            mode="blue_probe",
+            level=level,
+            cell=cell,
+            index=index,
+            phase=transaction.phase.name,
+        )
         adb.click(x, y)
         _exit_activity_after_probe_click(RUN_DEBUG_DIR / "debug_quit1.png")
         _write_probe_status(sample_dir, "activity_exited", phase=transaction.phase.name)
         if _reenter_activity_for_probe_result():
             transaction.advance(ProbePhase.RESULT_VISIBLE)
+            update_pending_probe(phase=transaction.phase.name)
             _write_probe_status(
                 sample_dir,
                 "victory_detected",
                 phase=transaction.phase.name,
             )
             transaction.advance(ProbePhase.RESULT_RECORDED)
+            update_pending_probe(phase=transaction.phase.name)
             transaction.hit = True
             row, col = cell
             hit_map[row][col] = 1
@@ -2001,6 +2739,7 @@ def _execute_probe_transaction(
                 last_result=ProbeResult.HIT_AND_LEVEL_COMPLETE.value,
             )
             _commit_hit_request_and_prepare_next_probe(transaction)
+            clear_pending_probe()
             _write_probe_status(
                 sample_dir,
                 "complete",
@@ -2091,6 +2830,7 @@ def _execute_probe_transaction(
                 score=float(result.score),
             )
         transaction.advance(ProbePhase.RESULT_VISIBLE)
+        update_pending_probe(phase=transaction.phase.name)
         _write_probe_status(sample_dir, "result_visible", phase=transaction.phase.name)
 
         hit_votes = sum(1 for result in hit_results if result.state == "hit")
@@ -2229,6 +2969,7 @@ def _execute_probe_transaction(
         )
         transaction.hit = hit
         transaction.advance(ProbePhase.RESULT_RECORDED)
+        update_pending_probe(phase=transaction.phase.name)
         _write_probe_status(
             sample_dir,
             "result_recorded",
@@ -2268,6 +3009,8 @@ def _execute_probe_transaction(
                 if level_complete
                 else ProbeResult.MISS
             )
+
+        clear_pending_probe()
 
         _write_probe_status(
             sample_dir,
@@ -2322,6 +3065,7 @@ def _commit_hit_request_and_prepare_next_probe(
 ) -> bool:
     """Restore network immediately on hit so the pending request is submitted."""
     transaction.advance(ProbePhase.REQUEST_COMMITTED)
+    update_pending_probe(phase=transaction.phase.name, request_committed=True)
     logger.info("hit detected; restoring network immediately to submit the pending request")
     transaction.advance(ProbePhase.LOGIN_RECOVERING)
     level_complete = restart_process() is True
@@ -2422,9 +3166,11 @@ def handle_victory_prompt(
         return False
 
     if restore_network:
+        if _has_pending_probe_request():
+            raise ProbeProtocolError("存在待提交探测请求，禁止在胜利界面恢复网络")
         logger.info("victory banner detected; restoring network and tapping screen to continue")
-        adb.disable_reject_network(GAME_PACKAGE_NAME)
         disable_weak_network()
+        adb.disable_reject_network(GAME_PACKAGE_NAME)
     else:
         logger.info("victory banner detected while probe request is pending; keeping network isolated")
     adb.click(*SCREEN_CONTINUE_POINT)
@@ -2434,11 +3180,15 @@ def handle_victory_prompt(
 
 def handle_connection_interrupted_prompt(timeout: float = 20.0) -> bool:
     """Detect the connection-interrupted dialog, reconnect, and click retry."""
+    if _has_pending_probe_request():
+        raise ProbeProtocolError("存在待提交探测请求，禁止通过连接弹窗恢复网络")
+
     dialog = wait_until_connection_interrupted_dialog(timeout=min(4.0, float(timeout)))
     if dialog is None:
         return False
 
     logger.info("connection-interrupted dialog detected; reconnecting and clicking retry")
+    disable_weak_network()
     adb.disable_reject_network(GAME_PACKAGE_NAME)
     retry = wait_until_retry_button(timeout=max(0.0, float(timeout) - 4.0))
     if retry is None:
@@ -2711,7 +3461,15 @@ def resolve_next_level_with_retries(
             LEVEL_ADVANCE_RETRIES,
             next_level,
         )
-        adb.click(*SCREEN_CONTINUE_POINT)
+        transition_screen = adb.read_screenshot()
+        if not handle_victory_prompt(
+            timeout=VICTORY_WAIT_BEFORE_LEVEL_SECONDS,
+            screenshot=transition_screen,
+        ):
+            logger.warning(
+                "victory banner was not confirmed after level %s; refusing to tap the grid",
+                current_level,
+            )
         adb.delay(1.5)
         try:
             enter_activity()
@@ -2722,7 +3480,7 @@ def resolve_next_level_with_retries(
 
 
 def main(level: int | None = None) -> Path | None:
-    """执行指定关卡的辑探测并输出命中图"""
+    """执行自动探测流程并输出各关命中图。"""
     run_started_at = monotonic()
     fallback_is_manual = level is not None
     fallback_level = DEFAULT_LEVEL if level is None else int(level)
@@ -2743,6 +3501,7 @@ def main(level: int | None = None) -> Path | None:
             probe_mode=settings.mode.value,
             red_scout_total=settings.count,
         )
+        _prune_probe_sample_dirs()
         disable_weak_network()
 
         screenshot = adb.read_screenshot()
@@ -2814,11 +3573,11 @@ def main(level: int | None = None) -> Path | None:
         logger.info("脚本总运行时间：%s", format_elapsed(monotonic() - run_started_at))
 
 
-if __name__ == "__main__":
+def run_main_entrypoint() -> int:
     main_pid: int | None = None
-    register_exit_cleanup()
     try:
         main_pid = acquire_main_lock()
+        register_exit_cleanup()
         write_runtime_status(pid=main_pid)
         logger.info("main.py 启动，PID=%s", main_pid)
         adb.ensure_root_shell()
@@ -2830,13 +3589,18 @@ if __name__ == "__main__":
         main()
     except AlreadyRunningError as exc:
         logger.error("%s", exc)
-        raise SystemExit(2)
+        return 2
     except RedScoutSafetyError as exc:
         logger.critical("%s", exc)
-        raise SystemExit(3)
+        return 3
     finally:
-        cleanup_weak_network("main finished")
-        cleanup_reject_network("main finished")
         if main_pid is not None:
-            remove_pid(pid=main_pid)
+            cleanup_weak_network("main finished")
+            cleanup_reject_network("main finished")
+            release_main_lock(pid=main_pid)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_main_entrypoint())
 

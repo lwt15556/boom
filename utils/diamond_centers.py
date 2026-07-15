@@ -595,7 +595,7 @@ def draw_quad(
 
     names = ["top", "right", "bottom", "left"]
 
-    for name, point in zip(names, q):
+    for name, point in zip(names, q, strict=True):
         x = int(round(float(point[0])))
         y = int(round(float(point[1])))
 
@@ -638,8 +638,8 @@ def _validate_grid_size(n: int) -> int:
     """校验网格边长必须为正整数。"""
     try:
         value = int(n)
-    except (TypeError, ValueError):
-        raise ValueError(f"n 必须是正整数: {n}")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"n 必须是正整数: {n}") from exc
 
     if value <= 0:
         raise ValueError(f"n 必须是正整数: {n}")

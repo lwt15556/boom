@@ -13,10 +13,21 @@ PENDING_PROBE_FILE = BASE_DIR / "_debug" / "runtime" / "pending_probe.json"
 
 def read_pending_probe(path: Path = PENDING_PROBE_FILE) -> dict[str, Any] | None:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
-    return payload if isinstance(payload, dict) else None
+    except (OSError, UnicodeError) as exc:
+        return _unknown_pending_probe(f"read failed: {exc}")
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return _unknown_pending_probe(f"invalid json: {exc}")
+    if not isinstance(payload, dict):
+        return _unknown_pending_probe(
+            f"expected object, got {type(payload).__name__}"
+        )
+    return payload
 
 
 def has_pending_probe(path: Path = PENDING_PROBE_FILE) -> bool:
@@ -77,6 +88,15 @@ def _write_payload(path: Path, payload: dict[str, Any]) -> None:
         encoding="utf-8",
     )
     temp_path.replace(path)
+
+
+def _unknown_pending_probe(reason: str) -> dict[str, Any]:
+    return {
+        "mode": "unknown",
+        "phase": "INTERRUPTED",
+        "state_unknown": True,
+        "error": str(reason),
+    }
 
 
 __all__ = [
