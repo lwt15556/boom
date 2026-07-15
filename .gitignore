@@ -27,4 +27,6 @@ _debug/screenshots/**
 _debug/diamond_hit_probe/**
 _debug/logs/**
 _debug/runtime/**
+_debug/reports/**
+_debug/red_scout_samples/**
 save_points/dbg/

@@ -3,6 +3,7 @@ from typing import Final
 
 # Base 路径，指向项目根目录
 BASE_DIR = Path(__file__).resolve().parent
+RED_SCOUT_MAX_COUNT = 50
 
 # ADB 连接的默认设备 IP 地址
 ADB_SERIAL = "127.0.0.1:5555"
@@ -20,6 +21,7 @@ LOG_DIR = BASE_DIR / "_debug" / "logs"
 LOG_FILE = LOG_DIR / "bbma.log"
 OUTPUT_DIR = BASE_DIR / "outputs"
 MAX_PROBE_SAMPLE_DIRS: Final[int] = 120
+MAX_RED_SCOUT_SAMPLE_DIRS: Final[int] = 60
 
 
 # 目前支持的最大关卡

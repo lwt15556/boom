@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -59,7 +60,6 @@ def find_template_multi_scale(
         raise ValueError("scales cannot be empty")
 
     path = Path(template_path)
-    template, mask = _read_template(path)
     screenshot = _normalize_screenshot(screenshot)
     shape_weight = _normalize_weight(shape_weight)
     shape_power = max(float(shape_power), 1.0)
@@ -67,7 +67,7 @@ def find_template_multi_scale(
     best_match: MatchResult | None = None
     best_score = -1.0
     for scale in scales:
-        scaled_template, scaled_mask = _resize_template(template, mask, float(scale))
+        scaled_template, scaled_mask = _read_scaled_template(path, float(scale))
         match = _match_prepared_template(
             screenshot=screenshot,
             template=scaled_template,
@@ -121,6 +121,7 @@ def _match_prepared_template(
     )
 
 
+@lru_cache(maxsize=64)
 def _read_template(path: Path):
     raw_template = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
     if raw_template is None:
@@ -139,6 +140,17 @@ def _read_template(path: Path):
         raise ValueError(f"template alpha channel is empty: {path}")
 
     return template[y : y + height, x : x + width], alpha[y : y + height, x : x + width]
+
+
+@lru_cache(maxsize=256)
+def _read_scaled_template(path: Path, scale: float):
+    template, mask = _read_template(path)
+    return _resize_template(template, mask, scale)
+
+
+def _clear_template_caches() -> None:
+    _read_scaled_template.cache_clear()
+    _read_template.cache_clear()
 
 
 def _resize_template(template, mask, scale: float):

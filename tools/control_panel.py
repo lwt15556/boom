@@ -57,7 +57,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from config import ADB_EXE, ADB_SERIAL, GAME_PACKAGE_NAME, LOG_FILE
+from config import ADB_EXE, ADB_SERIAL, GAME_PACKAGE_NAME, LOG_FILE, RED_SCOUT_MAX_COUNT
 from utils.adb_control import AdbController
 from utils.pending_probe import clear_pending_probe, has_pending_probe
 from utils.runtime_lock import MAIN_PID_FILE, get_main_process, is_pid_running, remove_pid
@@ -158,13 +158,32 @@ def format_probe_mode(value: object) -> str:
     return PROBE_MODE_NAMES.get(str(value), PROBE_MODE_NAMES["blue_only"])
 
 
+def format_red_scout_progress(
+    *,
+    current: object,
+    total: object,
+    valid: object,
+    complete_six: object,
+) -> str:
+    current_value = safe_int(current)
+    total_value = safe_int(total)
+    if current_value is None or total_value is None:
+        return "--"
+    valid_value = max(0, safe_int(valid) or 0)
+    complete_value = max(0, safe_int(complete_six) or 0)
+    return (
+        f"{current_value} / {total_value} · "
+        f"有效 {valid_value} · 完整六格 {complete_value}"
+    )
+
+
 def build_main_environment(mode: object, red_count: object) -> dict[str, str]:
     normalized = str(mode) if str(mode) in PROBE_MODE_NAMES else "blue_only"
     try:
         count = int(red_count)
     except (TypeError, ValueError):
         count = 2
-    return {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "BBMA_PROBE_MODE": normalized, "BBMA_RED_SCOUT_COUNT": str(max(1, min(10, count)))}
+    return {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "BBMA_PROBE_MODE": normalized, "BBMA_RED_SCOUT_COUNT": str(max(1, min(RED_SCOUT_MAX_COUNT, count)))}
 
 
 def now_text() -> str:
@@ -626,6 +645,8 @@ class ControlPanel(QMainWindow):
         self.runtime_status: dict[str, object] = {}
         self.network_status = "未检测"
         self.last_recent_signature = ""
+        self.last_runtime_render_signature: str | None = None
+        self.last_process_render_signature: tuple[bool, int | None] | None = None
 
         self.log_lines: deque[str] = deque(maxlen=MAX_LOG_LINES)
         self.current_log_path: Path | None = None
@@ -671,7 +692,7 @@ class ControlPanel(QMainWindow):
         for value, label in PROBE_MODE_NAMES.items():
             self.probe_mode_combo.addItem(label, value)
         self.red_scout_count = QSpinBox()
-        self.red_scout_count.setRange(1, 10)
+        self.red_scout_count.setRange(1, RED_SCOUT_MAX_COUNT)
         self.red_scout_count.setValue(2)
         self.red_scout_count.setSuffix(" 次/关")
         self.probe_mode_value = QLabel("--")
@@ -1251,6 +1272,21 @@ class ControlPanel(QMainWindow):
         _pid, running = self._resolve_running_process()
         return running
 
+    def _runtime_status_needs_render(self, *, initial: bool = False) -> bool:
+        signature = json.dumps(
+            {
+                "runtime_status": self.runtime_status,
+                "network_status": self.network_status,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        if not initial and signature == self.last_runtime_render_signature:
+            return False
+        self.last_runtime_render_signature = signature
+        return True
+
     def update_status(self, initial: bool = False) -> None:
         previous_pid = self.last_running_pid
         self.main_pid, running = self._resolve_running_process()
@@ -1269,8 +1305,15 @@ class ControlPanel(QMainWindow):
             self.last_running_pid = self.main_pid
         self.was_running = running
 
-        self._set_status_badge(running)
-        self.pid_value.setText(str(self.main_pid) if self.main_pid is not None else "--")
+        process_signature = (running, self.main_pid)
+        if initial or process_signature != self.last_process_render_signature:
+            self._set_status_badge(running)
+            self.pid_value.setText(str(self.main_pid) if self.main_pid is not None else "--")
+            self.last_process_render_signature = process_signature
+
+        if not self._runtime_status_needs_render(initial=initial):
+            self.update_controls(running=running)
+            return
 
         phase = self.runtime_status.get("phase", "--")
         level = self.runtime_status.get("level", "--")
@@ -1292,7 +1335,12 @@ class ControlPanel(QMainWindow):
         red_current = self.runtime_status.get("red_scout_current")
         red_total = self.runtime_status.get("red_scout_total")
         self.red_scout_progress_value.setText(
-            f"{red_current} / {red_total}" if red_current is not None and red_total is not None else "--"
+            format_red_scout_progress(
+                current=red_current,
+                total=red_total,
+                valid=self.runtime_status.get("red_scout_valid"),
+                complete_six=self.runtime_status.get("red_scout_complete_six"),
+            )
         )
 
         self.network_value.setText(network)
@@ -1487,17 +1535,28 @@ class ControlPanel(QMainWindow):
         lines = decode_log_bytes(data).splitlines()
         if lines:
             self.log_lines.extend(lines)
-            self.render_log()
+            self.append_rendered_log_lines(lines)
 
-    def render_log(self) -> None:
+    def _filter_log_lines(self, lines) -> list[str]:
         show_detail = bool(self.log_filter_combo.currentData())
         query = self.log_search.text().strip().casefold()
-        filtered = [
+        return [
             line
-            for line in self.log_lines
+            for line in lines
             if should_show_log_line(line, show_detail)
             and (not query or query in line.casefold())
         ]
+
+    def append_rendered_log_lines(self, lines) -> None:
+        filtered = self._filter_log_lines(lines)
+        if not filtered:
+            return
+        self.log_view.appendPlainText("\n".join(filtered))
+        if bool(self.auto_scroll_combo.currentData()):
+            self.log_view.moveCursor(QTextCursor.MoveOperation.End)
+
+    def render_log(self) -> None:
+        filtered = self._filter_log_lines(self.log_lines)
         self.log_view.setPlainText("\n".join(filtered[-MAX_LOG_LINES:]))
         if bool(self.auto_scroll_combo.currentData()):
             self.log_view.moveCursor(QTextCursor.MoveOperation.End)

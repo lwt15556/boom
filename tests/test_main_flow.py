@@ -8,9 +8,20 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import cv2
 import numpy as np
 
 from utils.sidebar_progress import SidebarProgress
+
+
+class FakeScreenshotCapture:
+    def __init__(self, image):
+        self.image = image
+        self.png_bytes = b"fake-png"
+
+    @staticmethod
+    def save(path):
+        return path
 
 
 class FakeAdb:
@@ -46,6 +57,10 @@ class FakeAdb:
     def read_screenshot(self, output_path=None):
         self.calls.append(("read_screenshot", output_path))
         return object()
+
+    def capture_screenshot(self):
+        self.calls.append(("capture_screenshot",))
+        return FakeScreenshotCapture(self.read_screenshot())
 
     def swipe(self, start_x, start_y, end_x, end_y):
         self.calls.append(("swipe", start_x, start_y, end_x, end_y))
@@ -147,6 +162,157 @@ class MainFlowTest(unittest.TestCase):
             confidence_by_cell={(1, 1): 0.9, (1, 2): 0.9},
         )
 
+    def test_red_scout_sample_directories_are_unique_per_attempt(self):
+        sample_root = self.main.Path(self.runtime_temp.name) / "red_scout_samples"
+        with patch.object(
+            self.main,
+            "RED_SCOUT_SAMPLE_DIR",
+            sample_root,
+            create=True,
+        ):
+            first = self.main._create_red_scout_sample_dir(
+                level=15,
+                center=(4, 5),
+                index=45,
+                attempt=1,
+            )
+            second = self.main._create_red_scout_sample_dir(
+                level=15,
+                center=(4, 5),
+                index=45,
+                attempt=2,
+            )
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.is_dir())
+        self.assertTrue(second.is_dir())
+        self.assertIn("attempt_01", first.name)
+        self.assertIn("attempt_02", second.name)
+
+    def test_red_analysis_recovers_only_when_two_extra_baselines_agree(self):
+        primary = self.main.RedScoutResult(
+            center_cell=(1, 1),
+            affected_cells=frozenset(),
+            hit_cells=frozenset(),
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=None,
+            valid=False,
+            confidence_by_cell={},
+            invalid_reason="insufficient_changed_cells",
+        )
+        cells = frozenset({(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)})
+        consensus = self.main.RedScoutResult(
+            center_cell=(1, 1),
+            affected_cells=cells,
+            hit_cells=frozenset({(1, 1)}),
+            miss_cells=cells - {(1, 1)},
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(frozenset({(0, 0)})),
+            valid=True,
+            confidence_by_cell={cell: 0.9 for cell in cells},
+        )
+
+        with patch.object(
+            self.main,
+            "_analyze_red_result",
+            side_effect=[primary, consensus, consensus],
+        ) as analyze:
+            result = self.main._analyze_red_result_with_baseline_consensus(
+                before_images=["before-0", "before-1", "before-2"],
+                after_images=["after"],
+                click_points=[(0, 0)] * 9,
+                grid_size=3,
+                center_cell=(1, 1),
+                submarine_lengths=[3],
+            )
+
+        self.assertEqual(result.affected_cells, consensus.affected_cells)
+        self.assertEqual(result.hit_cells, consensus.hit_cells)
+        self.assertEqual(result.miss_cells, consensus.miss_cells)
+        self.assertEqual(result.diagnostics["baseline_consensus_votes"], 2)
+        self.assertEqual(result.diagnostics["baseline_count"], 3)
+        self.assertEqual(analyze.call_count, 3)
+
+    def test_red_analysis_keeps_primary_when_extra_baselines_disagree(self):
+        primary = self.main.RedScoutResult(
+            center_cell=(1, 1), affected_cells=frozenset(),
+            hit_cells=frozenset(), miss_cells=frozenset(),
+            unknown_cells=frozenset(), footprint=None, valid=False,
+            confidence_by_cell={}, invalid_reason="insufficient_changed_cells",
+        )
+
+        def full_result(last_cell):
+            cells = frozenset({(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), last_cell})
+            return self.main.RedScoutResult(
+                center_cell=(1, 1), affected_cells=cells,
+                hit_cells=frozenset({(1, 1)}), miss_cells=cells - {(1, 1)},
+                unknown_cells=frozenset(),
+                footprint=self.main.RedFootprint(frozenset({(0, 0)})),
+                valid=True, confidence_by_cell={cell: 0.9 for cell in cells},
+            )
+
+        with patch.object(
+            self.main,
+            "_analyze_red_result",
+            side_effect=[primary, full_result((1, 2)), full_result((2, 1))],
+        ):
+            result = self.main._analyze_red_result_with_baseline_consensus(
+                before_images=["before-0", "before-1", "before-2"],
+                after_images=["after"], click_points=[(0, 0)] * 9,
+                grid_size=3, center_cell=(1, 1), submarine_lengths=[3],
+            )
+
+        self.assertIs(result, primary)
+
+    def test_red_analysis_keeps_primary_when_extra_baseline_analysis_errors(self):
+        primary = self.main.RedScoutResult(
+            center_cell=(1, 1), affected_cells=frozenset(),
+            hit_cells=frozenset(), miss_cells=frozenset(),
+            unknown_cells=frozenset(), footprint=None, valid=False,
+            confidence_by_cell={}, invalid_reason="insufficient_changed_cells",
+        )
+        alternative = self._valid_red_result()
+
+        with patch.object(
+            self.main,
+            "_analyze_red_result",
+            side_effect=[primary, RuntimeError("secondary failed"), alternative],
+        ):
+            result = self.main._analyze_red_result_with_baseline_consensus(
+                before_images=["before-0", "before-1", "before-2"],
+                after_images=["after"], click_points=[(0, 0)] * 9,
+                grid_size=3, center_cell=(1, 1), submarine_lengths=[3],
+            )
+
+        self.assertIs(result, primary)
+
+    def test_red_scout_sample_retention_removes_only_oldest_managed_directory(self):
+        sample_root = self.main.Path(self.runtime_temp.name) / "red_scout_samples"
+        sample_root.mkdir()
+        directories = []
+        for index in range(3):
+            path = sample_root / f"level_15_attempt_0{index + 1}_sample"
+            path.mkdir()
+            (path / "analysis.json").write_text("{}", encoding="utf-8")
+            os.utime(path, (index + 1, index + 1))
+            directories.append(path)
+        unmanaged = sample_root / "keep_me"
+        unmanaged.mkdir()
+
+        with patch.object(
+            self.main,
+            "RED_SCOUT_SAMPLE_DIR",
+            sample_root,
+            create=True,
+        ):
+            self.main._prune_red_scout_sample_dirs(max_directories=2)
+
+        self.assertFalse(directories[0].exists())
+        self.assertTrue(directories[1].is_dir())
+        self.assertTrue(directories[2].is_dir())
+        self.assertTrue(unmanaged.is_dir())
+
     def test_rejected_second_instance_does_not_register_or_run_network_cleanup(self):
         with (
             patch.object(
@@ -193,6 +359,13 @@ class MainFlowTest(unittest.TestCase):
 
         self.assertTrue(completed)
         self.assertEqual(execute.call_count, 3)
+        self.assertTrue(
+            all(call.kwargs["excluded_cells"] == () for call in execute.call_args_list)
+        )
+        self.assertEqual(
+            [call.kwargs["attempt"] for call in execute.call_args_list],
+            [1, 2, 3],
+        )
         online_hit.assert_called_once()
         self.assertEqual(execute.call_args.args[4], 3)
         self.assertEqual(execute.call_args.args[5], [(row, col) for row in range(3) for col in range(3)])
@@ -204,6 +377,8 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(write_status.call_args.kwargs["phase"], "blue_attack")
         self.assertEqual(write_status.call_args.kwargs["red_scout_current"], 3)
         self.assertEqual(write_status.call_args.kwargs["red_scout_total"], 3)
+        self.assertEqual(write_status.call_args.kwargs["red_scout_valid"], 3)
+        self.assertEqual(write_status.call_args.kwargs["red_scout_complete_six"], 0)
         phases = [call.kwargs["phase"] for call in write_status.call_args_list if "phase" in call.kwargs]
         self.assertEqual(phases[-1], "blue_attack")
         self.assertEqual(phases.count("red_scout_capture"), 3)
@@ -252,6 +427,37 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(scan.call_args.kwargs["initial_scout_hits"], set())
         self.assertEqual(scan.call_args.kwargs["initial_scout_misses"], set(neighbors))
         self.assertTrue(scan.call_args.kwargs["commit_scout_hits_online"])
+
+    def test_red_scout_counts_only_fully_classified_six_cell_results_as_complete(self):
+        cells = frozenset({(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)})
+        result = self.main.RedScoutResult(
+            center_cell=(1, 1),
+            affected_cells=cells,
+            hit_cells=frozenset(),
+            miss_cells=cells,
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(frozenset({(0, 0)})),
+            valid=True,
+            confidence_by_cell={cell: 0.9 for cell in cells},
+        )
+
+        with (
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True),
+            patch.object(self.main, "write_runtime_status") as write_status,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                level=1,
+                hit_map=[[0] * 3 for _ in range(3)],
+                click_points=[(400, 300)] * 9,
+                submarines=[3],
+                initial_hits=set(),
+                settings=self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1),
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(write_status.call_args.kwargs["red_scout_valid"], 1)
+        self.assertEqual(write_status.call_args.kwargs["red_scout_complete_six"], 1)
 
     def test_red_scout_commits_new_hits_online_before_next_red_attempt(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
@@ -512,7 +718,12 @@ class MainFlowTest(unittest.TestCase):
             return_value=expected,
         ) as analyze:
             result = self.main._analyze_red_result(
-                "before", ["after"], click_points, 3, (1, 1)
+                "before",
+                ["after"],
+                click_points,
+                3,
+                (1, 1),
+                submarine_lengths=[3],
             )
 
         self.assertIs(result, expected)
@@ -524,6 +735,7 @@ class MainFlowTest(unittest.TestCase):
             center_cell=(1, 1),
             excluded_cells=set(),
             learned_footprint=None,
+            submarine_lengths=[3],
         )
 
     def test_red_transaction_capture_does_not_precede_preflight(self):
@@ -699,6 +911,7 @@ class MainFlowTest(unittest.TestCase):
     def test_online_scout_hit_keeps_network_connected_and_clicks_target_once(self):
         hit_map = [[0, 0, 0] for _row in range(3)]
         screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        incomplete_progress = SidebarProgress(active_lengths=(3,))
         self.adb.read_screenshot = Mock(return_value=screenshot)
 
         with (
@@ -714,7 +927,7 @@ class MainFlowTest(unittest.TestCase):
                 self.main,
                 "classify_diamond_hit",
                 side_effect=lambda *_args, **_kwargs: dummy_hit_result("hit"),
-            ),
+            ) as classify,
             patch.object(self.main, "find_victory_banner", return_value=None),
             patch.object(self.main, "red_hit_marker_visible", return_value=False),
             patch.object(self.main, "visible_wreck_static_detected", return_value=False),
@@ -722,7 +935,7 @@ class MainFlowTest(unittest.TestCase):
             patch.object(
                 self.main,
                 "apply_sidebar_completion_confirmation",
-                return_value=(False, None, ()),
+                return_value=(False, incomplete_progress, ()),
             ),
             patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
             patch.object(self.main, "_write_probe_status"),
@@ -741,6 +954,7 @@ class MainFlowTest(unittest.TestCase):
 
         package_name = self.main.GAME_PACKAGE_NAME
         self.assertEqual(result, self.main.ProbeResult.HIT)
+        self.assertEqual(classify.call_count, 3)
         self.assertEqual(hit_map[1][1], 1)
         self.assertEqual(self.adb.calls.count(("click", 640, 360)), 1)
         self.assertEqual(self.adb.calls.count(("click", *self.main.BLUE_BOMB_POINT)), 1)
@@ -1204,9 +1418,11 @@ class MainFlowTest(unittest.TestCase):
     def test_red_planner_progresses_covered_cells_and_resets_each_level(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
         centers = []
+        received_submarine_lengths = []
 
         def execute(level, center, point, index, grid_size, all_click_points, **_kwargs):
             centers.append((level, center))
+            received_submarine_lengths.append(_kwargs.get("submarine_lengths"))
             self.assertEqual(grid_size, 3)
             self.assertEqual(len(all_click_points), 9)
             return self._valid_red_result(center)
@@ -1231,6 +1447,7 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(centers[0][1], (1, 1))
         self.assertNotEqual(centers[1][1], centers[0][1])
         self.assertEqual(centers[2], centers[0])
+        self.assertEqual(received_submarine_lengths, [[3], [3], [3], [3]])
 
     def test_red_planner_keeps_first_valid_footprint_for_later_attempts(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 3)
@@ -1589,7 +1806,8 @@ class MainFlowTest(unittest.TestCase):
             events.append("reenter_activity")
             return False
 
-        def capture_result_frames():
+        def capture_result_frames(*, sample_dir=None):
+            self.assertIsNone(sample_dir)
             events.append("capture_result")
             return ["after"]
 
@@ -1609,7 +1827,11 @@ class MainFlowTest(unittest.TestCase):
             ) as exit_activity,
             patch.object(self.main, "enter_activity", side_effect=reenter_activity),
             patch.object(self.main, "_capture_red_result_frames", side_effect=capture_result_frames),
-            patch.object(self.main, "_analyze_red_result", return_value=analysis),
+            patch.object(
+                self.main,
+                "_analyze_red_result",
+                return_value=analysis,
+            ) as analyze,
             patch.object(self.main, "_discard_pending_request_and_prepare_next_probe", side_effect=discard) as discard_mock,
             patch.object(self.main, "_commit_hit_request_and_prepare_next_probe") as commit_mock,
             patch.object(self.main, "ammo_fingerprint_matches", return_value=True),
@@ -1622,6 +1844,7 @@ class MainFlowTest(unittest.TestCase):
             result = self.main._execute_red_scout_transaction(
                 level=1, center_cell=(1, 1), point=(100, 200), index=0,
                 grid_size=3, all_click_points=[(0, 0)] * 9,
+                submarine_lengths=[3],
             )
         self.assertIs(result, analysis)
         write_pending.assert_called_once()
@@ -1642,6 +1865,89 @@ class MainFlowTest(unittest.TestCase):
             phases,
             ["red_scout_preflight", "red_scout_capture", "red_scout_discard", "red_scout_verify_ammo"],
         )
+        self.assertEqual(analyze.call_args.kwargs["submarine_lengths"], [3])
+
+    def test_red_scout_transaction_wires_all_artifacts_to_attempt_directory(self):
+        analysis = self._valid_red_result()
+        sample_dir = self.main.Path(self.runtime_temp.name) / "attempt"
+        sample_dir.mkdir()
+        match = DummyMatch((10, 20))
+
+        def discard(transaction):
+            transaction.advance(self.main.ProbePhase.REQUEST_DISCARDED)
+            transaction.red_request_discarded = True
+            transaction.advance(self.main.ProbePhase.LOGIN_RECOVERING)
+            transaction.advance(self.main.ProbePhase.COMPLETE)
+            return False
+
+        with (
+            patch.object(
+                self.main,
+                "_create_red_scout_sample_dir",
+                return_value=sample_dir,
+            ) as create_sample,
+            patch.object(
+                self.main,
+                "_capture_red_ammo_state",
+                return_value=(["before-0", "before-1", "before-2"], "fingerprint", match),
+            ) as capture_ammo,
+            patch.object(self.main, "_select_red_bomb", return_value=True) as select_red,
+            patch.object(self.main, "_exit_activity_after_probe_click") as exit_activity,
+            patch.object(self.main, "_reenter_activity_for_probe_result", return_value=False),
+            patch.object(
+                self.main,
+                "_capture_red_result_frames",
+                return_value=["after"],
+            ) as capture_results,
+            patch.object(
+                self.main,
+                "_analyze_red_result_with_baseline_consensus",
+                return_value=analysis,
+            ) as analyze,
+            patch.object(
+                self.main,
+                "_discard_pending_request_and_prepare_next_probe",
+                side_effect=discard,
+            ),
+            patch.object(self.main, "_verify_red_ammo_unchanged") as verify_ammo,
+            patch.object(self.main, "_write_red_scout_analysis") as write_analysis,
+        ):
+            result = self.main._execute_red_scout_transaction(
+                level=15,
+                center_cell=(1, 1),
+                point=(100, 200),
+                index=11,
+                grid_size=3,
+                all_click_points=[(0, 0)] * 9,
+                submarine_lengths=[3],
+                attempt=2,
+            )
+
+        self.assertIs(result, analysis)
+        create_sample.assert_called_once_with(15, (1, 1), 11, 2)
+        capture_ammo.assert_called_once_with(
+            sample_dir=sample_dir,
+            prefix="before",
+            include_frames=True,
+        )
+        select_red.assert_called_once_with(match, output_path=sample_dir / "selected.png")
+        exit_activity.assert_called_once_with(
+            sample_dir / "exit_attempt.png",
+            use_system_back=True,
+        )
+        capture_results.assert_called_once_with(sample_dir=sample_dir)
+        self.assertEqual(
+            analyze.call_args.kwargs["before_images"],
+            ["before-0", "before-1", "before-2"],
+        )
+        write_analysis.assert_called_once_with(
+            sample_dir,
+            analysis,
+            level=15,
+            index=11,
+            attempt=2,
+        )
+        verify_ammo.assert_called_once_with("fingerprint", sample_dir=sample_dir)
 
     def test_red_pending_marker_is_written_before_target_click(self):
         events = []
@@ -1688,6 +1994,9 @@ class MainFlowTest(unittest.TestCase):
         self.assertLess(events.index("request_discarded"), events.index("pending_cleared"))
 
     def test_red_local_victory_is_discarded_and_not_reported_as_level_complete(self):
+        sample_dir = self.main.Path(self.runtime_temp.name) / "attempt"
+        sample_dir.mkdir()
+
         def discard(transaction, **_kwargs):
             transaction.advance(self.main.ProbePhase.REQUEST_DISCARDED)
             transaction.red_request_discarded = True
@@ -1696,6 +2005,11 @@ class MainFlowTest(unittest.TestCase):
             return False
 
         with (
+            patch.object(
+                self.main,
+                "_create_red_scout_sample_dir",
+                return_value=sample_dir,
+            ),
             patch.object(self.main, "_capture_red_ammo_state", side_effect=[("before", "fp", DummyMatch((10, 20))), ("after", "fp", DummyMatch((10, 20)))]),
             patch.object(self.main, "_select_red_bomb", return_value=True),
             patch.object(self.main, "_exit_activity_after_probe_click"),
@@ -1706,15 +2020,24 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "update_pending_probe"),
             patch.object(self.main, "clear_pending_probe") as clear_pending,
             patch.object(self.main, "_analyze_red_result") as analyze,
+            patch.object(self.main, "_write_red_scout_analysis") as write_analysis,
         ):
             result = self.main._execute_red_scout_transaction(
-                1, (1, 1), (100, 200), 0, 3, [(0, 0)] * 9
+                1, (1, 1), (100, 200), 0, 3, [(0, 0)] * 9, attempt=1
             )
 
         self.assertFalse(result.level_completed)
         self.assertFalse(result.valid)
+        self.assertEqual(result.invalid_reason, "local_victory_screen")
         clear_pending.assert_called_once()
         analyze.assert_not_called()
+        write_analysis.assert_called_once_with(
+            sample_dir,
+            result,
+            level=1,
+            index=0,
+            attempt=1,
+        )
 
     def test_startup_recovery_force_stops_stale_pending_request_before_cleanup(self):
         events = []
@@ -1797,6 +2120,166 @@ class MainFlowTest(unittest.TestCase):
             ],
         )
 
+    def test_red_result_capture_writes_each_attempt_to_its_sample_directory(self):
+        frames = [object() for _ in self.main.HIT_RESULT_FRAME_DELAYS]
+        captured_paths = []
+        sample_dir = self.main.Path(self.runtime_temp.name) / "attempt"
+        sample_dir.mkdir()
+
+        def read_screenshot(path):
+            captured_paths.append(path)
+            return frames[len(captured_paths) - 1]
+
+        self.adb.read_screenshot = Mock(side_effect=read_screenshot)
+
+        result = self.main._capture_red_result_frames(sample_dir=sample_dir)
+
+        self.assertEqual(result, frames)
+        self.assertEqual(
+            captured_paths,
+            [
+                sample_dir / f"after_{index}.png"
+                for index in range(len(self.main.HIT_RESULT_FRAME_DELAYS))
+            ],
+        )
+
+    def test_red_ammo_capture_keeps_before_and_verify_frames_separate(self):
+        sample_dir = self.main.Path(self.runtime_temp.name) / "attempt"
+        sample_dir.mkdir()
+        match = DummyMatch((10, 20))
+        self.adb.read_screenshot = Mock(side_effect=["b0", "b1", "b2", "v0", "v1", "v2"])
+
+        with (
+            patch.object(self.main, "locate_red_bomb_button", return_value=match),
+            patch.object(self.main, "build_ammo_fingerprint", return_value="fingerprint"),
+        ):
+            before = self.main._capture_red_ammo_state(
+                sample_dir=sample_dir,
+                prefix="before",
+            )
+            verify = self.main._capture_red_ammo_state(
+                sample_dir=sample_dir,
+                prefix="verify",
+            )
+
+        self.assertEqual(before, ("b0", "fingerprint", match))
+        self.assertEqual(verify, ("v0", "fingerprint", match))
+        self.assertEqual(
+            [call.args[0] for call in self.adb.read_screenshot.call_args_list],
+            [
+                sample_dir / "before_0.png",
+                sample_dir / "before_1.png",
+                sample_dir / "before_2.png",
+                sample_dir / "verify_0.png",
+                sample_dir / "verify_1.png",
+                sample_dir / "verify_2.png",
+            ],
+        )
+
+    def test_red_ammo_capture_can_return_all_baseline_frames_for_consensus(self):
+        sample_dir = self.main.Path(self.runtime_temp.name) / "attempt"
+        sample_dir.mkdir()
+        match = DummyMatch((10, 20))
+        frames = ["b0", "b1", "b2"]
+        self.adb.read_screenshot = Mock(side_effect=frames)
+
+        with (
+            patch.object(self.main, "locate_red_bomb_button", return_value=match),
+            patch.object(self.main, "build_ammo_fingerprint", return_value="fingerprint"),
+        ):
+            captured, fingerprint, captured_match = self.main._capture_red_ammo_state(
+                sample_dir=sample_dir,
+                prefix="before",
+                include_frames=True,
+            )
+
+        self.assertEqual(captured, frames)
+        self.assertEqual(fingerprint, "fingerprint")
+        self.assertIs(captured_match, match)
+
+    def test_red_selection_screenshot_uses_attempt_sample_path(self):
+        sample_dir = self.main.Path(self.runtime_temp.name) / "attempt"
+        sample_dir.mkdir()
+        match = DummyMatch((10, 20))
+        selected_image = object()
+        self.adb.read_screenshot = Mock(return_value=selected_image)
+
+        with patch.object(self.main, "red_bomb_selected", return_value=True) as selected:
+            confirmed = self.main._select_red_bomb(
+                match,
+                output_path=sample_dir / "selected.png",
+            )
+
+        self.assertTrue(confirmed)
+        self.adb.read_screenshot.assert_called_once_with(sample_dir / "selected.png")
+        selected.assert_called_once_with(selected_image, match)
+
+    def test_red_analysis_json_records_result_and_intermediate_diagnostics(self):
+        sample_dir = self.main.Path(self.runtime_temp.name) / "attempt"
+        sample_dir.mkdir()
+        result = self.main.RedScoutResult(
+            center_cell=(1, 1),
+            affected_cells=frozenset({(0, 0), (0, 1)}),
+            hit_cells=frozenset({(0, 0)}),
+            miss_cells=frozenset({(0, 1)}),
+            unknown_cells=frozenset(),
+            footprint=None,
+            valid=False,
+            confidence_by_cell={(0, 0): 0.95, (0, 1): 0.80},
+            invalid_reason="insufficient_changed_cells",
+            diagnostics={
+                "stage": "insufficient_changes",
+                "raw_stable_hits": ((0, 0),),
+                "completed_sidebar_votes": (
+                    {"lengths": (3,), "votes": 2},
+                ),
+            },
+        )
+
+        self.main._write_red_scout_analysis(
+            sample_dir,
+            result,
+            level=15,
+            index=11,
+            attempt=2,
+        )
+
+        payload = self.main.json.loads(
+            (sample_dir / "analysis.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(payload["level"], 15)
+        self.assertEqual(payload["attempt"], 2)
+        self.assertEqual(payload["center"], [1, 1])
+        self.assertFalse(payload["valid"])
+        self.assertFalse(payload["complete_six"])
+        self.assertEqual(payload["invalid_reason"], "insufficient_changed_cells")
+        self.assertEqual(payload["diagnostics"]["raw_stable_hits"], [[0, 0]])
+        self.assertEqual(
+            payload["diagnostics"]["completed_sidebar_votes"],
+            [{"lengths": [3], "votes": 2}],
+        )
+
+    def test_red_analysis_json_does_not_mark_invalid_six_cell_result_complete(self):
+        sample_dir = self.main.Path(self.runtime_temp.name) / "attempt"
+        sample_dir.mkdir()
+        cells = frozenset({(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)})
+        result = self.main.RedScoutResult(
+            center_cell=(1, 1), affected_cells=cells,
+            hit_cells=frozenset(), miss_cells=cells,
+            unknown_cells=frozenset(), footprint=None, valid=False,
+            confidence_by_cell={cell: 0.9 for cell in cells},
+            invalid_reason="ambiguous_result",
+        )
+
+        self.main._write_red_scout_analysis(
+            sample_dir, result, level=1, index=4, attempt=1,
+        )
+
+        payload = self.main.json.loads(
+            (sample_dir / "analysis.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(payload["complete_six"])
+
     def test_exit_activity_waits_until_detail_is_gone(self):
         frames = [
             np.zeros((20, 20, 3), dtype=np.uint8),
@@ -1819,6 +2302,44 @@ class MainFlowTest(unittest.TestCase):
             )
 
         self.assertEqual(self.adb.read_screenshot.call_count, 3)
+
+    def test_exit_wait_ignores_quit_template_match_outside_top_left(self):
+        template = cv2.imread(str(self.main.QUIT_ACTIVITY_TEMPLATE))
+        self.assertIsNotNone(template)
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        template_height, template_width = template.shape[:2]
+        frame[300:300 + template_height, 500:500 + template_width] = template
+        self.adb.read_screenshot = Mock(return_value=frame)
+
+        with (
+            patch.object(
+                self.main,
+                "monotonic",
+                side_effect=[0.0, 0.0, 0.1, 1.1],
+            ),
+            patch.object(self.main, "sleep"),
+        ):
+            closed = self.main._wait_until_activity_detail_closed(timeout=1.0)
+
+        self.assertTrue(closed)
+        self.assertEqual(self.adb.read_screenshot.call_count, 2)
+
+    def test_exit_wait_takes_final_confirmation_when_one_absent_frame_hits_deadline(self):
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=frame)
+
+        with (
+            patch.object(
+                self.main,
+                "monotonic",
+                side_effect=[0.0, 0.0, 1.1],
+            ),
+            patch.object(self.main, "sleep"),
+        ):
+            closed = self.main._wait_until_activity_detail_closed(timeout=1.0)
+
+        self.assertTrue(closed)
+        self.assertEqual(self.adb.read_screenshot.call_count, 2)
 
     def test_exit_activity_retries_quit_when_first_click_is_ignored(self):
         with (
@@ -1976,7 +2497,11 @@ class MainFlowTest(unittest.TestCase):
             side_effect=[before, victory_frame, victory_frame, victory_frame, victory_frame]
         )
 
-        def commit(transaction):
+        def commit(transaction, *, victory_wait_timeout):
+            self.assertEqual(
+                victory_wait_timeout,
+                self.main.VICTORY_WAIT_AFTER_HIT_SECONDS,
+            )
             transaction.advance(self.main.ProbePhase.REQUEST_COMMITTED)
             transaction.advance(self.main.ProbePhase.LOGIN_RECOVERING)
             transaction.advance(self.main.ProbePhase.COMPLETE)
@@ -2062,6 +2587,63 @@ class MainFlowTest(unittest.TestCase):
             ("disable_weak_network", self.main.GAME_PACKAGE_NAME),
             self.adb.calls,
         )
+
+    def test_victory_detection_uses_center_roi_and_restores_screen_coordinates(self):
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        local_match = self.main.MatchResult(
+            template_path=self.main.VICTORY_BANNER_TEMPLATE,
+            top_left=(10, 20),
+            bottom_right=(110, 80),
+            center=(60, 50),
+            score=0.95,
+        )
+
+        with (
+            patch.object(self.main, "find_template", return_value=None),
+            patch.object(
+                self.main,
+                "find_template_multi_scale",
+                return_value=local_match,
+            ) as multi_scale,
+        ):
+            match = self.main.find_victory_banner(screenshot)
+
+        roi = multi_scale.call_args.args[0]
+        left, top, right, bottom = self.main.VICTORY_SEARCH_REGION
+        offset_x = int(round(screenshot.shape[1] * left))
+        offset_y = int(round(screenshot.shape[0] * top))
+        self.assertEqual(
+            roi.shape[:2],
+            (
+                int(round(screenshot.shape[0] * bottom)) - offset_y,
+                int(round(screenshot.shape[1] * right)) - offset_x,
+            ),
+        )
+        self.assertEqual(match.top_left, (offset_x + 10, offset_y + 20))
+        self.assertEqual(match.bottom_right, (offset_x + 110, offset_y + 80))
+        self.assertEqual(match.center, (offset_x + 60, offset_y + 50))
+        self.assertEqual(match.score, local_match.score)
+
+    def test_victory_wait_runs_full_screen_fallback_after_roi_misses(self):
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        fallback_match = DummyMatch((640, 280))
+        searches = []
+        self.adb.read_screenshot = Mock(return_value=screenshot)
+
+        def find_banner(_screenshot, *, full_screen=False):
+            searches.append(full_screen)
+            return fallback_match if full_screen else None
+
+        with (
+            patch.object(self.main, "find_victory_banner", side_effect=find_banner),
+            patch.object(self.main, "monotonic", side_effect=[0.0, 0.1, 1.1]),
+            patch.object(self.main, "sleep"),
+        ):
+            match = self.main.wait_until_victory_banner(timeout=1.0)
+
+        self.assertIs(match, fallback_match)
+        self.assertEqual(searches, [False, True])
+        self.adb.read_screenshot.assert_called_once_with()
 
     def test_victory_handler_refuses_network_restore_while_probe_is_pending(self):
         transaction = self.main.ProbeTransaction(level=1, cell=(0, 0), index=0)
@@ -2395,6 +2977,102 @@ class MainFlowTest(unittest.TestCase):
             self.assertTrue(managed[2].exists())
             self.assertTrue(unrelated.exists())
 
+    def test_clear_probe_debug_images_save_only_before_and_best_frame(self):
+        persist = getattr(self.main, "_persist_probe_debug_images", None)
+        self.assertIsNotNone(persist)
+
+        class FakeCapture:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def save(self, path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(self.payload)
+                return path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_dir = self.main.Path(temp_dir)
+            frame_captures = [
+                (sample_dir / f"after_{index}.png", FakeCapture(bytes([index])))
+                for index in range(1, 5)
+            ]
+            frame_records = [
+                {"result": {"state": "miss", "score": score}}
+                for score in (0.10, 0.25, 0.15, 0.20)
+            ]
+
+            persist(
+                sample_dir,
+                FakeCapture(b"before"),
+                frame_captures,
+                frame_records,
+                preserve_all=False,
+            )
+
+            self.assertEqual((sample_dir / "before.png").read_bytes(), b"before")
+            self.assertEqual((sample_dir / "after_2.png").read_bytes(), b"\x02")
+            self.assertFalse((sample_dir / "after_1.png").exists())
+            self.assertFalse((sample_dir / "after_3.png").exists())
+            self.assertFalse((sample_dir / "after_4.png").exists())
+            self.assertEqual(
+                [record["saved"] for record in frame_records],
+                [False, True, False, False],
+            )
+
+    def test_uncertain_probe_debug_images_preserve_every_frame(self):
+        persist = getattr(self.main, "_persist_probe_debug_images", None)
+        preserve_all = getattr(self.main, "_should_preserve_all_probe_images", None)
+        self.assertIsNotNone(persist)
+        self.assertIsNotNone(preserve_all)
+
+        class FakeCapture:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def save(self, path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(self.payload)
+                return path
+
+        frame_records = [
+            {
+                "dynamic_hit_vetoed": index == 2,
+                "sidebar_completed_lengths": [],
+                "result": {
+                    "state": "hit" if index == 1 else "miss",
+                    "score": 0.9 if index == 1 else 0.2,
+                },
+            }
+            for index in range(1, 5)
+        ]
+        self.assertTrue(
+            preserve_all(
+                frame_records,
+                suspect_extra_checked=False,
+                victory_detected=False,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_dir = self.main.Path(temp_dir)
+            captures = [
+                (sample_dir / f"after_{index}.png", FakeCapture(bytes([index])))
+                for index in range(1, 5)
+            ]
+            persist(
+                sample_dir,
+                FakeCapture(b"before"),
+                captures,
+                frame_records,
+                preserve_all=True,
+            )
+
+            self.assertEqual(
+                sorted(path.name for path in sample_dir.glob("*.png")),
+                ["after_1.png", "after_2.png", "after_3.png", "after_4.png", "before.png"],
+            )
+            self.assertTrue(all(record["saved"] for record in frame_records))
+
     def test_loose_wreck_template_alone_does_not_promote_miss_to_hit(self):
         result = dummy_hit_result("miss")
 
@@ -2527,7 +3205,7 @@ class MainFlowTest(unittest.TestCase):
                 "apply_sidebar_completion_confirmation",
                 side_effect=confirm_sidebar,
             ) as sidebar_confirmation,
-            patch.object(self.main, "restart_process", return_value=False),
+            patch.object(self.main, "restart_process", return_value=False) as restart,
         ):
             result = self.main._probe_cell(
                 level=1,
@@ -2545,6 +3223,155 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(self.main._runtime_status.get("sidebar_completed_lengths"), [3])
         self.assertEqual(probe_metadata["sidebar_newly_completed_lengths"], (3,))
         self.assertEqual(probe_metadata["sidebar_completed_lengths"], (3,))
+        restart.assert_called_once_with(
+            victory_wait_timeout=self.main.VICTORY_WAIT_AFTER_HIT_SECONDS,
+        )
+
+    def test_consistent_incomplete_sidebar_frames_use_short_victory_wait(self):
+        select_timeout = getattr(
+            self.main,
+            "_victory_wait_timeout_for_sidebar_samples",
+            None,
+        )
+        self.assertIsNotNone(select_timeout)
+        progress = SidebarProgress(
+            active_lengths=(4,),
+            completed_lengths=(5, 3, 2, 2),
+        )
+
+        timeout = select_timeout(
+            [progress] * len(self.main.HIT_RESULT_FRAME_DELAYS),
+            (2, 2, 3, 4, 5),
+        )
+
+        self.assertEqual(
+            timeout,
+            self.main.VICTORY_WAIT_AFTER_CONFIRMED_INCOMPLETE_SECONDS,
+        )
+
+    def test_uncertain_sidebar_frames_keep_full_victory_wait(self):
+        select_timeout = getattr(
+            self.main,
+            "_victory_wait_timeout_for_sidebar_samples",
+            None,
+        )
+        self.assertIsNotNone(select_timeout)
+        incomplete = SidebarProgress(
+            active_lengths=(4,),
+            completed_lengths=(5, 3, 2, 2),
+        )
+        inconsistent = SidebarProgress(
+            active_lengths=(3, 4),
+            completed_lengths=(5, 2, 2),
+        )
+        invalid = SidebarProgress(
+            active_lengths=(4,),
+            completed_lengths=(5, 3, 2),
+            unknown_lengths=(2,),
+        )
+        required_frames = len(self.main.HIT_RESULT_FRAME_DELAYS)
+        cases = {
+            "too_few": [incomplete] * (required_frames - 1),
+            "missing": [incomplete, None, incomplete, incomplete],
+            "invalid": [incomplete, invalid, incomplete, incomplete],
+            "inconsistent": [incomplete, inconsistent, incomplete, incomplete],
+        }
+
+        for name, samples in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    select_timeout(samples, (2, 2, 3, 4, 5)),
+                    self.main.VICTORY_WAIT_AFTER_HIT_SECONDS,
+                )
+
+    def test_completed_sidebar_frames_keep_full_victory_wait(self):
+        select_timeout = getattr(
+            self.main,
+            "_victory_wait_timeout_for_sidebar_samples",
+            None,
+        )
+        self.assertIsNotNone(select_timeout)
+        progress = SidebarProgress(completed_lengths=(5, 4, 3, 2, 2))
+
+        timeout = select_timeout(
+            [progress] * len(self.main.HIT_RESULT_FRAME_DELAYS),
+            (2, 2, 3, 4, 5),
+        )
+
+        self.assertEqual(timeout, self.main.VICTORY_WAIT_AFTER_HIT_SECONDS)
+
+    def test_adaptive_frames_require_consistent_incomplete_sidebar_progress(self):
+        can_stop = getattr(self.main, "_can_stop_probe_frames_early", None)
+        self.assertIsNotNone(can_stop)
+        records = [
+            {
+                "dynamic_hit_vetoed": False,
+                "result": {
+                    "state": "hit",
+                    "score": 0.99,
+                    "evidence_vetoed": False,
+                },
+            }
+            for _index in range(3)
+        ]
+        incomplete = SidebarProgress(active_lengths=(3,), completed_lengths=(2,))
+        complete = SidebarProgress(completed_lengths=(3, 2))
+        inconsistent = SidebarProgress(active_lengths=(2, 3))
+
+        self.assertTrue(can_stop(records, [incomplete] * 3, (2, 3)))
+        self.assertFalse(can_stop(records, [complete] * 3, (2, 3)))
+        self.assertFalse(
+            can_stop(records, [incomplete, inconsistent, incomplete], (2, 3))
+        )
+        self.assertFalse(can_stop(records, [incomplete, None, incomplete], (2, 3)))
+
+    def test_probe_hit_uses_short_wait_after_consistent_incomplete_sidebar_frames(self):
+        hit_map = [[0, 0, 0] for _ in range(3)]
+        progress = SidebarProgress(
+            active_lengths=(3,),
+            completed_lengths=(2,),
+        )
+
+        def confirm_sidebar(_before, _after, _fleet, result):
+            result.state = "hit"
+            result.score = 0.99
+            result.confidence = 0.99
+            return True, progress, (2,)
+
+        with (
+            patch.object(self.main, "wait_until_occur", return_value=DummyMatch((1, 1))),
+            patch.object(self.main, "click_template", return_value=True),
+            patch.object(self.main, "_wait_until_activity_detail_closed", return_value=True),
+            patch.object(self.main, "enter_activity"),
+            patch.object(self.main, "get_configured_submarines", return_value=[2, 3]),
+            patch.object(
+                self.main,
+                "classify_diamond_hit",
+                side_effect=lambda *_args, **_kwargs: dummy_hit_result("miss"),
+            ) as classify,
+            patch.object(self.main, "apply_wreck_template_confirmation", return_value=False),
+            patch.object(
+                self.main,
+                "apply_sidebar_completion_confirmation",
+                side_effect=confirm_sidebar,
+            ),
+            patch.object(self.main, "restart_process", return_value=False) as restart,
+        ):
+            result = self.main._probe_cell(
+                level=1,
+                hit_map=hit_map,
+                cell=(0, 1),
+                point=(400, 300),
+                index=1,
+            )
+
+        self.assertEqual(result, self.main.ProbeResult.HIT)
+        self.assertEqual(classify.call_count, 3)
+        restart.assert_called_once_with(
+            victory_wait_timeout=(
+                self.main.VICTORY_WAIT_AFTER_CONFIRMED_INCOMPLETE_SECONDS
+            ),
+        )
 
     def test_strategy_status_uses_exact_initial_visual_hit_count(self):
         signature = inspect.signature(self.main._scan_level_by_strategy)
