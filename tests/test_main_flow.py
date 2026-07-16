@@ -2791,6 +2791,38 @@ class MainFlowTest(unittest.TestCase):
         self.assertIn(("click", 30, 40), self.adb.calls)
         self.assertIn(("click", 1205, 644), self.adb.calls)
 
+    def test_re_enter_after_client_reload_prepares_activity_list_without_reblocking_network(self):
+        self.assertIn(
+            "prepare_activity_list",
+            inspect.signature(self.main.enter_activity).parameters,
+        )
+        waits = iter(
+            [
+                DummyMatch((30, 40)),
+                DummyMatch((50, 60)),
+            ]
+        )
+
+        with patch.object(
+            self.main,
+            "wait_until_occur",
+            side_effect=lambda *args, **kwargs: next(waits),
+        ):
+            self.main.enter_activity(
+                re_enter=True,
+                max_retries=1,
+                prepare_activity_list=True,
+            )
+
+        package_name = self.main.GAME_PACKAGE_NAME
+        self.assertNotIn(("enable_weak_network", package_name), self.adb.calls)
+        self.assertEqual(
+            self.adb.calls.count(("swipe", 1000, 660, 1000, 180)),
+            2,
+        )
+        self.assertNotIn(("close_app", package_name), self.adb.calls)
+        self.assertNotIn(("open_app", package_name), self.adb.calls)
+
     def test_re_enter_failure_does_not_use_normal_restart_recovery(self):
         with patch.object(self.main, "wait_until_occur", return_value=None):
             with self.assertRaisesRegex(
@@ -3972,6 +4004,16 @@ class MainFlowTest(unittest.TestCase):
 
         with (
             patch.object(self.main, "wait_until_occur", return_value=DummyMatch((1, 1))),
+            patch.object(
+                self.main,
+                "wait_until_connection_interrupted_dialog",
+                return_value=DummyMatch((640, 360)),
+            ),
+            patch.object(
+                self.main,
+                "wait_until_retry_button",
+                return_value=DummyMatch((374, 442)),
+            ),
             patch.object(self.main, "click_template", return_value=True),
             patch.object(self.main, "_wait_until_activity_detail_closed", return_value=True),
             patch.object(self.main, "enter_activity"),
@@ -4106,46 +4148,98 @@ class MainFlowTest(unittest.TestCase):
         self.assertLess(click_index, clear_index)
         self.assertEqual(events[marker_index][1]["mode"], "blue_probe")
 
-    def test_miss_discard_force_stops_before_network_restore(self):
+    def test_miss_discard_uses_connection_retry_without_closing_app(self):
+        transaction = self.main.ProbeTransaction(level=1, cell=(0, 1), index=1)
+        transaction.advance(self.main.ProbePhase.REQUEST_PENDING)
+        transaction.advance(self.main.ProbePhase.RESULT_VISIBLE)
+        transaction.advance(self.main.ProbePhase.RESULT_RECORDED)
+        retry = DummyMatch((123, 456))
+        package_name = self.main.GAME_PACKAGE_NAME
+
+        def connection_dialog_after_reject(*, timeout):
+            self.assertEqual(timeout, self.main.MISS_CONNECTION_DIALOG_WAIT_SECONDS)
+            self.assertIn(("enable_reject_network", package_name), self.adb.calls)
+            self.assertNotIn(("disable_weak_network", package_name), self.adb.calls)
+            self.assertNotIn(("disable_reject_network", package_name), self.adb.calls)
+            return DummyMatch((100, 100))
+
+        def retry_button_while_isolated(*, timeout):
+            self.assertEqual(timeout, self.main.MISS_RETRY_BUTTON_WAIT_SECONDS)
+            self.assertNotIn(("disable_weak_network", package_name), self.adb.calls)
+            self.assertNotIn(("disable_reject_network", package_name), self.adb.calls)
+            return retry
+
+        with (
+            patch.object(
+                self.main,
+                "wait_until_connection_interrupted_dialog",
+                side_effect=connection_dialog_after_reject,
+            ) as dialog,
+            patch.object(
+                self.main,
+                "wait_until_retry_button",
+                side_effect=retry_button_while_isolated,
+            ) as retry_wait,
+            patch.object(self.main, "enter_activity", return_value=False) as enter,
+        ):
+            completed = self.main._discard_pending_request_and_prepare_next_probe(transaction)
+
+        self.assertFalse(completed)
+        self.assertEqual(transaction.phase, self.main.ProbePhase.COMPLETE)
+        self.assertNotIn(("close_app", package_name), self.adb.calls)
+        self.assertNotIn(("open_app", package_name), self.adb.calls)
+        self.assertIn(("click", *retry.center), self.adb.calls)
+        self.assertLess(
+            self.adb.calls.index(("enable_reject_network", package_name)),
+            self.adb.calls.index(("disable_weak_network", package_name)),
+        )
+        self.assertNotIn(("delay", 2.0), self.adb.calls)
+        self.assertLess(
+            self.adb.calls.index(("disable_weak_network", package_name)),
+            self.adb.calls.index(("disable_reject_network", package_name)),
+        )
+        self.assertLess(
+            self.adb.calls.index(("disable_reject_network", package_name)),
+            self.adb.calls.index(("click", *retry.center)),
+        )
+        self.assertNotIn(("delay", 0.8), self.adb.calls)
+        dialog.assert_called_once_with(
+            timeout=self.main.MISS_CONNECTION_DIALOG_WAIT_SECONDS,
+        )
+        retry_wait.assert_called_once_with(
+            timeout=self.main.MISS_RETRY_BUTTON_WAIT_SECONDS,
+        )
+        enter.assert_called_once_with(
+            re_enter=True,
+            max_retries=1,
+            prepare_activity_list=True,
+            activity_button_timeout=self.main.POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
+        )
+
+    def test_miss_discard_keeps_network_isolated_when_dialog_is_missing(self):
         transaction = self.main.ProbeTransaction(level=1, cell=(0, 1), index=1)
         transaction.advance(self.main.ProbePhase.REQUEST_PENDING)
         transaction.advance(self.main.ProbePhase.RESULT_VISIBLE)
         transaction.advance(self.main.ProbePhase.RESULT_RECORDED)
 
         with (
-            patch.object(self.main, "handle_connection_interrupted_prompt") as dialog,
-            patch.object(self.main, "wait_until_retry_prompt") as retry,
-            patch.object(self.main, "restart_process") as restart,
+            patch.object(
+                self.main,
+                "wait_until_connection_interrupted_dialog",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(self.main.ProbeProtocolError, "连接中断"),
         ):
             self.main._discard_pending_request_and_prepare_next_probe(transaction)
 
         package_name = self.main.GAME_PACKAGE_NAME
-        self.assertEqual(transaction.phase, self.main.ProbePhase.COMPLETE)
-        self.assertEqual(
-            self.adb.calls[:5],
-            [
-                ("enable_reject_network", package_name),
-                ("delay", 0.2),
-                ("close_app", package_name),
-                (
-                    "wait_until_app_stopped",
-                    package_name,
-                    self.main.APP_STOP_TIMEOUT_SECONDS,
-                    self.main.APP_STOP_POLL_SECONDS,
-                ),
-                ("delay", self.main.POST_FORCE_STOP_GUARD_SECONDS),
-            ],
-        )
-        self.assertNotIn(("click", 123, 456), self.adb.calls)
-        dialog.assert_not_called()
-        retry.assert_not_called()
-        restart.assert_called_once_with(reopen_game=True, app_already_closed=True)
-        self.assertLess(
-            self.adb.calls.index(("wait_until_app_stopped", package_name, self.main.APP_STOP_TIMEOUT_SECONDS, self.main.APP_STOP_POLL_SECONDS)),
-            self.adb.calls.index(("delay", self.main.POST_FORCE_STOP_GUARD_SECONDS)),
-        )
+        self.assertEqual(transaction.phase, self.main.ProbePhase.REQUEST_DISCARDED)
+        self.assertIn(("enable_reject_network", package_name), self.adb.calls)
+        self.assertNotIn(("disable_weak_network", package_name), self.adb.calls)
+        self.assertNotIn(("disable_reject_network", package_name), self.adb.calls)
+        self.assertNotIn(("close_app", package_name), self.adb.calls)
 
-    def test_miss_transaction_closes_app_instead_of_clicking_retry(self):
+    def test_miss_transaction_clicks_retry_instead_of_closing_app(self):
         waits = iter(
             [
                 DummyMatch((1, 1)),  # 点击前已在详情页
@@ -4161,12 +4255,20 @@ class MainFlowTest(unittest.TestCase):
                 "wait_until_occur",
                 side_effect=lambda *args, **kwargs: next(waits),
             ),
-            patch.object(self.main, "handle_connection_interrupted_prompt") as dialog,
-            patch.object(self.main, "wait_until_retry_prompt") as retry,
+            patch.object(
+                self.main,
+                "wait_until_connection_interrupted_dialog",
+                return_value=DummyMatch((100, 100)),
+            ) as dialog,
+            patch.object(
+                self.main,
+                "wait_until_retry_button",
+                return_value=DummyMatch((123, 456)),
+            ) as retry,
             patch.object(self.main, "click_template", return_value=True),
             patch.object(self.main, "_wait_until_activity_detail_closed", return_value=True),
             patch.object(self.main, "classify_diamond_hit", return_value=dummy_hit_result("miss")),
-            patch.object(self.main, "restart_process") as restart,
+            patch.object(self.main, "enter_activity", return_value=False),
         ):
             result = self.main._probe_cell(
                 level=1,
@@ -4179,11 +4281,11 @@ class MainFlowTest(unittest.TestCase):
         package_name = self.main.GAME_PACKAGE_NAME
         self.assertEqual(result, self.main.ProbeResult.MISS)
         self.assertIsNone(self.main._active_probe)
-        self.assertIn(("enable_reject_network", package_name), self.adb.calls)
-        self.assertIn(("close_app", package_name), self.adb.calls)
-        dialog.assert_not_called()
-        retry.assert_not_called()
-        restart.assert_called_once_with(reopen_game=True, app_already_closed=True)
+        self.assertNotIn(("close_app", package_name), self.adb.calls)
+        self.assertNotIn(("open_app", package_name), self.adb.calls)
+        self.assertIn(("click", 123, 456), self.adb.calls)
+        dialog.assert_called_once()
+        retry.assert_called_once()
 
     def test_preflight_failure_retries_the_same_cell(self):
         hit_map = [[0, 0], [0, 0]]

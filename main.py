@@ -91,14 +91,17 @@ QUIT_ACTIVITY_TEMPLATE = TEMPLATE_DIR / "quit_activity.png"
 ACTIVITY_QUIT_ROI_REFERENCE_SIZE = (100, 100)
 SCREEN_REFERENCE_SIZE = (1280, 720)
 RETRY_TEMPLATE = TEMPLATE_DIR / "retry.png"
-CONNECTION_INTERRUPTED_TEMPLATE = TEMPLATE_DIR / "connection_interrupted.png"
+CONNECTION_INTERRUPTED_PANEL_TEMPLATE = TEMPLATE_DIR / "connection_interrupted_panel.png"
 CONNECTION_RETRY_TEMPLATE = TEMPLATE_DIR / "connection_retry.png"
 VICTORY_BANNER_TEMPLATE = TEMPLATE_DIR / "victory_banner.png"
 RETRY_TEMPLATE_SCALES = (0.85, 0.95, 1.0, 1.05, 1.15)
 RETRY_TEMPLATE_LOOSE_THRESHOLD = 0.72
-CONNECTION_TEMPLATE_SCALES = (0.9, 1.0, 1.1)
-CONNECTION_DIALOG_THRESHOLD = 0.78
-CONNECTION_RETRY_THRESHOLD = 0.74
+CONNECTION_PROMPT_SCALES = (1.0,)
+CONNECTION_DIALOG_THRESHOLD = 0.95
+CONNECTION_RETRY_THRESHOLD = 0.95
+CONNECTION_DIALOG_SEARCH_REGION = (0.18, 0.20, 0.82, 0.80)
+CONNECTION_RETRY_SEARCH_REGION = (0.18, 0.45, 0.50, 0.78)
+CONNECTION_RETRY_RELATIVE_CENTER = (0.10, 0.81)
 VICTORY_TEMPLATE_SCALES = (0.75, 0.85, 0.95, 1.0, 1.05, 1.15, 1.3, 1.5, 1.65, 1.8)
 VICTORY_BANNER_THRESHOLD = 0.80
 VICTORY_SEARCH_REGION = (0.18, 0.06, 0.82, 0.70)
@@ -121,7 +124,8 @@ NEAR_HIT_MIN_S_DROP = 4.0
 NEAR_HIT_MIN_FRAMES = 3
 FAST_POLL_INTERVAL_SECONDS = 0.25
 PROBE_DROP_SETTLE_SECONDS = 0.2
-MISS_REJECT_SETTLE_SECONDS = 0.2
+MISS_CONNECTION_DIALOG_WAIT_SECONDS = 8.0
+MISS_RETRY_BUTTON_WAIT_SECONDS = 4.0
 APP_STOP_TIMEOUT_SECONDS = 5.0
 APP_STOP_POLL_SECONDS = 0.1
 POST_FORCE_STOP_GUARD_SECONDS = 0.5
@@ -1464,6 +1468,7 @@ def enter_activity(
     max_retries: int = 5,
     *,
     activity_button_timeout: float | None = None,
+    prepare_activity_list: bool | None = None,
 ) -> bool:
     """进入活动详情页。
 
@@ -1471,6 +1476,7 @@ def enter_activity(
     ``re_enter=True`` 用于点击后的第二次进入，此时 DROP 下可能仍有暂存请求，
     任何失败都必须立即中止，不能复用会关闭弱网的普通恢复流程。
     刚登录后的活动入口加载较慢，可通过 ``activity_button_timeout`` 延长轮询。
+    客户端完整重载后可用 ``prepare_activity_list=True`` 恢复首次进入的列表位置。
     """
     if max_retries <= 0:
         raise ValueError(f"max_retries 必须大于 0: {max_retries}")
@@ -1481,6 +1487,11 @@ def enter_activity(
     )
     if button_timeout <= 0:
         raise ValueError(f"activity_button_timeout 必须大于 0: {button_timeout}")
+    should_prepare_activity_list = (
+        not re_enter
+        if prepare_activity_list is None
+        else bool(prepare_activity_list)
+    )
 
     last_failure = "进入活动失败"
     level_completed = False
@@ -1525,6 +1536,7 @@ def enter_activity(
         adb.click(*res.center)  # 点击活动按钮进入活动界面
         if not re_enter:
             enable_weak_network(0.2)
+        if should_prepare_activity_list:
             adb.delay(0.4).swipe(*ACTIVITY_LIST_SWIPE)  # 首次进入需要展示全部项
             adb.delay(0.2).swipe(*ACTIVITY_LIST_SWIPE)
 
@@ -3950,31 +3962,51 @@ def _commit_hit_request_and_prepare_next_probe(
 def _discard_pending_request_and_prepare_next_probe(
     transaction: ProbeTransaction,
 ) -> bool:
-    """Force-stop the game while offline so a pending request cannot be retried."""
+    """Reject the offline connection, then reconnect through the retry prompt."""
+    logger.info(
+        "miss detected; enabling REJECT to trigger the connection-interrupted dialog"
+    )
     adb.enable_reject_network(GAME_PACKAGE_NAME)
-    write_runtime_status(network="断网中")
-    adb.delay(MISS_REJECT_SETTLE_SECONDS)
-    logger.info("discarding pending probe request; force-stopping game before restoring network")
-    adb.close_app(GAME_PACKAGE_NAME)
-    if not adb.wait_until_app_stopped(
-        GAME_PACKAGE_NAME,
-        timeout=APP_STOP_TIMEOUT_SECONDS,
-        poll_interval=APP_STOP_POLL_SECONDS,
-    ):
-        raise ProbeProtocolError(
-            "游戏进程未完全退出；为避免未命中请求补发，保留断网并中止探测"
-        )
-    adb.delay(POST_FORCE_STOP_GUARD_SECONDS)
-
+    write_runtime_status(network="DROP+REJECT 断网中")
     transaction.advance(ProbePhase.REQUEST_DISCARDED)
     transaction.red_request_discarded = True
     update_pending_probe(
         phase=ProbePhase.REQUEST_DISCARDED.name,
         request_discarded=True,
     )
-    transaction.advance(ProbePhase.LOGIN_RECOVERING)
 
-    level_complete = restart_process(reopen_game=True, app_already_closed=True) is True
+    dialog = wait_until_connection_interrupted_dialog(
+        timeout=MISS_CONNECTION_DIALOG_WAIT_SECONDS,
+    )
+    if dialog is None:
+        raise ProbeProtocolError(
+            "未检测到连接中断弹窗；保留 DROP/REJECT 并停止自动探测"
+        )
+
+    retry = wait_until_retry_button(timeout=MISS_RETRY_BUTTON_WAIT_SECONDS)
+    if retry is None:
+        raise ProbeProtocolError(
+            "连接中断弹窗已出现，但未检测到重试按钮；保留 DROP/REJECT 并停止自动探测"
+        )
+
+    transaction.advance(ProbePhase.LOGIN_RECOVERING)
+    logger.info(
+        "retry button confirmed; restoring DROP and REJECT before clicking"
+    )
+    disable_weak_network()
+    adb.disable_reject_network(GAME_PACKAGE_NAME)
+    logger.info(
+        "clicking retry button with network restored: center=%s score=%.3f",
+        retry.center,
+        float(getattr(retry, "score", 0.0)),
+    )
+    adb.click(*retry.center)
+    level_complete = enter_activity(
+        re_enter=True,
+        max_retries=1,
+        prepare_activity_list=True,
+        activity_button_timeout=POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
+    ) is True
     transaction.advance(ProbePhase.COMPLETE)
     return level_complete
 
@@ -4117,22 +4149,100 @@ def wait_until_victory_banner(timeout: float = 4.0) -> MatchResult | None:
     return None
 
 
-def wait_until_connection_interrupted_dialog(timeout: float = 20.0) -> MatchResult | None:
-    """Wait for the larger connection-interrupted dialog."""
-    exact_wait = min(3.0, max(0.0, float(timeout)))
-    dialog = wait_until_occur(CONNECTION_INTERRUPTED_TEMPLATE, timeout=exact_wait)
-    if dialog is not None:
-        return dialog
+def _crop_normalized_region(
+    screenshot: np.ndarray,
+    region: tuple[float, float, float, float],
+) -> tuple[np.ndarray, int, int] | None:
+    if not isinstance(screenshot, np.ndarray) or screenshot.ndim < 2:
+        return None
+    height, width = screenshot.shape[:2]
+    min_x, min_y, max_x, max_y = region
+    left = max(0, min(width, int(round(width * min_x))))
+    top = max(0, min(height, int(round(height * min_y))))
+    right = max(left, min(width, int(round(width * max_x))))
+    bottom = max(top, min(height, int(round(height * max_y))))
+    if right <= left or bottom <= top:
+        return None
+    return screenshot[top:bottom, left:right], left, top
 
-    deadline = monotonic() + max(0.0, float(timeout) - exact_wait)
+
+def _offset_match(match: MatchResult | None, left: int, top: int) -> MatchResult | None:
+    if match is None:
+        return None
+    return MatchResult(
+        template_path=match.template_path,
+        top_left=(match.top_left[0] + left, match.top_left[1] + top),
+        bottom_right=(match.bottom_right[0] + left, match.bottom_right[1] + top),
+        center=(match.center[0] + left, match.center[1] + top),
+        score=match.score,
+    )
+
+
+def find_connection_interrupted_dialog(screenshot: np.ndarray) -> MatchResult | None:
+    """Match the complete connection prompt only inside the central screen area."""
+    cropped = _crop_normalized_region(screenshot, CONNECTION_DIALOG_SEARCH_REGION)
+    if cropped is None:
+        return None
+    roi, left, top = cropped
+    dialog = find_template_multi_scale(
+        roi,
+        CONNECTION_INTERRUPTED_PANEL_TEMPLATE,
+        scales=CONNECTION_PROMPT_SCALES,
+        threshold=CONNECTION_DIALOG_THRESHOLD,
+    )
+    return _offset_match(dialog, left, top)
+
+
+def find_connection_retry_button(
+    screenshot: np.ndarray,
+    *,
+    require_dialog: bool = True,
+) -> MatchResult | None:
+    """Find or derive the retry control only after confirming the complete dialog."""
+    if require_dialog:
+        dialog = find_connection_interrupted_dialog(screenshot)
+        if dialog is None:
+            return None
+        width = dialog.bottom_right[0] - dialog.top_left[0]
+        height = dialog.bottom_right[1] - dialog.top_left[1]
+        center = (
+            dialog.top_left[0] + round(width * CONNECTION_RETRY_RELATIVE_CENTER[0]),
+            dialog.top_left[1] + round(height * CONNECTION_RETRY_RELATIVE_CENTER[1]),
+        )
+        return MatchResult(
+            template_path=CONNECTION_RETRY_TEMPLATE,
+            top_left=center,
+            bottom_right=center,
+            center=center,
+            score=dialog.score,
+        )
+
+    cropped = _crop_normalized_region(screenshot, CONNECTION_RETRY_SEARCH_REGION)
+    if cropped is None:
+        return None
+    roi, left, top = cropped
+    retry = find_template_multi_scale(
+        roi,
+        CONNECTION_RETRY_TEMPLATE,
+        scales=CONNECTION_PROMPT_SCALES,
+        threshold=CONNECTION_RETRY_THRESHOLD,
+    )
+    if retry is None:
+        retry = find_template_multi_scale(
+            roi,
+            RETRY_TEMPLATE,
+            scales=RETRY_TEMPLATE_SCALES,
+            threshold=RETRY_TEMPLATE_LOOSE_THRESHOLD,
+        )
+    return _offset_match(retry, left, top)
+
+
+def wait_until_connection_interrupted_dialog(timeout: float = 20.0) -> MatchResult | None:
+    """Wait for a connection-interrupted dialog in the center of the screen."""
+    deadline = monotonic() + max(0.0, float(timeout))
     while monotonic() < deadline:
         screenshot = adb.read_screenshot()
-        dialog = find_template_multi_scale(
-            screenshot,
-            CONNECTION_INTERRUPTED_TEMPLATE,
-            scales=CONNECTION_TEMPLATE_SCALES,
-            threshold=CONNECTION_DIALOG_THRESHOLD,
-        )
+        dialog = find_connection_interrupted_dialog(screenshot)
         if dialog is not None:
             return dialog
         sleep(FAST_POLL_INTERVAL_SECONDS)
@@ -4140,33 +4250,11 @@ def wait_until_connection_interrupted_dialog(timeout: float = 20.0) -> MatchResu
 
 
 def wait_until_retry_button(timeout: float = 20.0) -> MatchResult | None:
-    """Wait for the current connection dialog retry button or the legacy retry button."""
-    exact_wait = min(3.0, max(0.0, float(timeout)))
-    retry = wait_until_occur(CONNECTION_RETRY_TEMPLATE, timeout=exact_wait)
-    if retry is not None:
-        return retry
-
-    legacy_wait = min(5.0, max(0.0, float(timeout) - exact_wait))
-    retry = wait_until_occur(RETRY_TEMPLATE, timeout=legacy_wait)
-    if retry is not None:
-        return retry
-
-    deadline = monotonic() + max(0.0, float(timeout) - exact_wait - legacy_wait)
+    """Wait until one frame contains both the dialog and its retry button."""
+    deadline = monotonic() + max(0.0, float(timeout))
     while monotonic() < deadline:
         screenshot = adb.read_screenshot()
-        retry = find_template_multi_scale(
-            screenshot,
-            CONNECTION_RETRY_TEMPLATE,
-            scales=RETRY_TEMPLATE_SCALES,
-            threshold=CONNECTION_RETRY_THRESHOLD,
-        )
-        if retry is None:
-            retry = find_template_multi_scale(
-                screenshot,
-                RETRY_TEMPLATE,
-                scales=RETRY_TEMPLATE_SCALES,
-                threshold=RETRY_TEMPLATE_LOOSE_THRESHOLD,
-            )
+        retry = find_connection_retry_button(screenshot, require_dialog=True)
         if retry is not None:
             return retry
         sleep(FAST_POLL_INTERVAL_SECONDS)
