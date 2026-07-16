@@ -243,6 +243,29 @@ class SidebarProgressTest(unittest.TestCase):
         )
         self.assertEqual(resolution.discarded_cells, frozenset({(0, 1)}))
 
+    def test_completed_ship_resolution_prefers_new_exact_run_over_old_or_embedded_run(self):
+        candidates = {
+            (0, 4), (1, 4),
+            (2, 6),
+            (5, 4), (5, 5), (5, 6), (5, 7),
+            (7, 2),
+            (7, 6), (7, 7),
+        }
+        newly_visible = {(5, 7), (7, 2), (7, 6)}
+
+        resolution = sidebar_progress.resolve_completed_ship_cells(
+            candidates,
+            completed_lengths=(2,),
+            grid_size=8,
+            preferred_cells=newly_visible,
+        )
+
+        self.assertEqual(
+            resolution.cells,
+            frozenset({(7, 6), (7, 7)}),
+        )
+        self.assertEqual(resolution.unresolved_lengths, ())
+
 
 if __name__ == "__main__":
     unittest.main()

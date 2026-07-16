@@ -231,6 +231,7 @@ def resolve_completed_ship_cells(
     completed_lengths: Sequence[int],
     *,
     grid_size: int,
+    preferred_cells: set[tuple[int, int]] | frozenset[tuple[int, int]] = frozenset(),
 ) -> CompletedShipResolution:
     """Keep only exact straight placements supported by completed-ship pixels."""
     candidates = {
@@ -239,6 +240,30 @@ def resolve_completed_ship_cells(
         if 0 <= int(row) < grid_size and 0 <= int(col) < grid_size
     }
     lengths = tuple(sorted((int(length) for length in completed_lengths), reverse=True))
+    preferred = {
+        (int(row), int(col))
+        for row, col in preferred_cells
+        if 0 <= int(row) < grid_size and 0 <= int(col) < grid_size
+    }
+
+    def placement_extension_count(
+        placement: tuple[tuple[int, int], ...],
+    ) -> int:
+        if len(placement) < 2:
+            return 0
+        first_row, first_col = placement[0]
+        last_row, last_col = placement[-1]
+        if first_row == last_row:
+            neighbors = (
+                (first_row, first_col - 1),
+                (last_row, last_col + 1),
+            )
+        else:
+            neighbors = (
+                (first_row - 1, first_col),
+                (last_row + 1, last_col),
+            )
+        return sum(neighbor in candidates for neighbor in neighbors)
 
     def supported_placements(length: int) -> tuple[tuple[tuple[int, int], ...], ...]:
         if length <= 0 or length > grid_size:
@@ -279,11 +304,13 @@ def resolve_completed_ship_cells(
     ) -> tuple[
         int,
         int,
+        int,
+        int,
         tuple[tuple[tuple[int, int], ...], ...],
         tuple[int, ...],
     ]:
         if index >= len(lengths):
-            return 0, 0, (), ()
+            return 0, 0, 0, 0, (), ()
 
         length = lengths[index]
         skipped = solve(index + 1, used)
@@ -291,7 +318,9 @@ def resolve_completed_ship_cells(
             skipped[0],
             skipped[1],
             skipped[2],
-            (length,) + skipped[3],
+            skipped[3],
+            skipped[4],
+            (length,) + skipped[5],
         )
 
         for placement in placements_by_length.get(length, ()):
@@ -302,19 +331,28 @@ def resolve_completed_ship_cells(
             candidate = (
                 length + remainder[0],
                 1 + remainder[1],
-                (placement,) + remainder[2],
-                remainder[3],
+                len(set(placement) & preferred) + remainder[2],
+                remainder[3] - placement_extension_count(placement),
+                (placement,) + remainder[4],
+                remainder[5],
             )
-            candidate_score = candidate[:2]
-            best_score = best[:2]
+            candidate_score = candidate[:4]
+            best_score = best[:4]
             if candidate_score > best_score or (
                 candidate_score == best_score
-                and (candidate[2], candidate[3]) < (best[2], best[3])
+                and (candidate[4], candidate[5]) < (best[4], best[5])
             ):
                 best = candidate
         return best
 
-    _resolved_cells, _resolved_count, placements, unresolved = solve(
+    (
+        _resolved_cells,
+        _resolved_count,
+        _preferred_count,
+        _negative_extensions,
+        placements,
+        unresolved,
+    ) = solve(
         0,
         frozenset(),
     )

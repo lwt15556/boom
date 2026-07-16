@@ -70,6 +70,7 @@ from utils.sidebar_progress import (
 )
 from utils.submarine_strategy import Cell, SubmarineStrategy, get_configured_submarines
 from utils.wreck_detection import (
+    detect_completed_submarine_candidate_cells,
     VISIBLE_WRECK_TEMPLATES,
     detect_visible_wreck_cells,
     red_hit_marker_visible,
@@ -1794,7 +1795,22 @@ def handle_game_level(
             template_paths=VISIBLE_WRECK_TEMPLATES,
         )
         partial_cells = set(partial_wreck_cells or set())
-        completed_candidates = set(visible_hits) - partial_cells
+        completed_anchor_candidates = detect_completed_submarine_candidate_cells(
+            grid_img,
+            click_points,
+            grid_size,
+        )
+        if completed_anchor_candidates:
+            logger.info(
+                "level %s completed ship anchor review found %s candidate cells",
+                level,
+                len(completed_anchor_candidates),
+            )
+        completed_candidates = (
+            completed_anchor_candidates
+            if completed_anchor_candidates
+            else set(visible_hits) - partial_cells
+        )
         if sidebar_progress is not None:
             completed_resolution = resolve_completed_ship_cells(
                 completed_candidates,
@@ -4497,4 +4513,3 @@ def run_main_entrypoint() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(run_main_entrypoint())
-

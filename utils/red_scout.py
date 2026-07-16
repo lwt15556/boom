@@ -624,6 +624,7 @@ class RedScoutAnalyzer:
             before_visible | raw_stable_result_hits,
             completed_lengths,
             grid_size=grid_size,
+            preferred_cells=raw_stable_result_hits - before_visible,
         )
         details["resolved_ship_placements"] = resolution.placements
         details["unresolved_ship_lengths"] = resolution.unresolved_lengths
@@ -924,17 +925,18 @@ class RedScoutPlanner:
         excluded_centers: Sequence[Cell] | set[Cell] | frozenset[Cell] = (),
     ) -> Cell | None:
         excluded = self._snapshot_cells(excluded_centers)
-        if excluded is None:
+        covered = self._snapshot_cells(covered_cells)
+        known = self._snapshot_cells(known_cells)
+        if excluded is None or covered is None or known is None:
             return None
+        blocked_centers = excluded | covered | known
         if footprint is None:
-            return self._choose_untried_center(excluded)
+            return self._choose_untried_center(blocked_centers)
         if not isinstance(footprint, RedFootprint):
             return None
 
         offsets = self._snapshot_cells(footprint.offsets)
-        covered = self._snapshot_cells(covered_cells)
-        known = self._snapshot_cells(known_cells)
-        if offsets is None or covered is None or known is None or not offsets:
+        if offsets is None or not offsets:
             return None
 
         if cell_scores is None:
@@ -948,7 +950,7 @@ class RedScoutPlanner:
         best_score = float("-inf")
         for row in range(self.grid_size):
             for col in range(self.grid_size):
-                if (row, col) in excluded:
+                if (row, col) in blocked_centers:
                     continue
                 projected = {
                     (row + row_offset, col + col_offset)
