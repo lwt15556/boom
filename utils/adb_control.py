@@ -231,7 +231,14 @@ class AdbController:
     def _capture_screenshot_via_pull(self) -> ScreenshotCapture:
         path = SCREENSHOT_DIR / DEFAULT_SCREENSHOT_NAME
         screen = self._read_screenshot_via_pull(path)
-        return ScreenshotCapture(image=screen, png_bytes=path.read_bytes())
+        if path.is_file():
+            png_bytes = path.read_bytes()
+        else:
+            encoded, buffer = cv2.imencode(".png", screen)
+            if not encoded:
+                raise RuntimeError("failed to encode pulled screenshot")
+            png_bytes = buffer.tobytes()
+        return ScreenshotCapture(image=screen, png_bytes=png_bytes)
 
     def _read_screenshot_via_pull(self, output_path: str | Path | None = None):
         """兼容不支持 exec-out 的设备，使用远端文件截图。"""

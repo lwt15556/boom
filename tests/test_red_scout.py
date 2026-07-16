@@ -1136,6 +1136,32 @@ class RedScoutPlannerTest(unittest.TestCase):
         self.assertNotEqual(second, first)
         self.assertNotEqual(third, first)
 
+    def test_first_scout_center_skips_already_explored_cells(self):
+        planner = self._planner(5)
+        explored = {(2, 2), (0, 0)}
+
+        result = planner.choose_center(
+            footprint=None,
+            known_cells={(2, 2)},
+            covered_cells={(0, 0)},
+        )
+
+        self.assertNotIn(result, explored)
+
+    def test_learned_footprint_never_uses_known_cell_as_center(self):
+        planner = self._planner(5)
+        footprint = self._footprint({(0, 1)})
+
+        result = planner.choose_center(
+            footprint=footprint,
+            known_cells={(0, 0)},
+            covered_cells=set(),
+            cell_scores={(0, 1): 1000.0},
+        )
+
+        self.assertNotEqual(result, (0, 0))
+        self.assertNotIn(result, {(0, 0)})
+
     def test_planner_breaks_equal_scores_in_row_major_order(self):
         planner = self._planner(5)
         footprint = self._footprint({(0, 0)})
