@@ -75,6 +75,53 @@ class ImageMatchTest(unittest.TestCase):
         self.assertLess(abs(match.center[0] - (x + resized.shape[1] // 2)), 3)
         self.assertLess(abs(match.center[1] - (y + resized.shape[0] // 2)), 3)
 
+    def test_connection_retry_template_matches_real_dialog_button(self):
+        screenshot = cv2.imread(
+            "tests/fixtures/connection_interrupted_current.png",
+            cv2.IMREAD_COLOR,
+        )
+        self.assertIsNotNone(screenshot)
+
+        match = find_template_multi_scale(
+            screenshot,
+            Path("template/connection_retry.png"),
+            scales=(0.85, 0.95, 1.0, 1.05, 1.15),
+            threshold=0.74,
+        )
+
+        self.assertIsNotNone(match)
+        self.assertLess(abs(match.center[0] - 374), 12)
+        self.assertLess(abs(match.center[1] - 442), 12)
+
+    def test_live_game_screen_is_not_a_connection_retry_prompt(self):
+        import main
+
+        screenshot = cv2.imread(
+            "tests/fixtures/connection_retry_false_positive.png",
+            cv2.IMREAD_COLOR,
+        )
+        self.assertIsNotNone(screenshot)
+
+        self.assertIsNone(main.find_connection_interrupted_dialog(screenshot))
+        self.assertIsNone(main.find_connection_retry_button(screenshot))
+
+    def test_connection_prompt_requires_centered_dialog_and_retry_in_same_frame(self):
+        import main
+
+        screenshot = cv2.imread(
+            "tests/fixtures/connection_interrupted_current.png",
+            cv2.IMREAD_COLOR,
+        )
+        self.assertIsNotNone(screenshot)
+
+        dialog = main.find_connection_interrupted_dialog(screenshot)
+        retry = main.find_connection_retry_button(screenshot)
+
+        self.assertIsNotNone(dialog)
+        self.assertIsNotNone(retry)
+        self.assertLess(abs(retry.center[0] - 374), 12)
+        self.assertLess(abs(retry.center[1] - 442), 12)
+
 
 if __name__ == "__main__":
     unittest.main()
