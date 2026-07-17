@@ -11,6 +11,7 @@ $venvPython = Join-Path $venvDir "Scripts\python.exe"
 $requirements = Join-Path $root "requirements.txt"
 $requirementsMarker = Join-Path $venvDir ".requirements.sha256"
 $adb = Join-Path $root "tools\platform-tools\adb.exe"
+$adbPreflight = Join-Path $root "tools\setup_preflight.py"
 
 $env:PYTHONUTF8 = "1"
 $env:PYTHONIOENCODING = "utf-8"
@@ -131,6 +132,9 @@ if (-not (Test-Path -LiteralPath $requirements)) {
 if (-not (Test-Path -LiteralPath $adb)) {
     throw "缺少内置 ADB：$adb。请重新下载完整项目，不要单独下载源码文件。"
 }
+if (-not (Test-Path -LiteralPath $adbPreflight)) {
+    throw "缺少模拟器预检脚本：$adbPreflight。请重新下载完整项目。"
+}
 
 $venvCandidate = $null
 if (Test-Path -LiteralPath $venvPython) {
@@ -197,9 +201,18 @@ Invoke-Checked `
     -Arguments @("version") `
     -FailureMessage "内置 ADB 无法运行"
 
+Write-Step "连接模拟器并检查 Root"
+& $venvPython $adbPreflight
+$adbReady = $LASTEXITCODE -eq 0
+if (-not $adbReady) {
+    Write-Host "模拟器尚未准备完成。Python 环境已经配置成功，启动模拟器并修正上方问题后，可在控制台中再次点击“检查模拟器”。" -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "环境配置完成。" -ForegroundColor Green
-Write-Host "使用前请在模拟器中确认：已开启 Root 和 ADB、本地地址为 127.0.0.1:5555、分辨率为 1280x720。" -ForegroundColor Yellow
+if ($adbReady) {
+    Write-Host "模拟器连接和 Root 检查已通过。请继续确认分辨率为 1280x720，并登录游戏。" -ForegroundColor Green
+}
 
 if (-not $SkipLaunch) {
     Write-Step "启动控制台"
