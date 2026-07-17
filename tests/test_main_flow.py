@@ -3273,6 +3273,8 @@ class MainFlowTest(unittest.TestCase):
         hit_map = [[0, 0, 0] for _ in range(3)]
         progress = SidebarProgress(completed_lengths=(3,))
         probe_metadata = {}
+        completion_screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=completion_screenshot)
 
         def confirm_sidebar(_before, _after, _fleet, result):
             result.state = "hit"
@@ -3314,9 +3316,35 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(self.main._runtime_status.get("sidebar_completed_lengths"), [3])
         self.assertEqual(probe_metadata["sidebar_newly_completed_lengths"], (3,))
         self.assertEqual(probe_metadata["sidebar_completed_lengths"], (3,))
+        self.assertIs(
+            probe_metadata["sidebar_completion_screenshot"],
+            completion_screenshot,
+        )
         restart.assert_called_once_with(
             victory_wait_timeout=self.main.VICTORY_WAIT_AFTER_HIT_SECONDS,
         )
+
+    def test_probe_metadata_resolves_trusted_completed_submarine_cells(self):
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        click_points = [(400 + index, 300 + index) for index in range(36)]
+        metadata = {
+            "sidebar_completion_screenshot": screenshot,
+            "sidebar_completed_lengths": (3,),
+        }
+
+        with patch.object(
+            self.main,
+            "detect_completed_submarine_candidate_cells",
+            return_value={(2, 1), (2, 2), (2, 3), (1, 2)},
+        ):
+            trusted = self.main._trusted_completed_cells_from_probe_metadata(
+                metadata,
+                click_points,
+                grid_size=6,
+                anchor=(2, 2),
+            )
+
+        self.assertEqual(trusted, {(2, 1), (2, 2), (2, 3)})
 
     def test_consistent_incomplete_sidebar_frames_use_short_victory_wait(self):
         select_timeout = getattr(

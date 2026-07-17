@@ -223,6 +223,7 @@ class SubmarineStrategy:
         accounted = Counter(ship.length for ship in self.confirmed_ships)
         accounted.update(self.unlocated_completed)
         missing = observed - accounted
+        trusted_completed_cells = frozenset(observed_completed_cells)
 
         located: list[int] = []
         unlocated: list[int] = []
@@ -234,6 +235,7 @@ class SubmarineStrategy:
             placement = self._find_explicit_completion_placement(
                 length,
                 anchor=anchor_available,
+                trusted_completed_cells=trusted_completed_cells,
             )
             if placement is not None:
                 self._confirm_placement(placement)
@@ -253,7 +255,7 @@ class SubmarineStrategy:
             }
             recovered_cells = {
                 cell
-                for cell in observed_completed_cells
+                for cell in trusted_completed_cells
                 if self._inside(cell) and cell not in confirmed_cells
             }
             self.accounted_hit_cells.update(recovered_cells)
@@ -621,8 +623,10 @@ class SubmarineStrategy:
         length: int,
         *,
         anchor: Cell | None = None,
+        trusted_completed_cells: Iterable[Cell] = (),
     ) -> Optional[Placement]:
-        """Find one fully observed placement for a sidebar-completed ship."""
+        """Locate a completed ship without truncating a possible longer ship."""
+        trusted = frozenset(trusted_completed_cells)
         clusters = self._get_hit_clusters()
         if anchor is not None:
             clusters = [cluster for cluster in clusters if anchor in cluster]
@@ -643,9 +647,31 @@ class SubmarineStrategy:
                 candidates.append(placement)
 
             if len(candidates) == 1:
-                return candidates[0]
+                candidate = candidates[0]
+                candidate_cells = frozenset(candidate.cells)
+                if candidate_cells.issubset(trusted):
+                    return candidate
+                if not self._can_extend_placement_into_longer_ship(candidate):
+                    return candidate
 
         return None
+
+    def _can_extend_placement_into_longer_ship(self, placement: Placement) -> bool:
+        placement_cells = frozenset(placement.cells)
+        for longer_length, count in self.remaining.items():
+            if count <= 0 or longer_length <= placement.length:
+                continue
+            for longer in self._all_placements(longer_length):
+                longer_cells = frozenset(longer.cells)
+                if not placement_cells.issubset(longer_cells):
+                    continue
+                extra_cells = longer_cells - placement_cells
+                if all(
+                    self.shots.get(cell) is not False and cell not in self.blocked_cells
+                    for cell in extra_cells
+                ):
+                    return True
+        return False
 
     def _exact_complete_cluster_placement(self, cluster: set[Cell]) -> Optional[Placement]:
         if not cluster:
