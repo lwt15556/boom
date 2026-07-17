@@ -2,6 +2,7 @@ import atexit
 import json
 import os
 import signal
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -1091,16 +1092,6 @@ def _red_scout_result_is_complete_six(result: RedScoutResult) -> bool:
     )
 
 
-def _red_scout_result_signature(result: RedScoutResult) -> tuple[object, ...]:
-    return (
-        bool(result.valid),
-        result.affected_cells,
-        result.hit_cells,
-        result.miss_cells,
-        result.unknown_cells,
-    )
-
-
 def _red_scout_result_quality(result: RedScoutResult) -> tuple[int, int, int, int]:
     classified = len(result.hit_cells | result.miss_cells)
     return (
@@ -1122,9 +1113,15 @@ def _analyze_red_result_with_baseline_consensus(
     learned_footprint: RedFootprint | None = None,
     submarine_lengths: Sequence[int] = (),
 ) -> RedScoutResult:
-    baselines = tuple(before_images)
+    baselines = tuple(
+        baseline
+        for baseline in before_images
+        if isinstance(baseline, np.ndarray) and baseline.ndim == 3
+    )
     if not baselines:
         raise ValueError("red scout analysis requires at least one baseline frame")
+    if any(baseline.shape != baselines[0].shape for baseline in baselines[1:]):
+        raise ValueError("red scout baseline frames must have matching shapes")
 
     def analyze(baseline: object) -> RedScoutResult:
         return _analyze_red_result(
@@ -1138,74 +1135,66 @@ def _analyze_red_result_with_baseline_consensus(
             submarine_lengths=submarine_lengths,
         )
 
-    primary = analyze(baselines[0])
-    if _red_scout_result_is_complete_six(primary) or len(baselines) == 1:
+    median_baseline = np.median(np.stack(baselines, axis=0), axis=0).astype(
+        baselines[0].dtype
+    )
+    primary = analyze(median_baseline)
+    uncertain_reasons = {
+        "preflight_failed",
+        "before_hit_detection_failed",
+        "stable_hit_detection_failed",
+        "evidence_collection_failed",
+        "result_classification_failed",
+        "insufficient_changed_cells",
+        "ambiguous_result",
+    }
+    needs_fallback = bool(primary.unknown_cells) or (
+        not primary.valid and primary.invalid_reason in uncertain_reasons
+    )
+    if not needs_fallback or len(baselines) == 1:
         return primary
 
-    results = [primary]
-    for baseline_index, baseline in enumerate(baselines[1:], start=1):
-        try:
-            results.append(analyze(baseline))
-        except Exception as exc:
-            logger.warning(
-                "red scout secondary baseline %s analysis failed; keeping safer primary "
-                "result: %s",
-                baseline_index,
-                exc,
+    ranked_baselines = sorted(
+        baselines,
+        key=lambda baseline: float(
+            np.mean(
+                np.abs(
+                    baseline.astype(np.int16)
+                    - median_baseline.astype(np.int16)
+                )
             )
-    groups: dict[tuple[object, ...], list[RedScoutResult]] = {}
-    for result in results:
-        groups.setdefault(_red_scout_result_signature(result), []).append(result)
-
-    agreed_groups = [group for group in groups.values() if len(group) >= 2]
-    if not agreed_groups:
-        return primary
-    consensus_group = max(
-        agreed_groups,
-        key=lambda group: _red_scout_result_quality(group[0]),
+        ),
     )
-    consensus = consensus_group[0]
-    if _red_scout_result_quality(consensus) <= _red_scout_result_quality(primary):
+    fallback = next(
+        (
+            baseline
+            for baseline in ranked_baselines
+            if not np.array_equal(baseline, median_baseline)
+        ),
+        None,
+    )
+    if fallback is None:
         return primary
 
-    logger.info(
-        "red scout baseline consensus recovered a stronger result: affected=%s hits=%s "
-        "misses=%s",
-        sorted(consensus.affected_cells),
-        sorted(consensus.hit_cells),
-        sorted(consensus.miss_cells),
-    )
-    diagnostics = dict(consensus.diagnostics)
-    diagnostics.update(
-        {
-            "baseline_count": len(results),
-            "baseline_consensus_votes": len(consensus_group),
-            "baseline_results": tuple(
-                {
-                    "valid": bool(result.valid),
-                    "affected": tuple(sorted(result.affected_cells)),
-                    "hits": tuple(sorted(result.hit_cells)),
-                    "misses": tuple(sorted(result.miss_cells)),
-                    "unknown": tuple(sorted(result.unknown_cells)),
-                    "invalid_reason": result.invalid_reason,
-                }
-                for result in results
-            ),
-        }
-    )
-    return RedScoutResult(
-        center_cell=consensus.center_cell,
-        affected_cells=consensus.affected_cells,
-        hit_cells=consensus.hit_cells,
-        miss_cells=consensus.miss_cells,
-        unknown_cells=consensus.unknown_cells,
-        footprint=consensus.footprint,
-        valid=consensus.valid,
-        confidence_by_cell=consensus.confidence_by_cell,
-        level_completed=consensus.level_completed,
-        invalid_reason=consensus.invalid_reason,
-        diagnostics=diagnostics,
-    )
+    try:
+        alternative = analyze(fallback)
+    except Exception as exc:
+        logger.warning(
+            "red scout fallback baseline analysis failed; keeping median result: %s",
+            exc,
+        )
+        return primary
+
+    if _red_scout_result_quality(alternative) > _red_scout_result_quality(primary):
+        logger.info(
+            "red scout fallback baseline recovered a stronger result: affected=%s "
+            "hits=%s misses=%s",
+            sorted(alternative.affected_cells),
+            sorted(alternative.hit_cells),
+            sorted(alternative.miss_cells),
+        )
+        return alternative
+    return primary
 
 
 def _stop_and_latch_safety_failure(
@@ -1331,6 +1320,8 @@ def _execute_red_scout_transaction(
     grid_clicked = False
     pending_marker_written = False
     sample_dir: Path | None = None
+    analysis_executor: ThreadPoolExecutor | None = None
+    analysis_future = None
     if attempt is not None:
         try:
             sample_dir = _create_red_scout_sample_dir(
@@ -1426,7 +1417,12 @@ def _execute_red_scout_transaction(
         after_images = _capture_red_result_frames(sample_dir=sample_dir)
         transaction.advance(ProbePhase.RESULT_RECORDED)
         update_pending_probe(phase=ProbePhase.RESULT_RECORDED.name)
-        analysis = _analyze_red_result_with_baseline_consensus(
+        analysis_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="red-scout-analysis",
+        )
+        analysis_future = analysis_executor.submit(
+            _analyze_red_result_with_baseline_consensus,
             before_images=before_images,
             after_images=after_images,
             click_points=all_click_points,
@@ -1436,17 +1432,6 @@ def _execute_red_scout_transaction(
             learned_footprint=learned_footprint,
             submarine_lengths=submarine_lengths,
         )
-        if sample_dir is not None and attempt is not None:
-            try:
-                _write_red_scout_analysis(
-                    sample_dir,
-                    analysis,
-                    level=level,
-                    index=index,
-                    attempt=attempt,
-                )
-            except OSError as exc:
-                logger.warning("could not write red scout analysis: %s", exc)
         write_runtime_status(phase="red_scout_discard", level=level)
         _discard_pending_request_and_prepare_next_probe(transaction)
         if (
@@ -1458,9 +1443,41 @@ def _execute_red_scout_transaction(
             )
         _verify_red_ammo_unchanged(before_fingerprint, sample_dir=sample_dir)
         pending_marker_written = False
+        analysis = analysis_future.result()
+        analysis_executor.shutdown(wait=True)
+        analysis_executor = None
+        analysis_future = None
+        if sample_dir is not None and attempt is not None:
+            try:
+                _write_red_scout_analysis(
+                    sample_dir,
+                    analysis,
+                    level=level,
+                    index=index,
+                    attempt=attempt,
+                )
+            except OSError as exc:
+                logger.warning("could not write red scout analysis: %s", exc)
         _active_probe = None
         return analysis
     except Exception as exc:
+        if analysis_future is not None:
+            analysis_future.cancel()
+        if analysis_executor is not None:
+            analysis_executor.shutdown(wait=False, cancel_futures=True)
+        discard_completed = bool(
+            transaction is not None
+            and transaction.phase is ProbePhase.COMPLETE
+            and getattr(transaction, "red_request_discarded", False)
+            and not pending_marker_written
+        )
+        if discard_completed:
+            logger.error(
+                "red scout analysis failed after the red request was safely discarded: %s",
+                exc,
+            )
+            _active_probe = None
+            raise
         if grid_clicked:
             try:
                 update_pending_probe(phase="INTERRUPTED", error=str(exc))

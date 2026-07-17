@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import nullcontext
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -189,8 +190,8 @@ class MainFlowTest(unittest.TestCase):
         self.assertIn("attempt_01", first.name)
         self.assertIn("attempt_02", second.name)
 
-    def test_red_analysis_recovers_only_when_two_extra_baselines_agree(self):
-        primary = self.main.RedScoutResult(
+    def test_red_analysis_uses_median_baseline_once_for_deterministic_result(self):
+        deterministic = self.main.RedScoutResult(
             center_cell=(1, 1),
             affected_cells=frozenset(),
             hit_cells=frozenset(),
@@ -199,27 +200,20 @@ class MainFlowTest(unittest.TestCase):
             footprint=None,
             valid=False,
             confidence_by_cell={},
-            invalid_reason="insufficient_changed_cells",
+            invalid_reason="too_many_strong_cells",
         )
-        cells = frozenset({(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)})
-        consensus = self.main.RedScoutResult(
-            center_cell=(1, 1),
-            affected_cells=cells,
-            hit_cells=frozenset({(1, 1)}),
-            miss_cells=cells - {(1, 1)},
-            unknown_cells=frozenset(),
-            footprint=self.main.RedFootprint(frozenset({(0, 0)})),
-            valid=True,
-            confidence_by_cell={cell: 0.9 for cell in cells},
-        )
+        baselines = [
+            np.full((2, 2, 3), value, dtype=np.uint8)
+            for value in (0, 30, 10)
+        ]
 
         with patch.object(
             self.main,
             "_analyze_red_result",
-            side_effect=[primary, consensus, consensus],
+            return_value=deterministic,
         ) as analyze:
             result = self.main._analyze_red_result_with_baseline_consensus(
-                before_images=["before-0", "before-1", "before-2"],
+                before_images=baselines,
                 after_images=["after"],
                 click_points=[(0, 0)] * 9,
                 grid_size=3,
@@ -227,14 +221,14 @@ class MainFlowTest(unittest.TestCase):
                 submarine_lengths=[3],
             )
 
-        self.assertEqual(result.affected_cells, consensus.affected_cells)
-        self.assertEqual(result.hit_cells, consensus.hit_cells)
-        self.assertEqual(result.miss_cells, consensus.miss_cells)
-        self.assertEqual(result.diagnostics["baseline_consensus_votes"], 2)
-        self.assertEqual(result.diagnostics["baseline_count"], 3)
-        self.assertEqual(analyze.call_count, 3)
+        self.assertIs(result, deterministic)
+        self.assertEqual(analyze.call_count, 1)
+        np.testing.assert_array_equal(
+            analyze.call_args.args[0],
+            np.full((2, 2, 3), 10, dtype=np.uint8),
+        )
 
-    def test_red_analysis_keeps_primary_when_extra_baselines_disagree(self):
+    def test_red_analysis_uses_only_one_original_fallback_when_uncertain(self):
         primary = self.main.RedScoutResult(
             center_cell=(1, 1), affected_cells=frozenset(),
             hit_cells=frozenset(), miss_cells=frozenset(),
@@ -252,20 +246,30 @@ class MainFlowTest(unittest.TestCase):
                 valid=True, confidence_by_cell={cell: 0.9 for cell in cells},
             )
 
+        recovered = full_result((1, 2))
+        baselines = [
+            np.full((2, 2, 3), value, dtype=np.uint8)
+            for value in (0, 20, 100)
+        ]
         with patch.object(
             self.main,
             "_analyze_red_result",
-            side_effect=[primary, full_result((1, 2)), full_result((2, 1))],
-        ):
+            side_effect=[primary, recovered],
+        ) as analyze:
             result = self.main._analyze_red_result_with_baseline_consensus(
-                before_images=["before-0", "before-1", "before-2"],
+                before_images=baselines,
                 after_images=["after"], click_points=[(0, 0)] * 9,
                 grid_size=3, center_cell=(1, 1), submarine_lengths=[3],
             )
 
-        self.assertIs(result, primary)
+        self.assertIs(result, recovered)
+        self.assertEqual(analyze.call_count, 2)
+        np.testing.assert_array_equal(
+            analyze.call_args_list[1].args[0],
+            baselines[0],
+        )
 
-    def test_red_analysis_keeps_primary_when_extra_baseline_analysis_errors(self):
+    def test_red_analysis_keeps_median_result_when_single_fallback_errors(self):
         primary = self.main.RedScoutResult(
             center_cell=(1, 1), affected_cells=frozenset(),
             hit_cells=frozenset(), miss_cells=frozenset(),
@@ -273,19 +277,24 @@ class MainFlowTest(unittest.TestCase):
             confidence_by_cell={}, invalid_reason="insufficient_changed_cells",
         )
         alternative = self._valid_red_result()
+        baselines = [
+            np.full((2, 2, 3), value, dtype=np.uint8)
+            for value in (0, 20, 100)
+        ]
 
         with patch.object(
             self.main,
             "_analyze_red_result",
             side_effect=[primary, RuntimeError("secondary failed"), alternative],
-        ):
+        ) as analyze:
             result = self.main._analyze_red_result_with_baseline_consensus(
-                before_images=["before-0", "before-1", "before-2"],
+                before_images=baselines,
                 after_images=["after"], click_points=[(0, 0)] * 9,
                 grid_size=3, center_cell=(1, 1), submarine_lengths=[3],
             )
 
         self.assertIs(result, primary)
+        self.assertEqual(analyze.call_count, 2)
 
     def test_red_scout_sample_retention_removes_only_oldest_managed_directory(self):
         sample_root = self.main.Path(self.runtime_temp.name) / "red_scout_samples"
@@ -1856,6 +1865,8 @@ class MainFlowTest(unittest.TestCase):
             valid=True, confidence_by_cell={(1, 1): 0.9, (1, 2): 0.9},
         )
         events = []
+        analysis_started = Event()
+        recovery_started = Event()
 
         def exit_red_activity(*_args, **_kwargs):
             events.append("system_back_exit")
@@ -1870,9 +1881,20 @@ class MainFlowTest(unittest.TestCase):
             events.append("capture_result")
             return ["after"]
 
+        def analyze_result(**_kwargs):
+            events.append("analysis_started")
+            analysis_started.set()
+            if not recovery_started.wait(timeout=0.5):
+                events.append("analysis_waited_for_recovery")
+            events.append("analysis_finished")
+            return analysis
+
         def discard(tx):
+            self.assertTrue(analysis_started.wait(timeout=0.5))
             tx.advance(self.main.ProbePhase.REQUEST_DISCARDED)
             tx.red_request_discarded = True
+            events.append("discard_started")
+            recovery_started.set()
             tx.advance(self.main.ProbePhase.LOGIN_RECOVERING)
             tx.advance(self.main.ProbePhase.COMPLETE)
             return False
@@ -1888,8 +1910,8 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "_capture_red_result_frames", side_effect=capture_result_frames),
             patch.object(
                 self.main,
-                "_analyze_red_result",
-                return_value=analysis,
+                "_analyze_red_result_with_baseline_consensus",
+                side_effect=analyze_result,
             ) as analyze,
             patch.object(self.main, "_discard_pending_request_and_prepare_next_probe", side_effect=discard) as discard_mock,
             patch.object(self.main, "_commit_hit_request_and_prepare_next_probe") as commit_mock,
@@ -1916,15 +1938,75 @@ class MainFlowTest(unittest.TestCase):
             use_system_back=True,
         )
         self.assertEqual(
-            events,
-            ["system_back_exit", "reenter_activity", "capture_result"],
+            events[:5],
+            [
+                "system_back_exit",
+                "reenter_activity",
+                "capture_result",
+                "analysis_started",
+                "discard_started",
+            ],
         )
+        self.assertNotIn("analysis_waited_for_recovery", events)
         phases = [call.kwargs["phase"] for call in write_status.call_args_list if "phase" in call.kwargs]
         self.assertEqual(
             phases,
             ["red_scout_preflight", "red_scout_capture", "red_scout_discard", "red_scout_verify_ammo"],
         )
         self.assertEqual(analyze.call_args.kwargs["submarine_lengths"], [3])
+
+    def test_red_analysis_failure_after_discard_does_not_force_stop_game(self):
+        events = []
+
+        def discard(transaction):
+            events.append("discard")
+            transaction.advance(self.main.ProbePhase.REQUEST_DISCARDED)
+            transaction.red_request_discarded = True
+            transaction.advance(self.main.ProbePhase.LOGIN_RECOVERING)
+            transaction.advance(self.main.ProbePhase.COMPLETE)
+            return False
+
+        with (
+            patch.object(
+                self.main,
+                "_capture_red_ammo_state",
+                return_value=("before", "fingerprint", DummyMatch((10, 20))),
+            ),
+            patch.object(self.main, "_select_red_bomb", return_value=True),
+            patch.object(self.main, "_exit_activity_after_probe_click"),
+            patch.object(self.main, "_reenter_activity_for_probe_result", return_value=False),
+            patch.object(self.main, "_capture_red_result_frames", return_value=["after"]),
+            patch.object(
+                self.main,
+                "_analyze_red_result_with_baseline_consensus",
+                side_effect=RuntimeError("analysis failed"),
+            ),
+            patch.object(
+                self.main,
+                "_discard_pending_request_and_prepare_next_probe",
+                side_effect=discard,
+            ),
+            patch.object(
+                self.main,
+                "_verify_red_ammo_unchanged",
+                side_effect=lambda *_args, **_kwargs: events.append("verify_ammo"),
+            ),
+            patch.object(self.main, "_stop_and_latch_red_safety_failure") as stop,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "analysis failed"):
+                self.main._execute_red_scout_transaction(
+                    level=1,
+                    center_cell=(1, 1),
+                    point=(100, 200),
+                    index=0,
+                    grid_size=3,
+                    all_click_points=[(0, 0)] * 9,
+                    submarine_lengths=[3],
+                )
+
+        self.assertEqual(events, ["discard", "verify_ammo"])
+        stop.assert_not_called()
+        self.assertIsNone(self.main._active_probe)
 
     def test_red_scout_transaction_wires_all_artifacts_to_attempt_directory(self):
         analysis = self._valid_red_result()
@@ -2034,7 +2116,11 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "_exit_activity_after_probe_click"),
             patch.object(self.main, "_reenter_activity_for_probe_result", return_value=False),
             patch.object(self.main, "_capture_red_result_frames", return_value=["after"]),
-            patch.object(self.main, "_analyze_red_result", return_value=analysis),
+            patch.object(
+                self.main,
+                "_analyze_red_result_with_baseline_consensus",
+                return_value=analysis,
+            ),
             patch.object(self.main, "_discard_pending_request_and_prepare_next_probe", side_effect=discard),
             patch.object(self.main, "ammo_fingerprint_matches", return_value=True),
             patch.object(self.main, "write_pending_probe", side_effect=write_pending),
