@@ -5,7 +5,11 @@ $python = Join-Path $root ".venv\Scripts\python.exe"
 $panel = Join-Path $root "tools\control_panel.py"
 
 if (-not (Test-Path -LiteralPath $python)) {
-    throw "Python virtual environment not found: $python"
+    $setup = Join-Path $root "setup.ps1"
+    if (-not (Test-Path -LiteralPath $setup)) {
+        throw "Python virtual environment not found: $python"
+    }
+    & $setup -SkipLaunch
 }
 
 $env:PYTHONUTF8 = "1"
