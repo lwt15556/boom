@@ -22,6 +22,8 @@ class ScriptSafetyTest(unittest.TestCase):
         self.assertIn('"-m", "pip", "install", "-r"', script)
         self.assertIn('"import cv2, numpy, PyQt6;', script)
         self.assertIn('Arguments @(\"version\")', script)
+        self.assertIn('tools\setup_preflight.py', script)
+        self.assertIn('$adbReady = $LASTEXITCODE -eq 0', script)
         self.assertIn('.venv.invalid.', script)
         self.assertIn('[switch]$SkipLaunch', script)
 
