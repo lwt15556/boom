@@ -765,6 +765,51 @@ def apply_sidebar_completion_confirmation(
     return True, after_progress, newly_completed
 
 
+def _trusted_completed_cells_from_probe_metadata(
+    probe_metadata: Mapping[str, object],
+    click_points: Sequence[tuple[int, int]],
+    *,
+    grid_size: int,
+    anchor: Cell | None = None,
+) -> set[Cell]:
+    screenshot = probe_metadata.get("sidebar_completion_screenshot")
+    completed_lengths = tuple(
+        int(length)
+        for length in probe_metadata.get("sidebar_completed_lengths", ())
+        if int(length) > 0
+    )
+    if (
+        not isinstance(screenshot, np.ndarray)
+        or screenshot.ndim != 3
+        or not completed_lengths
+        or len(click_points) != grid_size * grid_size
+    ):
+        return set()
+
+    candidates = detect_completed_submarine_candidate_cells(
+        screenshot,
+        list(click_points),
+        grid_size,
+    )
+    if not candidates:
+        return set()
+
+    resolution = resolve_completed_ship_cells(
+        candidates,
+        completed_lengths,
+        grid_size=grid_size,
+        preferred_cells={anchor} if anchor is not None else set(),
+    )
+    trusted = set(resolution.cells)
+    logger.info(
+        "live completed ship geometry: placements=%s unresolved=%s discarded=%s",
+        [list(placement) for placement in resolution.placements],
+        list(resolution.unresolved_lengths),
+        sorted(resolution.discarded_cells),
+    )
+    return trusted
+
+
 def enforce_positive_hit_evidence(
     result,
     *,
@@ -2330,10 +2375,16 @@ def _scan_level_by_strategy(
                         )
                     reconcile = getattr(strategy, "reconcile_completed_lengths", None)
                     if hit and sidebar_completed_lengths and callable(reconcile):
+                        trusted_completed_cells = _trusted_completed_cells_from_probe_metadata(
+                            probe_metadata,
+                            click_points,
+                            grid_size=grid_size,
+                            anchor=cell,
+                        )
                         reconcile(
                             sidebar_completed_lengths,
                             anchor=cell,
-                            observed_completed_cells={cell},
+                            observed_completed_cells=trusted_completed_cells,
                         )
 
                     save_level_shots(level, grid_size, strategy.shots)
@@ -2451,10 +2502,16 @@ def _scan_level_by_strategy(
             if not sidebar_completed_lengths and newly_completed_lengths:
                 sidebar_completed_lengths = tuple(accounted_completed_lengths()) + newly_completed_lengths
             if hit and sidebar_completed_lengths:
+                trusted_completed_cells = _trusted_completed_cells_from_probe_metadata(
+                    probe_metadata,
+                    click_points,
+                    grid_size=grid_size,
+                    anchor=cell,
+                )
                 located, unlocated = strategy.reconcile_completed_lengths(
                     sidebar_completed_lengths,
                     anchor=cell,
-                    observed_completed_cells={cell} if hit else set(),
+                    observed_completed_cells=trusted_completed_cells,
                 )
                 if located or unlocated:
                     logger.info(
@@ -2583,12 +2640,16 @@ def _scan_level_by_strategy(
             if not completed_lengths and newly_completed:
                 completed_lengths = tuple(accounted_completed_lengths()) + newly_completed
             if _probe_result_is_hit(probe_result) and completed_lengths:
+                trusted_completed_cells = _trusted_completed_cells_from_probe_metadata(
+                    probe_metadata,
+                    click_points,
+                    grid_size=grid_size,
+                    anchor=cell,
+                )
                 located, unlocated = strategy.reconcile_completed_lengths(
                     completed_lengths,
                     anchor=cell,
-                    observed_completed_cells={cell}
-                    if _probe_result_is_hit(probe_result)
-                    else set(),
+                    observed_completed_cells=trusted_completed_cells,
                 )
                 if located or unlocated:
                     logger.info(
@@ -2669,6 +2730,9 @@ def _run_red_scout_and_blue_strategy(
     valid_attempts = 0
     complete_six_attempts = 0
     online_sidebar_completed_lengths: tuple[int, ...] = ()
+    online_completed_visual_hits = set(
+        scan_kwargs.get("initial_completed_visual_hits") or set()
+    )
 
     def current_board_states() -> list[list[str]]:
         display_strategy = SubmarineStrategy(grid_size, submarines)
@@ -2685,7 +2749,7 @@ def _run_red_scout_and_blue_strategy(
         if online_sidebar_completed_lengths:
             display_strategy.reconcile_completed_lengths(
                 online_sidebar_completed_lengths,
-                observed_completed_cells=real_hits,
+                observed_completed_cells=online_completed_visual_hits,
             )
         return build_runtime_board_states(
             display_strategy,
@@ -2875,6 +2939,14 @@ def _run_red_scout_and_blue_strategy(
             )
             if completed_lengths:
                 online_sidebar_completed_lengths = completed_lengths
+                online_completed_visual_hits.update(
+                    _trusted_completed_cells_from_probe_metadata(
+                        probe_metadata,
+                        click_points,
+                        grid_size=grid_size,
+                        anchor=cell,
+                    )
+                )
             write_runtime_status(
                 phase="level_complete" if level_completed else "blue_online_scout_hits",
                 level=level,
@@ -2918,6 +2990,7 @@ def _run_red_scout_and_blue_strategy(
             completed_lengths=online_sidebar_completed_lengths,
         )
         final_scan_kwargs["initial_completed_lengths"] = online_sidebar_completed_lengths
+        final_scan_kwargs["initial_completed_visual_hits"] = online_completed_visual_hits
     final_scan_kwargs.update(
         initial_hits=initial_real_hits | committed_hits,
         initial_misses=committed_misses,
@@ -3177,10 +3250,14 @@ def _execute_online_scout_hit(
     latest_sidebar_progress: SidebarProgress | None = None
     sidebar_progress_samples: list[SidebarProgress | None] = []
     sidebar_newly_completed: tuple[int, ...] = ()
+    sidebar_completion_screenshot: np.ndarray | None = None
     victory_screenshot: np.ndarray | None = None
 
     def capture_online_frame(frame_index: int, frame_delay: float) -> None:
-        nonlocal latest_sidebar_progress, sidebar_newly_completed, victory_screenshot
+        nonlocal latest_sidebar_progress
+        nonlocal sidebar_newly_completed
+        nonlocal sidebar_completion_screenshot
+        nonlocal victory_screenshot
         screenshot_path = sample_dir / f"after_{frame_index}.png"
         frame_capture = adb.delay(frame_delay).capture_screenshot()
         frame_captures.append((screenshot_path, frame_capture))
@@ -3215,6 +3292,7 @@ def _execute_online_scout_hit(
                 latest_sidebar_progress = frame_sidebar_progress
             if frame_newly_completed:
                 sidebar_newly_completed = frame_newly_completed
+                sidebar_completion_screenshot = after_img
         sidebar_progress_samples.append(frame_sidebar_progress)
 
         dynamic_hit_vetoed = enforce_positive_hit_evidence(
@@ -3389,6 +3467,7 @@ def _execute_online_scout_hit(
                 if latest_sidebar_progress is not None and latest_sidebar_progress.valid
                 else 0
             ),
+            sidebar_completion_screenshot=sidebar_completion_screenshot,
             level_completed=_probe_result_completed_level(probe_result),
         )
     _write_probe_status(
@@ -3599,6 +3678,7 @@ def _execute_probe_transaction(
         latest_sidebar_progress: SidebarProgress | None = None
         sidebar_progress_samples: list[SidebarProgress | None] = []
         sidebar_newly_completed: tuple[int, ...] = ()
+        sidebar_completion_screenshot: np.ndarray | None = None
         victory_frame_detected = False
         adaptive_frames_stopped = False
         for frame_index, frame_delay in enumerate(HIT_RESULT_FRAME_DELAYS, start=1):
@@ -3636,6 +3716,7 @@ def _execute_probe_transaction(
                     latest_sidebar_progress = frame_sidebar_progress
                 if frame_newly_completed:
                     sidebar_newly_completed = frame_newly_completed
+                    sidebar_completion_screenshot = after_img
             sidebar_progress_samples.append(frame_sidebar_progress)
             new_wreck_hit = template_hit and not before_wreck_visible
             dynamic_hit_vetoed = enforce_positive_hit_evidence(
@@ -3738,6 +3819,7 @@ def _execute_probe_transaction(
                         latest_sidebar_progress = frame_sidebar_progress
                     if frame_newly_completed:
                         sidebar_newly_completed = frame_newly_completed
+                        sidebar_completion_screenshot = after_img
                 sidebar_progress_samples.append(frame_sidebar_progress)
                 new_wreck_hit = template_hit and not before_wreck_visible
                 dynamic_hit_vetoed = enforce_positive_hit_evidence(
@@ -3927,6 +4009,7 @@ def _execute_probe_transaction(
                     if latest_sidebar_progress is not None and latest_sidebar_progress.valid
                     else 0
                 ),
+                sidebar_completion_screenshot=sidebar_completion_screenshot,
             )
         return probe_result
     except Exception as exc:

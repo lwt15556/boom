@@ -430,7 +430,7 @@ class SubmarineStrategyTest(unittest.TestCase):
             strategy.report_result(cell, False)
 
     def test_structured_board_states_distinguish_probe_results(self):
-        strategy = SubmarineStrategy(5, [2, 3])
+        strategy = SubmarineStrategy(5, [2])
         strategy.report_result((2, 1), True)
         strategy.report_result((2, 2), True)
         strategy.confirm_completed_lengths((2,), anchor=(2, 2))
@@ -451,20 +451,58 @@ class SubmarineStrategyTest(unittest.TestCase):
 
         self.assertEqual(strategy.get_confirmed_ships(), [])
 
-    def test_sidebar_completed_length_confirms_ambiguous_short_ship(self):
+    def test_sidebar_completed_length_does_not_truncate_possible_long_ship(self):
         strategy = SubmarineStrategy(6, [2, 4])
         strategy.report_result((2, 2), True)
         strategy.report_result((2, 3), True)
 
-        confirmed = strategy.confirm_completed_lengths((2,), anchor=(2, 3))
-
-        self.assertEqual(confirmed, (2,))
-        self.assertEqual(
-            [ship.length for ship in strategy.get_confirmed_ships()],
-            [2],
+        located, unlocated = strategy.reconcile_completed_lengths(
+            (2,),
+            anchor=(2, 3),
         )
-        self.assertIn((1, 1), strategy.blocked_cells)
-        self.assertIn((3, 4), strategy.blocked_cells)
+
+        self.assertEqual(located, ())
+        self.assertEqual(unlocated, (2,))
+        self.assertEqual(strategy.get_confirmed_ships(), [])
+        self.assertEqual(strategy.get_cell_states()[2][2], "hit")
+        self.assertEqual(strategy.get_cell_states()[2][3], "hit")
+        self.assertNotIn((1, 1), strategy.blocked_cells)
+        self.assertNotIn((3, 4), strategy.blocked_cells)
+
+    def test_sidebar_length_three_does_not_claim_partial_length_five(self):
+        strategy = SubmarineStrategy(10, [2, 2, 3, 4, 5])
+        for cell in ((0, 1), (0, 2), (0, 3)):
+            strategy.report_result(cell, True)
+
+        located, unlocated = strategy.reconcile_completed_lengths(
+            (3,),
+            anchor=(0, 1),
+        )
+
+        self.assertEqual(located, ())
+        self.assertEqual(unlocated, (3,))
+        self.assertEqual(strategy.get_confirmed_ships(), [])
+        states = strategy.get_cell_states()
+        self.assertEqual([states[0][col] for col in (1, 2, 3)], ["hit"] * 3)
+        self.assertNotIn((1, 1), strategy.blocked_cells)
+
+    def test_trusted_visual_hull_locates_extendable_sidebar_completion(self):
+        strategy = SubmarineStrategy(10, [2, 2, 3, 4, 5])
+        hull = {(4, 0), (4, 1), (4, 2)}
+        for cell in hull:
+            strategy.report_result(cell, True)
+
+        located, unlocated = strategy.reconcile_completed_lengths(
+            (3,),
+            anchor=(4, 1),
+            observed_completed_cells=hull,
+        )
+
+        self.assertEqual(located, (3,))
+        self.assertEqual(unlocated, ())
+        states = strategy.get_cell_states()
+        self.assertEqual([states[4][col] for col in range(3)], ["ship"] * 3)
+        self.assertIn((3, 1), strategy.blocked_cells)
 
     def test_unlocated_sidebar_completion_is_removed_from_hunt_fleet(self):
         strategy = SubmarineStrategy(6, [2, 4])
