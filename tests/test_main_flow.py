@@ -118,6 +118,12 @@ class MainFlowTest(unittest.TestCase):
         runtime_root = self.main.Path(self.runtime_temp.name)
         self.runtime_path_patchers = [
             patch.object(self.main, "PROBE_SAMPLE_DIR", runtime_root / "probes"),
+            patch.object(
+                self.main,
+                "RED_SCOUT_SAMPLE_DIR",
+                runtime_root / "red_scout_samples",
+            ),
+            patch.object(self.main, "RUN_DEBUG_DIR", runtime_root / "run_debug"),
             patch.object(self.main, "RUNTIME_DIR", runtime_root / "runtime"),
             patch.object(
                 self.main,
@@ -189,6 +195,11 @@ class MainFlowTest(unittest.TestCase):
         self.assertTrue(second.is_dir())
         self.assertIn("attempt_01", first.name)
         self.assertIn("attempt_02", second.name)
+
+    def test_runtime_evidence_retention_defaults_are_bounded(self):
+        self.assertEqual(self.main.MAX_PROBE_SAMPLE_DIRS, 20)
+        self.assertEqual(self.main.MAX_RED_SCOUT_SAMPLE_DIRS, 10)
+        self.assertEqual(self.main.MAX_SCREENSHOT_STORAGE_BYTES, 500 * 1024 * 1024)
 
     def test_red_analysis_uses_median_baseline_once_for_deterministic_result(self):
         deterministic = self.main.RedScoutResult(
@@ -321,6 +332,58 @@ class MainFlowTest(unittest.TestCase):
         self.assertTrue(directories[1].is_dir())
         self.assertTrue(directories[2].is_dir())
         self.assertTrue(unmanaged.is_dir())
+
+    def test_total_screenshot_limit_removes_oldest_samples_across_modes(self):
+        root = self.main.Path(self.runtime_temp.name)
+        probe_root = root / "probes"
+        red_root = root / "red"
+        run_debug = root / "run_debug"
+        probe_root.mkdir()
+        red_root.mkdir()
+        run_debug.mkdir()
+        old_probe = probe_root / "level_1_cell_0_sample"
+        current_probe = probe_root / "level_1_cell_1_sample"
+        red_sample = red_root / "level_1_attempt_01_sample"
+        for index, directory in enumerate((old_probe, red_sample, current_probe), start=1):
+            directory.mkdir()
+            (directory / "frame.png").write_bytes(b"x" * 40)
+            os.utime(directory, (index, index))
+        (run_debug / "latest.png").write_bytes(b"x" * 10)
+
+        with (
+            patch.object(self.main, "PROBE_SAMPLE_DIR", probe_root),
+            patch.object(self.main, "RED_SCOUT_SAMPLE_DIR", red_root),
+            patch.object(self.main, "RUN_DEBUG_DIR", run_debug),
+        ):
+            self.main._prune_screenshot_storage(
+                max_bytes=90,
+                protected_paths=(current_probe,),
+            )
+
+        self.assertFalse(old_probe.exists())
+        self.assertTrue(red_sample.exists())
+        self.assertTrue(current_probe.exists())
+        self.assertTrue((run_debug / "latest.png").exists())
+
+    def test_successful_red_scout_keeps_only_representative_images(self):
+        compact = getattr(self.main, "_compact_successful_red_scout_images", None)
+        self.assertIsNotNone(compact)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_dir = self.main.Path(temp_dir)
+            for prefix, count in (("before", 3), ("after", 4), ("verify", 3)):
+                for index in range(count):
+                    (sample_dir / f"{prefix}_{index}.png").write_bytes(bytes([index]))
+            for name in ("selected.png", "exit_attempt.png"):
+                (sample_dir / name).write_bytes(b"image")
+            (sample_dir / "analysis.json").write_text("{}", encoding="utf-8")
+
+            compact(sample_dir)
+
+            self.assertEqual(
+                sorted(path.name for path in sample_dir.glob("*.png")),
+                ["after_1.png", "before_1.png", "selected.png", "verify_1.png"],
+            )
+            self.assertTrue((sample_dir / "analysis.json").exists())
 
     def test_rejected_second_instance_does_not_register_or_run_network_cleanup(self):
         with (
@@ -3227,6 +3290,7 @@ class MainFlowTest(unittest.TestCase):
                 frame_records,
                 suspect_extra_checked=False,
                 victory_detected=False,
+                result_unknown=True,
             )
         )
 
@@ -3249,6 +3313,52 @@ class MainFlowTest(unittest.TestCase):
                 ["after_1.png", "after_2.png", "after_3.png", "after_4.png", "before.png"],
             )
             self.assertTrue(all(record["saved"] for record in frame_records))
+
+    def test_successful_probe_with_frame_disagreement_keeps_key_frame_only(self):
+        preserve_all = self.main._should_preserve_all_probe_images
+        frame_records = [
+            {
+                "dynamic_hit_vetoed": index == 2,
+                "sidebar_completed_lengths": [],
+                "result": {"state": state, "score": score},
+            }
+            for index, (state, score) in enumerate(
+                (("hit", 0.95), ("hit", 0.91), ("miss", 0.4)),
+                start=1,
+            )
+        ]
+
+        self.assertFalse(
+            preserve_all(
+                frame_records,
+                suspect_extra_checked=True,
+                victory_detected=False,
+                result_unknown=False,
+            )
+        )
+
+    def test_level_memory_log_includes_working_set_and_private_memory(self):
+        with (
+            patch.object(
+                self.main,
+                "_process_memory_usage_mb",
+                return_value=(123.4, 234.5),
+            ),
+            patch.object(self.main.logger, "info") as info,
+            patch.object(self.main, "write_runtime_status") as write_status,
+        ):
+            self.main._log_level_memory(7)
+
+        info.assert_called_once_with(
+            "level %s memory: working_set=%.1f MB private=%.1f MB",
+            7,
+            123.4,
+            234.5,
+        )
+        write_status.assert_called_once_with(
+            memory_working_set_mb=123.4,
+            memory_private_mb=234.5,
+        )
 
     def test_loose_wreck_template_alone_does_not_promote_miss_to_hit(self):
         result = dummy_hit_result("miss")

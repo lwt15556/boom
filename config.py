@@ -20,8 +20,9 @@ SCREENSHOT_DIR = BASE_DIR / "_debug" / "screenshots"
 LOG_DIR = BASE_DIR / "_debug" / "logs"
 LOG_FILE = LOG_DIR / "bbma.log"
 OUTPUT_DIR = BASE_DIR / "outputs"
-MAX_PROBE_SAMPLE_DIRS: Final[int] = 120
-MAX_RED_SCOUT_SAMPLE_DIRS: Final[int] = 60
+MAX_PROBE_SAMPLE_DIRS: Final[int] = 20
+MAX_RED_SCOUT_SAMPLE_DIRS: Final[int] = 10
+MAX_SCREENSHOT_STORAGE_BYTES: Final[int] = 500 * 1024 * 1024
 
 
 # 目前支持的最大关卡

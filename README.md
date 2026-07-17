@@ -1,4 +1,5 @@
 # BoomBeachSonarAuto
+
 基于GameMainKH的海岛奇兵声呐潜艇自动化工具的二次开发
 
 基于 **Python、ADB、OpenCV 和 PyQt6** 的《海岛奇兵》声呐活动自动化工具。程序通过 ADB 控制安卓模拟器，识别声呐棋盘、潜艇残骸、侧栏进度和胜利界面，并使用带安全约束的断网事务执行蓝色炮弹探测或红色炮弹侦察。
@@ -11,7 +12,7 @@
 - 支持 `adb root`、`iptables` 和 `ip6tables` 的安卓模拟器
 - 单台设备，默认 ADB 地址为 `127.0.0.1:5555`
 
-> [!WARNING]
+> \[!WARNING]
 > 本项目仅用于个人学习、图像识别和自动化研究。自动化操作、模板误判、网络规则异常和游戏界面变化都可能造成炮弹消耗、任务中断或账号风险。项目不能承诺零损耗，使用者需要自行确认其使用方式符合适用法律、平台规则和服务条款。
 
 ## 零基础一键安装
@@ -33,7 +34,7 @@
 - 在模拟器设置中开启 Root、ADB 调试和本地 ADB 连接；
 - 将模拟器分辨率设为 `1280x720`；
 - 确认 ADB 地址为 `127.0.0.1:5555`；
-- 登录游戏，并停留在游戏主界面或声呐活动详情页。
+- 登录游戏，并停留在游戏主界面
 
 如果模拟器不是默认地址，脚本会列出检测到的其他设备，但不会在多设备场景下自动猜测目标。请修改 `config.py` 中的 `ADB_SERIAL` 后重新运行一键启动。
 
@@ -51,9 +52,7 @@
 - 蓝色离线探测和红色侦察在点击前都会验证 IPv4/IPv6 网络隔离状态。
 - 使用 `pending_probe.json`、DROP/REJECT 双规则、游戏进程退出确认和 `fail_closed` 状态保护待处理请求。
 - 使用进程生命周期锁保证 `main.py` 单实例运行，避免多个脚本同时操作模拟器。
-- 保存多帧识别证据、运行日志和命中图；探测证据默认只保留最近 120 个批次。
-
-
+- 保存多帧识别证据、运行日志和命中图；普通探测保留最近 20 个批次，红色侦察保留最近 10 个批次，截图证据合计最多 500 MB。
 
 ## 运行流程
 
@@ -83,17 +82,17 @@ flowchart TD
 
 ## 环境要求
 
-| 项目 | 要求 |
-| --- | --- |
-| 操作系统 | Windows 10/11 |
-| Python | 3.10 或更高版本，推荐 3.11 |
-| 模拟器分辨率 | `1280x720`，不要手动缩放活动棋盘 |
-| 模拟器版本 | 雷电模拟器9 |
-| ADB | 仓库已包含 Windows Platform Tools |
-| Root | `adb shell id -u` 必须输出 `0` |
-| 网络工具 | 模拟器内需要可用的 `iptables` 和 `ip6tables` |
-| 游戏版本 | 默认适配国服，国际服未验证 |
-| 游戏包名 | 默认 `com.tencent.tmgp.supercell.boombeach` |
+| 项目     | 要求                                        |
+| ------ | ----------------------------------------- |
+| 操作系统   | Windows 10/11                             |
+| Python | 3.10 或更高版本，推荐 3.11                        |
+| 模拟器分辨率 | `1280x720`，不要手动缩放活动棋盘                     |
+| 模拟器版本  | 雷电模拟器9                                    |
+| ADB    | 仓库已包含 Windows Platform Tools              |
+| Root   | `adb shell id -u` 必须输出 `0`                |
+| 网络工具   | 模拟器内需要可用的 `iptables` 和 `ip6tables`        |
+| 游戏版本   | 默认适配国服，国际服未验证                             |
+| 游戏包名   | 默认 `com.tencent.tmgp.supercell.boombeach` |
 
 普通真机通常无法满足 `adb root` 和网络规则要求。建议使用允许 ADB root 的安卓模拟器，并在模拟器设置中打开 Root、ADB 调试和本地 ADB 连接。
 
@@ -153,12 +152,13 @@ py -3.11 -m venv .venv
 启动程序前应满足以下条件：
 
 1. 游戏已经登录。
-2. 当前位于游戏主界面，或者已经进入声呐活动详情页。
+2. 当前位于游戏主界面，注意必须是原皮肤地图（有些皮肤的视角会高一些，不匹配）！！！
 3. 声呐活动入口可见。
 4. 模拟器分辨率为 `1280x720`。
 5. 活动棋盘没有被手动拖动、缩放或遮挡。
 
 ![alt text](<屏幕截图 2026-07-15 101010.png>)
+
 ### 5. 启动控制台
 
 推荐使用控制台启动主程序在IDE终端运行：
@@ -172,21 +172,22 @@ powershell -ExecutionPolicy Bypass -File .\run_control_panel.ps1
 ```powershell
 .\.venv\Scripts\python.exe tools\control_panel.py
 ```
+
 ![alt text](image.png)
 
 ## 控制台
 
 控制台是当前项目的主要操作入口，不包含当前截图预览，主要提供以下功能：
 
-| 功能 | 说明 |
-| --- | --- |
-| 启动程序 | 使用当前选择的炮弹模式启动 `main.py` |
-| 停止程序 | 安全停止主程序，处理待丢弃请求并恢复网络 |
-| 恢复网络 | 在确认主程序和游戏请求安全后清理 DROP/REJECT 规则 |
-| 检查模拟器 | 显示 ADB 设备、目标设备和 Root 状态 |
-| 实时日志 | 默认过滤截图和逐帧等待等高频日志，可切换详细日志 |
-| 当前状态 | 显示 PID、网络、阶段、关卡、当前格子和最近结果 |
-| 炸潜艇棋盘 | 显示真实命中、真实未命中、侦察结果、完整潜艇和安全区 |
+| 功能    | 说明                              |
+| ----- | ------------------------------- |
+| 启动程序  | 使用当前选择的炮弹模式启动 `main.py`         |
+| 停止程序  | 安全停止主程序，处理待丢弃请求并恢复网络            |
+| 恢复网络  | 在确认主程序和游戏请求安全后清理 DROP/REJECT 规则 |
+| 检查模拟器 | 显示 ADB 设备、目标设备和 Root 状态         |
+| 实时日志  | 默认过滤截图和逐帧等待等高频日志，可切换详细日志        |
+| 当前状态  | 显示 PID、网络、阶段、关卡、当前格子和最近结果       |
+| 炸潜艇棋盘 | 显示真实命中、真实未命中、侦察结果、完整潜艇和安全区      |
 
 程序运行期间不能修改炮弹模式和红色侦察次数。停止程序后才能开始新的配置。
 
@@ -228,7 +229,7 @@ powershell -ExecutionPolicy Bypass -File .\run_control_panel.ps1
 
 ### 红色侦察 + 蓝色攻击
 
-控制台可设置每关执行 `1..10` 次红色侦察。每次侦察执行以下流程：
+控制台可设置每关执行 `1..50 `次红色侦察。每次侦察执行以下流程：
 
 1. 断网并验证完整网络隔离。
 2. 记录红色炮弹区域的弹药指纹。
@@ -265,15 +266,15 @@ Remove-Item Env:BBMA_RED_SCOUT_COUNT -ErrorAction SilentlyContinue
 
 控制台棋盘使用以下状态：
 
-| 状态 | 含义 |
-| --- | --- |
-| 未探测 | 当前没有可靠结果 |
-| 侦察未命中 | 红色侦察认为该格没有潜艇，尚未使用蓝色炮弹确认 |
-| 侦察命中 | 红色侦察认为该格有潜艇，等待或正在使用蓝色炮弹确认 |
-| 未命中 | 蓝色炮弹已经确认该格没有潜艇 |
-| 已命中 | 蓝色炮弹已经确认该格命中潜艇 |
-| 完整潜艇 | 已根据连续命中、潜艇长度或侧栏进度确认完整潜艇 |
-| 安全区 | 完整潜艇周围一圈，不再投弹 |
+| 状态    | 含义                        |
+| ----- | ------------------------- |
+| 未探测   | 当前没有可靠结果                  |
+| 侦察未命中 | 红色侦察认为该格没有潜艇，尚未使用蓝色炮弹确认   |
+| 侦察命中  | 红色侦察认为该格有潜艇，等待或正在使用蓝色炮弹确认 |
+| 未命中   | 蓝色炮弹已经确认该格没有潜艇            |
+| 已命中   | 蓝色炮弹已经确认该格命中潜艇            |
+| 完整潜艇  | 已根据连续命中、潜艇长度或侧栏进度确认完整潜艇   |
+| 安全区   | 完整潜艇周围一圈，不再投弹             |
 
 当前目标格会使用额外边框标记。鼠标悬停棋盘格可以查看行、列和状态。
 
@@ -329,22 +330,24 @@ powershell -ExecutionPolicy Bypass -File .\stop_all.ps1
 
 常用配置位于 `config.py`：
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `ADB_SERIAL` | `127.0.0.1:5555` | 目标模拟器或设备序列号 |
-| `ADB_EXE` | `tools/platform-tools/adb.exe` | 仓库内置 ADB 路径 |
-| `GAME_PACKAGE_NAME` | `com.tencent.tmgp.supercell.boombeach` | 游戏包名 |
-| `MAX_LEVEL` | `50` | 自动任务允许处理的最大关卡 |
-| `DEFAULT_LEVEL` | `2` | 自动识别不可用时的备用关卡 |
-| `AUTO_DETECT_LEVEL` | `True` | 是否自动识别当前关卡 |
-| `REQUIRE_CONFIDENT_LEVEL_DETECTION` | `True` | 识别不确定时是否拒绝继续投弹 |
-| `LEVEL_GRID_SIZES` | 关卡映射 | 每关菱形棋盘边长 |
-| `SUBMARINES` | 关卡映射 | 每关潜艇长度列表 |
-| `USE_SAVED_POINTS` | `True` | 是否优先使用人工校准点位 |
-| `SAVED_POINTS_FILE` | `save_points/points.json` | 人工点位数据文件 |
-| `DEFAULT_MATCH_THRESHOLD` | `0.85` | 通用模板匹配阈值 |
-| `MAX_PROBE_SAMPLE_DIRS` | `120` | 最多保留的探测证据批次 |
-| `LOG_LEVEL` | `INFO` | 日志级别 |
+| 配置项                                 | 默认值                                    | 说明                      |
+| ----------------------------------- | -------------------------------------- | ----------------------- |
+| `ADB_SERIAL`                        | `127.0.0.1:5555`                       | 目标模拟器或设备序列号             |
+| `ADB_EXE`                           | `tools/platform-tools/adb.exe`         | 仓库内置 ADB 路径             |
+| `GAME_PACKAGE_NAME`                 | `com.tencent.tmgp.supercell.boombeach` | 游戏包名                    |
+| `MAX_LEVEL`                         | `50`                                   | 自动任务允许处理的最大关卡           |
+| `DEFAULT_LEVEL`                     | `2`                                    | 自动识别不可用时的备用关卡           |
+| `AUTO_DETECT_LEVEL`                 | `True`                                 | 是否自动识别当前关卡              |
+| `REQUIRE_CONFIDENT_LEVEL_DETECTION` | `True`                                 | 识别不确定时是否拒绝继续投弹          |
+| `LEVEL_GRID_SIZES`                  | 关卡映射                                   | 每关菱形棋盘边长                |
+| `SUBMARINES`                        | 关卡映射                                   | 每关潜艇长度列表                |
+| `USE_SAVED_POINTS`                  | `True`                                 | 是否优先使用人工校准点位            |
+| `SAVED_POINTS_FILE`                 | `save_points/points.json`              | 人工点位数据文件                |
+| `DEFAULT_MATCH_THRESHOLD`           | `0.85`                                 | 通用模板匹配阈值                |
+| `MAX_PROBE_SAMPLE_DIRS`             | `20`                                   | 最多保留的普通探测证据批次           |
+| `MAX_RED_SCOUT_SAMPLE_DIRS`         | `10`                                   | 最多保留的红色侦察证据批次           |
+| `MAX_SCREENSHOT_STORAGE_BYTES`      | `500 MB`                               | 普通探测、红色侦察和运行调试截图的合计容量上限 |
+| `LOG_LEVEL`                         | `INFO`                                 | 日志级别                    |
 
 修改分辨率、游戏版本或包名后，固定坐标和模板图片通常也需要重新校准。
 
@@ -382,15 +385,17 @@ powershell -ExecutionPolicy Bypass -File .\stop_all.ps1
 
 ## 输出文件
 
-| 路径 | 内容 |
-| --- | --- |
-| `_debug/logs/bbma.log` | 主程序日志 |
+| 路径                                  | 内容                         |
+| ----------------------------------- | -------------------------- |
+| `_debug/logs/bbma.log`              | 主程序日志                      |
 | `run_stdout.log` / `run_stderr.log` | PowerShell 或控制台启动时的标准输出和错误 |
-| `_debug/runtime/status.json` | 控制台读取的实时状态和棋盘数据 |
-| `_debug/runtime/pending_probe.json` | 待处理炮弹事务安全标记 |
-| `_debug/screenshots/run_debug/` | 红色选择、退出、弹药核验等流程截图 |
-| `_debug/screenshots/probes/` | 蓝色探测的多帧截图和 JSON 判断结果 |
-| `outputs/hit_map_level_<level>.png` | 每关结束时生成的命中图 |
+| `_debug/runtime/status.json`        | 控制台读取的实时状态和棋盘数据            |
+| `_debug/runtime/pending_probe.json` | 待处理炮弹事务安全标记                |
+| `_debug/screenshots/run_debug/`     | 红色选择、退出、弹药核验等流程截图          |
+| `_debug/screenshots/probes/`        | 蓝色探测的多帧截图和 JSON 判断结果       |
+| `outputs/hit_map_level_<level>.png` | 每关结束时生成的命中图                |
+
+识别成功时只保存代表性的 `before`、`after`、弹药核验和选择关键帧；最终结果为 `unknown` 或流程异常时保存全部帧。容量超限时从最旧的已完成样本开始清理，仍有待提交请求的当前样本不会被删除。主日志单文件达到 5 MB 后自动轮转，当前文件加 3 个历史文件，合计保留 4 个。每关结束时日志和运行状态会记录当前进程的 Working Set 与 Private Memory。
 
 运行日志、运行时状态、探测截图和输出图片默认不会提交到 Git。
 
@@ -458,11 +463,17 @@ powershell -ExecutionPolicy Bypass -File .\stop_all.ps1
 
 ## 常见问题
 
+### 没有使用原地图皮肤
+
+有些地图的视角会被拉高，以展示皮肤。
+
+导致识图和使用炮弹出现问题，请换回原皮肤
+
 ### 控制台启动后 `main.py` 很快退出
 
 常见原因包括：
 
-- 当前不在游戏主界面或声呐活动详情页；
+- 当前不在游戏主界面
 - ADB 设备未连接；
 - Root shell 不可用；
 - 当前关卡识别不够可信；

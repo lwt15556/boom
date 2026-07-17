@@ -1,4 +1,6 @@
 import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from config import LOG_FILE, LOG_LEVEL
 
@@ -6,6 +8,8 @@ from config import LOG_FILE, LOG_LEVEL
 _LOGGING_READY = False
 _RESET = "\033[0m"
 _DIM = "\033[2m"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 _LEVEL_COLORS = {
     logging.DEBUG: "\033[36m",    # 青色
     logging.INFO: "\033[32m",     # 绿色
@@ -28,6 +32,15 @@ class ColorFormatter(logging.Formatter):
         if record.exc_info:
             message = f"{message}\n{self.formatException(record.exc_info)}"
         return f"{_DIM}{time_text}{_RESET} {level_text} {name_text} | {message}"
+
+
+def build_file_handler(path: str | Path) -> RotatingFileHandler:
+    return RotatingFileHandler(
+        path,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
 
 
 def setup_logging(level: str | int | None = None) -> None:
@@ -60,7 +73,7 @@ def setup_logging(level: str | int | None = None) -> None:
     console_handler.setFormatter(console_formatter)
     console_handler.setLevel(log_level)
 
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler = build_file_handler(LOG_FILE)
     file_handler.setFormatter(file_formatter)
     file_handler.setLevel(log_level)
 

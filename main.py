@@ -21,6 +21,7 @@ from config import (
     MAX_LEVEL,
     MAX_PROBE_SAMPLE_DIRS,
     MAX_RED_SCOUT_SAMPLE_DIRS,
+    MAX_SCREENSHOT_STORAGE_BYTES,
     OUTPUT_DIR,
     REQUIRE_CONFIDENT_LEVEL_DETECTION,
     SCREENSHOT_DIR,
@@ -387,6 +388,7 @@ def _create_probe_sample_dir(level: int, cell: Cell, index: int) -> Path:
     sample_dir = PROBE_SAMPLE_DIR / f"level_{level}_cell_{index}_r{row}_c{col}_{timestamp}"
     sample_dir.mkdir(parents=True, exist_ok=True)
     _prune_probe_sample_dirs()
+    _prune_screenshot_storage(protected_paths=(sample_dir,))
     return sample_dir
 
 
@@ -404,7 +406,106 @@ def _create_red_scout_sample_dir(
     )
     sample_dir.mkdir(parents=True, exist_ok=True)
     _prune_red_scout_sample_dirs()
+    _prune_screenshot_storage(protected_paths=(sample_dir,))
     return sample_dir
+
+
+def _managed_screenshot_sample_dirs() -> list[tuple[int, int, Path]]:
+    managed: list[tuple[int, int, Path]] = []
+    roots = (
+        (PROBE_SAMPLE_DIR, lambda name: name.startswith("level_") and "_cell_" in name),
+        (
+            RED_SCOUT_SAMPLE_DIR,
+            lambda name: name.startswith("level_") and "_attempt_" in name,
+        ),
+    )
+    for directory, matches in roots:
+        try:
+            root = directory.resolve(strict=False)
+            children = tuple(directory.iterdir())
+        except (FileNotFoundError, OSError):
+            continue
+        for path in children:
+            try:
+                if (
+                    path.is_symlink()
+                    or not path.is_dir()
+                    or not matches(path.name)
+                    or path.resolve(strict=False).parent != root
+                ):
+                    continue
+                entries = tuple(path.iterdir())
+                if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+                    continue
+                size = sum(entry.stat().st_size for entry in entries)
+                managed.append((path.stat().st_mtime_ns, size, path))
+            except OSError:
+                continue
+    return managed
+
+
+def _run_debug_storage_bytes() -> int:
+    try:
+        return sum(
+            path.stat().st_size
+            for path in RUN_DEBUG_DIR.iterdir()
+            if path.is_file() and not path.is_symlink()
+        )
+    except (FileNotFoundError, OSError):
+        return 0
+
+
+def _prune_screenshot_storage(
+    max_bytes: int = MAX_SCREENSHOT_STORAGE_BYTES,
+    *,
+    protected_paths: Sequence[Path] = (),
+) -> None:
+    if max_bytes < 1:
+        return
+    protected = {
+        Path(path).resolve(strict=False)
+        for path in protected_paths
+    }
+    managed = _managed_screenshot_sample_dirs()
+    total_bytes = _run_debug_storage_bytes() + sum(size for _mtime, size, _path in managed)
+    if total_bytes <= max_bytes:
+        return
+
+    removed = 0
+    for _mtime, size, path in sorted(managed, key=lambda item: item[0]):
+        if total_bytes <= max_bytes:
+            break
+        if path.resolve(strict=False) in protected:
+            continue
+        try:
+            entries = tuple(path.iterdir())
+            if any(entry.is_symlink() or not entry.is_file() for entry in entries):
+                continue
+            for entry in entries:
+                entry.unlink()
+            path.rmdir()
+            total_bytes -= size
+            removed += 1
+        except OSError as exc:
+            logger.warning("failed to prune screenshot storage directory %s: %s", path, exc)
+    if removed:
+        logger.info(
+            "screenshot storage retention removed %s directories; remaining=%.1f MB limit=%.1f MB",
+            removed,
+            total_bytes / (1024 * 1024),
+            max_bytes / (1024 * 1024),
+        )
+
+
+def _compact_successful_red_scout_images(sample_dir: Path) -> None:
+    keep = {"selected.png"}
+    for prefix in ("before", "after", "verify"):
+        paths = sorted(sample_dir.glob(f"{prefix}_*.png"))
+        if paths:
+            keep.add(paths[(len(paths) - 1) // 2].name)
+    for path in sample_dir.glob("*.png"):
+        if path.name not in keep and path.is_file() and not path.is_symlink():
+            path.unlink()
 
 
 def _prune_red_scout_sample_dirs(
@@ -634,27 +735,10 @@ def _should_preserve_all_probe_images(
     *,
     suspect_extra_checked: bool,
     victory_detected: bool,
+    result_unknown: bool,
 ) -> bool:
-    if suspect_extra_checked or victory_detected or not frame_records:
-        return True
-    if any(bool(record.get("dynamic_hit_vetoed")) for record in frame_records):
-        return True
-    if any(bool(record.get("victory_banner")) for record in frame_records):
-        return True
-
-    states = {
-        str(result.get("state", ""))
-        for record in frame_records
-        if isinstance((result := record.get("result")), Mapping)
-    }
-    if len(states) != 1:
-        return True
-
-    sidebar_states = {
-        tuple(record.get("sidebar_completed_lengths", ()))
-        for record in frame_records
-    }
-    return len(sidebar_states) > 1
+    del frame_records, suspect_extra_checked, victory_detected
+    return bool(result_unknown)
 
 
 def _persist_probe_debug_images(
@@ -1320,6 +1404,7 @@ def _execute_red_scout_transaction(
     grid_clicked = False
     pending_marker_written = False
     sample_dir: Path | None = None
+    sample_failed = False
     analysis_executor: ThreadPoolExecutor | None = None
     analysis_future = None
     if attempt is not None:
@@ -1456,11 +1541,14 @@ def _execute_red_scout_transaction(
                     index=index,
                     attempt=attempt,
                 )
+                if analysis.valid and not analysis.unknown_cells and not analysis.invalid_reason:
+                    _compact_successful_red_scout_images(sample_dir)
             except OSError as exc:
                 logger.warning("could not write red scout analysis: %s", exc)
         _active_probe = None
         return analysis
     except Exception as exc:
+        sample_failed = True
         if analysis_future is not None:
             analysis_future.cancel()
         if analysis_executor is not None:
@@ -1504,6 +1592,15 @@ def _execute_red_scout_transaction(
             clear_pending_probe()
         _active_probe = None
         raise
+    finally:
+        if sample_dir is not None:
+            protected = (
+                (sample_dir,)
+                if sample_failed
+                or (transaction is not None and transaction.request_may_be_pending)
+                else ()
+            )
+            _prune_screenshot_storage(protected_paths=protected)
 
 
 def cleanup_reject_network(reason: str = "脚本退出") -> None:
@@ -3393,6 +3490,7 @@ def _execute_online_scout_hit(
         frame_records,
         suspect_extra_checked=suspect_extra_checked,
         victory_detected=victory_screenshot is not None,
+        result_unknown=uncertain,
     )
     _persist_probe_debug_images(
         sample_dir,
@@ -3599,6 +3697,7 @@ def _execute_probe_transaction(
     _active_probe = transaction
     x, y = point
     sample_dir: Path | None = None
+    sample_failed = False
     before_capture = None
     frame_captures: list[tuple[Path, object]] = []
     frame_records: list[dict] = []
@@ -3670,7 +3769,7 @@ def _execute_probe_transaction(
                 before_capture,
                 frame_captures,
                 frame_records,
-                preserve_all=True,
+                preserve_all=False,
             )
             _commit_hit_request_and_prepare_next_probe(transaction)
             clear_pending_probe()
@@ -3891,10 +3990,16 @@ def _execute_probe_transaction(
             hit, decision_reason = True, "victory_banner_frame"
         else:
             hit, decision_reason = decide_hit_from_frames(hit_results)
+        result_unknown = not hit and (
+            suspect_extra_checked
+            or hit_votes == 1
+            or any(_is_near_hit_frame(result) for result in hit_results)
+        )
         preserve_all_images = _should_preserve_all_probe_images(
             frame_records,
             suspect_extra_checked=suspect_extra_checked,
             victory_detected=victory_frame_detected,
+            result_unknown=result_unknown,
         )
         _persist_probe_debug_images(
             sample_dir,
@@ -3977,7 +4082,7 @@ def _execute_probe_transaction(
                 if level_complete or victory_frame_detected
                 else ProbeResult.HIT
             )
-        elif suspect_extra_checked or hit_votes == 1 or any(_is_near_hit_frame(result) for result in hit_results):
+        elif result_unknown:
             logger.warning(
                 "level %s cell %s result: unknown (%s); discarding request and retrying",
                 level,
@@ -4030,6 +4135,7 @@ def _execute_probe_transaction(
             )
         return probe_result
     except Exception as exc:
+        sample_failed = True
         if sample_dir is not None:
             try:
                 _persist_probe_debug_images(
@@ -4049,6 +4155,13 @@ def _execute_probe_transaction(
             )
         raise
     finally:
+        if sample_dir is not None:
+            protected = (
+                (sample_dir,)
+                if sample_failed or transaction.request_may_be_pending
+                else ()
+            )
+            _prune_screenshot_storage(protected_paths=protected)
         if transaction.phase in {ProbePhase.PREPARING, ProbePhase.COMPLETE}:
             _active_probe = None
         elif transaction.request_may_be_pending:
@@ -4590,6 +4703,71 @@ def resolve_next_level_with_retries(
     return None
 
 
+def _process_memory_usage_mb() -> tuple[float | None, float | None]:
+    if os.name != "nt":
+        return None, None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessMemoryCountersEx(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+                ("PrivateUsage", ctypes.c_size_t),
+            ]
+
+        counters = ProcessMemoryCountersEx()
+        counters.cb = ctypes.sizeof(counters)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(ProcessMemoryCountersEx),
+            wintypes.DWORD,
+        ]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        process = kernel32.GetCurrentProcess()
+        if not psapi.GetProcessMemoryInfo(
+            process,
+            ctypes.byref(counters),
+            counters.cb,
+        ):
+            return None, None
+        unit = 1024 * 1024
+        return counters.WorkingSetSize / unit, counters.PrivateUsage / unit
+    except (AttributeError, OSError, ValueError):
+        return None, None
+
+
+def _log_level_memory(level: int) -> None:
+    working_set, private = _process_memory_usage_mb()
+    if working_set is None or private is None:
+        logger.info("level %s memory: unavailable", level)
+        return
+    working_set = round(working_set, 1)
+    private = round(private, 1)
+    logger.info(
+        "level %s memory: working_set=%.1f MB private=%.1f MB",
+        level,
+        working_set,
+        private,
+    )
+    write_runtime_status(
+        memory_working_set_mb=working_set,
+        memory_private_mb=private,
+    )
+
+
 def main(level: int | None = None) -> Path | None:
     """执行自动探测流程并输出各关命中图。"""
     run_started_at = monotonic()
@@ -4616,6 +4794,7 @@ def main(level: int | None = None) -> Path | None:
         )
         _prune_probe_sample_dirs()
         _prune_red_scout_sample_dirs()
+        _prune_screenshot_storage()
         disable_weak_network()
 
         screenshot = adb.read_screenshot()
@@ -4649,6 +4828,7 @@ def main(level: int | None = None) -> Path | None:
             save_hit_map_image(base_img, quad, hit_map, out_path)
             logger.info("hit map: %s", hit_map)
             logger.info("hit map image saved: %s", out_path)
+            _log_level_memory(current_level)
             last_out_path = out_path
 
             if not level_completed:
