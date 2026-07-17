@@ -124,7 +124,7 @@ NEAR_HIT_MIN_S_DROP = 4.0
 NEAR_HIT_MIN_FRAMES = 3
 FAST_POLL_INTERVAL_SECONDS = 0.25
 PROBE_DROP_SETTLE_SECONDS = 0.2
-MISS_CONNECTION_DIALOG_WAIT_SECONDS = 8.0
+MISS_CONNECTION_DIALOG_WAIT_SECONDS = 15.0
 MISS_RETRY_BUTTON_WAIT_SECONDS = 4.0
 APP_STOP_TIMEOUT_SECONDS = 5.0
 APP_STOP_POLL_SECONDS = 0.1
@@ -163,6 +163,10 @@ _network_fail_closed_reason: str | None = None
 
 class RedScoutSafetyError(RuntimeError):
     pass
+
+
+class DiscardRecoveryError(ProbeProtocolError):
+    """The request is isolated and discarded, but the in-client retry flow stalled."""
 
 
 class ProbeResult(str, Enum):
@@ -1419,6 +1423,18 @@ def _execute_red_scout_transaction(
                 logger.error("could not update interrupted red probe marker: %s", marker_exc)
             if isinstance(exc, RedScoutSafetyError) and _network_fail_closed_reason is not None:
                 raise
+            if (
+                isinstance(exc, DiscardRecoveryError)
+                and transaction is not None
+                and transaction.phase is ProbePhase.REQUEST_DISCARDED
+                and bool(getattr(transaction, "red_request_discarded", False))
+            ):
+                reason = f"red scout discard recovery stalled: {exc}"
+                logger.critical(
+                    "%s; keeping DROP/REJECT and leaving the game process running",
+                    reason,
+                )
+                raise RedScoutSafetyError(reason) from exc
             _stop_and_latch_red_safety_failure(
                 f"red scout transaction interrupted: {exc}"
             )
@@ -3979,15 +3995,15 @@ def _discard_pending_request_and_prepare_next_probe(
         timeout=MISS_CONNECTION_DIALOG_WAIT_SECONDS,
     )
     if dialog is None:
-        raise ProbeProtocolError(
-            "未检测到连接中断弹窗；保留 DROP/REJECT 并停止自动探测"
-        )
+        reason = "未检测到连接中断弹窗；保留 DROP/REJECT、保持游戏运行并停止自动探测"
+        latch_network_fail_closed(reason)
+        raise DiscardRecoveryError(reason)
 
     retry = wait_until_retry_button(timeout=MISS_RETRY_BUTTON_WAIT_SECONDS)
     if retry is None:
-        raise ProbeProtocolError(
-            "连接中断弹窗已出现，但未检测到重试按钮；保留 DROP/REJECT 并停止自动探测"
-        )
+        reason = "连接中断弹窗已出现，但未检测到重试按钮；保留 DROP/REJECT、保持游戏运行并停止自动探测"
+        latch_network_fail_closed(reason)
+        raise DiscardRecoveryError(reason)
 
     transaction.advance(ProbePhase.LOGIN_RECOVERING)
     logger.info(

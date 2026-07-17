@@ -1754,6 +1754,65 @@ class MainFlowTest(unittest.TestCase):
         self.assertIsNotNone(self.main._active_probe)
         self.assertTrue(self.main._active_probe.request_may_be_pending)
 
+    def test_red_discard_recovery_timeout_keeps_game_process_running(self):
+        analysis = self._valid_red_result()
+
+        def discard_timeout(transaction):
+            transaction.advance(self.main.ProbePhase.REQUEST_DISCARDED)
+            transaction.red_request_discarded = True
+            self.main.latch_network_fail_closed("retry dialog timeout")
+            raise self.main.DiscardRecoveryError("retry dialog timeout")
+
+        with (
+            patch.object(
+                self.main,
+                "_capture_red_ammo_state",
+                return_value=("before", "fp", DummyMatch((10, 20))),
+            ),
+            patch.object(self.main, "_select_red_bomb", return_value=True),
+            patch.object(self.main, "_exit_activity_after_probe_click"),
+            patch.object(self.main, "_reenter_activity_for_probe_result", return_value=False),
+            patch.object(self.main, "_capture_red_result_frames", return_value=["after"]),
+            patch.object(
+                self.main,
+                "_analyze_red_result_with_baseline_consensus",
+                return_value=analysis,
+            ),
+            patch.object(
+                self.main,
+                "_discard_pending_request_and_prepare_next_probe",
+                side_effect=discard_timeout,
+            ),
+            patch.object(self.main, "write_pending_probe"),
+            patch.object(self.main, "update_pending_probe"),
+        ):
+            with self.assertRaisesRegex(
+                self.main.RedScoutSafetyError,
+                "discard recovery stalled",
+            ):
+                self.main._execute_red_scout_transaction(
+                    1,
+                    (1, 1),
+                    (100, 200),
+                    0,
+                    3,
+                    [(0, 0)] * 9,
+                )
+
+        package_name = self.main.GAME_PACKAGE_NAME
+        self.assertEqual(self.main._network_fail_closed_reason, "retry dialog timeout")
+        self.assertNotIn(("close_app", package_name), self.adb.calls)
+        self.assertNotIn(("open_app", package_name), self.adb.calls)
+        self.assertNotIn(
+            "wait_until_app_stopped",
+            [call[0] for call in self.adb.calls],
+        )
+        self.assertIsNotNone(self.main._active_probe)
+        self.assertEqual(
+            self.main._active_probe.phase,
+            self.main.ProbePhase.REQUEST_DISCARDED,
+        )
+
     def test_red_safety_stop_latches_before_failing_safety_operations(self):
         self.adb.enable_reject_network = Mock(side_effect=RuntimeError("reject failed"))
         self.adb.close_app = Mock(side_effect=RuntimeError("close failed"))
@@ -4238,6 +4297,7 @@ class MainFlowTest(unittest.TestCase):
         self.assertNotIn(("disable_weak_network", package_name), self.adb.calls)
         self.assertNotIn(("disable_reject_network", package_name), self.adb.calls)
         self.assertNotIn(("close_app", package_name), self.adb.calls)
+        self.assertIn("未检测到连接中断弹窗", self.main._network_fail_closed_reason)
 
     def test_miss_transaction_clicks_retry_instead_of_closing_app(self):
         waits = iter(
