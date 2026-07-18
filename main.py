@@ -297,6 +297,27 @@ def _resolve_false_hit_in_l_shape(
     evidence_by_cell: Mapping[Cell, Mapping[str, object]],
 ) -> Cell | None:
     block = set(l_shaped_block)
+
+    # For a screen-down-right ship, the raised red flag can color the cell
+    # directly above its upper endpoint.  In grid coordinates this produces
+    # one cell on the upper row and the real adjacent pair on the lower row.
+    rows: dict[int, set[Cell]] = {}
+    for cell in block:
+        rows.setdefault(cell[0], set()).add(cell)
+    if len(rows) == 2:
+        upper_row, lower_row = sorted(rows)
+        upper_cells = rows[upper_row]
+        lower_cells = rows[lower_row]
+        lower_cols = sorted(col for _, col in lower_cells)
+        if (
+            len(upper_cells) == 1
+            and len(lower_cells) == 2
+            and lower_row == upper_row + 1
+            and lower_cols[1] == lower_cols[0] + 1
+            and next(iter(upper_cells))[1] == lower_cols[0]
+        ):
+            return next(iter(upper_cells))
+
     removable: list[Cell] = []
     for candidate in sorted(block):
         remaining = block - {candidate}
@@ -1015,17 +1036,29 @@ def _merge_completed_visual_snapshot(
     latest_cells: set[Cell] | frozenset[Cell],
     *,
     completed_lengths: Sequence[int],
+    authoritative_cells: set[Cell] | frozenset[Cell] = frozenset(),
 ) -> set[Cell]:
     previous = set(previous_cells)
     latest = set(latest_cells)
+    authoritative = set(authoritative_cells)
     expected_cells = sum(
         int(length)
         for length in completed_lengths
         if int(length) > 0
     )
-    if expected_cells > 0 and len(latest) == expected_cells:
-        return latest
-    return previous
+    merged = latest if expected_cells > 0 and len(latest) == expected_cells else previous
+    if not authoritative:
+        return merged
+
+    conflicting = {
+        cell
+        for cell in merged - authoritative
+        if any(
+            max(abs(cell[0] - row), abs(cell[1] - col)) <= 1
+            for row, col in authoritative
+        )
+    }
+    return (merged - conflicting) | authoritative
 
 
 def enforce_positive_hit_evidence(
@@ -2988,6 +3021,7 @@ def _run_red_scout_and_blue_strategy(
         scan_kwargs.get("initial_completed_visual_hits") or set()
     )
     online_hit_evidence: dict[Cell, Mapping[str, object]] = {}
+    authoritative_completed_visual_hits: set[Cell] = set()
 
     def current_red_state_strategy() -> SubmarineStrategy:
         state_strategy = SubmarineStrategy(grid_size, submarines)
@@ -3217,6 +3251,7 @@ def _run_red_scout_and_blue_strategy(
                     online_completed_visual_hits,
                     latest_completed_visual_hits,
                     completed_lengths=completed_lengths,
+                    authoritative_cells=authoritative_completed_visual_hits,
                 )
             if hit:
                 proposed_hits = initial_real_hits | committed_hits | {cell}
@@ -3245,6 +3280,7 @@ def _run_red_scout_and_blue_strategy(
                                 l_shaped_block
                             )
                             online_completed_visual_hits.update(corrected_ship)
+                            authoritative_completed_visual_hits.update(corrected_ship)
                     else:
                         raise ProbeProtocolError(
                             "online scout-hit result creates an impossible L-shaped hit block "

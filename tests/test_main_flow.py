@@ -1725,6 +1725,33 @@ class MainFlowTest(unittest.TestCase):
             actual_ship,
         )
 
+    def test_down_right_l_shape_always_discards_the_upper_flag_cell(self):
+        l_hits = ((0, 5), (1, 5), (1, 6))
+        misleading_evidence = {
+            (0, 5): {
+                "stable_state": "hit",
+                "hit_votes": 7,
+                "frame_count": 7,
+            },
+            (1, 5): {
+                "stable_state": "hit",
+                "hit_votes": 3,
+                "frame_count": 4,
+            },
+            (1, 6): {
+                "stable_state": "unknown",
+                "hit_votes": 2,
+                "frame_count": 4,
+            },
+        }
+
+        false_cell = self.main._resolve_false_hit_in_l_shape(
+            l_hits,
+            misleading_evidence,
+        )
+
+        self.assertEqual(false_cell, (0, 5))
+
     def test_red_planner_progresses_covered_cells_and_resets_each_level(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
         centers = []
@@ -3840,6 +3867,21 @@ class MainFlowTest(unittest.TestCase):
         )
 
         self.assertEqual(merged, previous)
+
+    def test_authoritative_completed_ship_survives_a_conflicting_later_snapshot(self):
+        corrected_ship = {(9, 8), (9, 9)}
+        previous = corrected_ship | {(7, 3), (7, 4), (7, 5)}
+        latest = {(8, 8), (9, 8)} | {(7, 3), (7, 4), (7, 5)}
+
+        merged = self.main._merge_completed_visual_snapshot(
+            previous,
+            latest,
+            completed_lengths=(3, 2),
+            authoritative_cells=corrected_ship,
+        )
+
+        self.assertEqual(merged, previous)
+        self.assertNotIn((8, 8), merged)
 
     def test_consistent_incomplete_sidebar_frames_use_short_victory_wait(self):
         select_timeout = getattr(
