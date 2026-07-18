@@ -21,6 +21,11 @@ from utils.sidebar_progress import (
     newly_completed_lengths,
     resolve_completed_ship_cells,
 )
+from utils.wreck_detection import (
+    COMPLETED_SHIP_BODY_MIN_SCORE,
+    completed_ship_body_score,
+    detect_completed_submarine_candidate_cells,
+)
 
 
 Cell = tuple[int, int]
@@ -39,6 +44,85 @@ RED_SCOUT_RESULT_CELL_COUNT = 6
 RED_SCOUT_MISS_MIN_CHANGE = 0.88
 RED_SCOUT_MISS_MIN_VOTES = 3
 RED_SCOUT_MISS_FALLBACK_MIN_CHANGE = 0.60
+COMPLETED_SHIP_ENDPOINT_MIN_MARGIN = 0.08
+
+
+def _infer_completed_ship_endpoints(
+    body_candidates: set[Cell],
+    *,
+    unresolved_lengths: Sequence[int],
+    grid_size: int,
+    after_images: Sequence[np.ndarray],
+    points_by_cell: Mapping[Cell, tuple[int, int]],
+) -> set[Cell]:
+    inferred: set[Cell] = set()
+
+    def maximal_runs(values: set[int]) -> list[tuple[int, ...]]:
+        runs: list[tuple[int, ...]] = []
+        pending: list[int] = []
+        for value in sorted(values):
+            if pending and value != pending[-1] + 1:
+                runs.append(tuple(pending))
+                pending = []
+            pending.append(value)
+        if pending:
+            runs.append(tuple(pending))
+        return runs
+
+    for raw_length in unresolved_lengths:
+        length = int(raw_length)
+        if length < 3 or length > grid_size:
+            continue
+
+        endpoint_groups: list[tuple[Cell, ...]] = []
+        for row in range(grid_size):
+            columns = {col for candidate_row, col in body_candidates if candidate_row == row}
+            for run in maximal_runs(columns):
+                if len(run) != length - 1:
+                    continue
+                endpoints = tuple(
+                    cell
+                    for cell in ((row, run[0] - 1), (row, run[-1] + 1))
+                    if 0 <= cell[1] < grid_size and cell not in body_candidates
+                )
+                if endpoints:
+                    endpoint_groups.append(endpoints)
+        for col in range(grid_size):
+            rows = {row for row, candidate_col in body_candidates if candidate_col == col}
+            for run in maximal_runs(rows):
+                if len(run) != length - 1:
+                    continue
+                endpoints = tuple(
+                    cell
+                    for cell in ((run[0] - 1, col), (run[-1] + 1, col))
+                    if 0 <= cell[0] < grid_size and cell not in body_candidates
+                )
+                if endpoints:
+                    endpoint_groups.append(endpoints)
+
+        for endpoints in endpoint_groups:
+            scored = []
+            for cell in endpoints:
+                point = points_by_cell.get(cell)
+                if point is None:
+                    continue
+                scores = [
+                    float(completed_ship_body_score(image, point))
+                    for image in after_images
+                ]
+                if scores:
+                    scored.append((float(median(scores)), cell))
+            if not scored:
+                continue
+            scored.sort(reverse=True)
+            best_score, best_cell = scored[0]
+            second_score = scored[1][0] if len(scored) > 1 else 0.0
+            if (
+                best_score >= COMPLETED_SHIP_BODY_MIN_SCORE
+                and best_score - second_score >= COMPLETED_SHIP_ENDPOINT_MIN_MARGIN
+            ):
+                inferred.add(best_cell)
+    return inferred
 
 
 class ProbeMode(str, Enum):
@@ -392,6 +476,8 @@ class RedScoutAnalyzer:
             before_visible=before_visible,
             raw_stable_result_hits=raw_stable_result_hits,
             grid_size=grid_size,
+            points_by_cell=points_by_cell,
+            eligible_cells=candidates,
             diagnostics=completed_diagnostics,
         )
         diagnostics.update(completed_diagnostics)
@@ -410,6 +496,10 @@ class RedScoutAnalyzer:
         )
         if completed_ship is not None:
             stable_result_hits.update(completed_ship.new_hit_cells)
+            authoritative_states = tuple("hit" for _ in frames)
+            for cell in completed_ship.new_hit_cells:
+                median_change_by_cell.setdefault(cell, 1.0)
+                states_by_cell.setdefault(cell, authoritative_states)
         diagnostics["resolved_ship_hits"] = tuple(sorted(stable_result_hits))
 
         strong_result_misses = {
@@ -428,12 +518,34 @@ class RedScoutAnalyzer:
             affected = affected - before_visible
         diagnostics["affected_before_limit"] = tuple(sorted(affected))
         if len(affected) > RED_SCOUT_RESULT_CELL_COUNT:
-            diagnostics["stage"] = "limit_strong_cells"
-            return self._invalid_result(
-                result_center,
-                reason="too_many_strong_cells",
-                diagnostics=diagnostics,
+            if completed_ship is None:
+                diagnostics["stage"] = "limit_strong_cells"
+                return self._invalid_result(
+                    result_center,
+                    reason="too_many_strong_cells",
+                    diagnostics=diagnostics,
+                )
+            # Surfacing a completed ship changes its entire body, so authoritative
+            # ship hits may legitimately outnumber the bomb's six result cells.
+            remaining_slots = max(
+                0,
+                RED_SCOUT_RESULT_CELL_COUNT - len(stable_result_hits),
             )
+            selected_misses = set(
+                sorted(
+                    strong_result_misses,
+                    key=lambda cell: (
+                        -median_change_by_cell[cell],
+                        cell[0],
+                        cell[1],
+                    ),
+                )[:remaining_slots]
+            )
+            diagnostics["trimmed_strong_misses"] = tuple(
+                sorted(strong_result_misses - selected_misses)
+            )
+            strong_result_misses = selected_misses
+            affected = stable_result_hits | strong_result_misses
 
         consistent_misses: list[Cell] = []
         if len(affected) < RED_SCOUT_RESULT_CELL_COUNT:
@@ -568,6 +680,8 @@ class RedScoutAnalyzer:
         before_visible: set[Cell],
         raw_stable_result_hits: set[Cell],
         grid_size: int,
+        points_by_cell: Mapping[Cell, tuple[int, int]],
+        eligible_cells: set[Cell],
         diagnostics: dict[str, object] | None = None,
     ) -> _CompletedShipEvidence | None:
         details = diagnostics if diagnostics is not None else {}
@@ -577,6 +691,7 @@ class RedScoutAnalyzer:
                 "completed_lengths": (),
                 "resolved_ship_placements": (),
                 "completed_perimeter": (),
+                "completed_body_candidates": (),
                 "completed_ship_failure": None,
             }
         )
@@ -620,12 +735,72 @@ class RedScoutAnalyzer:
             details["completed_ship_failure"] = "insufficient_sidebar_votes"
             return None
 
+        click_points = [
+            points_by_cell[(row, col)]
+            for row in range(grid_size)
+            for col in range(grid_size)
+        ]
+        stable_body_candidates: set[Cell] = set()
+        try:
+            before_body_candidates = detect_completed_submarine_candidate_cells(
+                before_image,
+                click_points,
+                grid_size,
+            )
+            body_votes: Counter[Cell] = Counter()
+            for after_image in after_images:
+                body_votes.update(
+                    detect_completed_submarine_candidate_cells(
+                        after_image,
+                        click_points,
+                        grid_size,
+                    )
+                )
+            stable_body_candidates = {
+                cell
+                for cell, candidate_votes in body_votes.items()
+                if candidate_votes >= MINIMUM_FRAME_VOTES
+                and cell not in before_body_candidates
+            }
+        except Exception:
+            details["completed_body_detection_failed"] = True
+        details["completed_body_candidates"] = tuple(
+            sorted(stable_body_candidates)
+        )
+        details["completed_body_overrides"] = tuple(
+            sorted(stable_body_candidates - eligible_cells)
+        )
+
         resolution = resolve_completed_ship_cells(
-            before_visible | raw_stable_result_hits,
+            before_visible | raw_stable_result_hits | stable_body_candidates,
             completed_lengths,
             grid_size=grid_size,
             preferred_cells=raw_stable_result_hits - before_visible,
         )
+        inferred_endpoints: set[Cell] = set()
+        if resolution.unresolved_lengths:
+            inferred_endpoints = _infer_completed_ship_endpoints(
+                stable_body_candidates,
+                unresolved_lengths=resolution.unresolved_lengths,
+                grid_size=grid_size,
+                after_images=after_images,
+                points_by_cell=points_by_cell,
+            )
+            if inferred_endpoints:
+                resolution = resolve_completed_ship_cells(
+                    before_visible
+                    | raw_stable_result_hits
+                    | stable_body_candidates
+                    | inferred_endpoints,
+                    completed_lengths,
+                    grid_size=grid_size,
+                    preferred_cells=(
+                        raw_stable_result_hits
+                        - before_visible
+                        | inferred_endpoints
+                    ),
+                )
+        details["inferred_ship_endpoints"] = tuple(sorted(inferred_endpoints))
         details["resolved_ship_placements"] = resolution.placements
         details["unresolved_ship_lengths"] = resolution.unresolved_lengths
         details["discarded_ship_cells"] = tuple(sorted(resolution.discarded_cells))

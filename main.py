@@ -37,6 +37,7 @@ from utils.adaptive_frames import (
 )
 from utils.diamond_centers import detect_diamond_centers
 from utils.diamond_hit import classify_diamond_hit
+from utils.frame_stability import analyze_stable_hit, stable_hit_is_suspect
 from utils.hit_map import save_hit_map_image
 from utils.image_match import find_template_multi_scale
 from utils.level_recognition import recognize_level_from_screenshot
@@ -253,6 +254,91 @@ def merge_red_scout_observations(
     hits.update(incoming_hits)
     misses.difference_update(incoming_hits)
     misses.update(incoming_misses - hits)
+
+
+def _find_l_shaped_hit_block(
+    hit_cells: set[Cell] | frozenset[Cell],
+) -> tuple[Cell, ...] | None:
+    """Return three hits occupying an impossible L shape in a 2x2 block."""
+    hits = set(hit_cells)
+    candidate_origins = {
+        (row + row_offset, col + col_offset)
+        for row, col in hits
+        for row_offset in (-1, 0)
+        for col_offset in (-1, 0)
+    }
+    for row, col in sorted(candidate_origins):
+        block = {
+            (row, col),
+            (row, col + 1),
+            (row + 1, col),
+            (row + 1, col + 1),
+        }
+        occupied = block & hits
+        if len(occupied) == 3:
+            return tuple(sorted(occupied))
+    return None
+
+
+def _online_hit_evidence_score(metadata: Mapping[str, object]) -> tuple[int, float, int]:
+    stable_state = str(metadata.get("stable_state", "unknown"))
+    stable_rank = {"miss": -1, "unknown": 0, "hit": 1}.get(stable_state, 0)
+    try:
+        hit_votes = max(0, int(metadata.get("hit_votes", 0)))
+        frame_count = max(1, int(metadata.get("frame_count", 0)))
+    except (TypeError, ValueError):
+        hit_votes = 0
+        frame_count = 1
+    return stable_rank, hit_votes / frame_count, hit_votes
+
+
+def _resolve_false_hit_in_l_shape(
+    l_shaped_block: Sequence[Cell],
+    evidence_by_cell: Mapping[Cell, Mapping[str, object]],
+) -> Cell | None:
+    block = set(l_shaped_block)
+
+    # For a screen-down-right ship, the raised red flag can color the cell
+    # directly above its upper endpoint.  In grid coordinates this produces
+    # one cell on the upper row and the real adjacent pair on the lower row.
+    rows: dict[int, set[Cell]] = {}
+    for cell in block:
+        rows.setdefault(cell[0], set()).add(cell)
+    if len(rows) == 2:
+        upper_row, lower_row = sorted(rows)
+        upper_cells = rows[upper_row]
+        lower_cells = rows[lower_row]
+        lower_cols = sorted(col for _, col in lower_cells)
+        if (
+            len(upper_cells) == 1
+            and len(lower_cells) == 2
+            and lower_row == upper_row + 1
+            and lower_cols[1] == lower_cols[0] + 1
+            and next(iter(upper_cells))[1] == lower_cols[0]
+        ):
+            return next(iter(upper_cells))
+
+    removable: list[Cell] = []
+    for candidate in sorted(block):
+        remaining = block - {candidate}
+        if len(remaining) != 2:
+            continue
+        first, second = sorted(remaining)
+        if first[0] == second[0] or first[1] == second[1]:
+            removable.append(candidate)
+    if len(removable) != 2:
+        return None
+
+    ranked = sorted(
+        (
+            _online_hit_evidence_score(evidence_by_cell.get(cell, {})),
+            cell,
+        )
+        for cell in removable
+    )
+    if ranked[0][0] == ranked[1][0]:
+        return None
+    return ranked[0][1]
 
 
 def write_runtime_status(**updates: object) -> None:
@@ -709,13 +795,16 @@ def _save_probe_result_json(
     suspect_extra_checked: bool,
     decision_reason: str = "",
     adaptive_frames_stopped: bool = False,
+    result_unknown: bool = False,
+    stable_analysis: Mapping[str, object] | None = None,
 ) -> None:
+    decision = "unknown" if result_unknown else ("hit" if hit else "miss")
     payload = {
         "level": level,
         "cell": list(cell),
         "index": index,
         "point": list(point),
-        "decision": "hit" if hit else "miss",
+        "decision": decision,
         "hit_votes": hit_votes,
         "decision_reason": decision_reason,
         "frame_count": len(frames),
@@ -724,6 +813,8 @@ def _save_probe_result_json(
         "adaptive_frames_stopped": adaptive_frames_stopped,
         "frames": frames,
     }
+    if stable_analysis is not None:
+        payload["stable_analysis"] = dict(stable_analysis)
     (sample_dir / "result.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -816,6 +907,48 @@ def decide_hit_from_frames(hit_results: list) -> tuple[bool, str]:
     return False, f"hit_votes_{hit_votes}_near_{len(near_hits)}"
 
 
+def _analyze_stable_probe_frames(
+    before_img: np.ndarray,
+    frame_captures: Sequence[tuple[Path, object]],
+    point: tuple[int, int],
+):
+    after_images = [
+        capture.image
+        for _path, capture in frame_captures
+        if isinstance(getattr(capture, "image", None), np.ndarray)
+    ]
+    if len(after_images) < 3:
+        return None
+    try:
+        return analyze_stable_hit(before_img, after_images, point)
+    except Exception as exc:
+        logger.warning("stable probe analysis was unavailable: %s", exc)
+        return None
+
+
+def _stable_analysis_to_dict(analysis) -> dict[str, object] | None:
+    if analysis is None:
+        return None
+    return {
+        "suspect": stable_hit_is_suspect(analysis),
+        "result": _hit_result_to_dict(analysis.result),
+        "motion": {
+            "inner_ratio": float(analysis.motion.inner_ratio),
+            "outer_ratio": float(analysis.motion.outer_ratio),
+            "contrast": float(analysis.motion.contrast),
+        },
+        "registrations": [
+            {
+                "dx": float(item.dx),
+                "dy": float(item.dy),
+                "response": float(item.response),
+                "accepted": bool(item.accepted),
+            }
+            for item in analysis.registrations
+        ],
+    }
+
+
 def apply_wreck_template_confirmation(after_img: np.ndarray, point: tuple[int, int], result) -> bool:
     if red_hit_marker_visible(after_img, point):
         result.state = "hit"
@@ -856,6 +989,7 @@ def _trusted_completed_cells_from_probe_metadata(
     *,
     grid_size: int,
     anchor: Cell | None = None,
+    preferred_cells: set[Cell] | frozenset[Cell] = frozenset(),
 ) -> set[Cell]:
     screenshot = probe_metadata.get("sidebar_completion_screenshot")
     completed_lengths = tuple(
@@ -883,7 +1017,9 @@ def _trusted_completed_cells_from_probe_metadata(
         candidates,
         completed_lengths,
         grid_size=grid_size,
-        preferred_cells={anchor} if anchor is not None else set(),
+        preferred_cells=(
+            set(preferred_cells) | ({anchor} if anchor is not None else set())
+        ),
     )
     trusted = set(resolution.cells)
     logger.info(
@@ -893,6 +1029,36 @@ def _trusted_completed_cells_from_probe_metadata(
         sorted(resolution.discarded_cells),
     )
     return trusted
+
+
+def _merge_completed_visual_snapshot(
+    previous_cells: set[Cell] | frozenset[Cell],
+    latest_cells: set[Cell] | frozenset[Cell],
+    *,
+    completed_lengths: Sequence[int],
+    authoritative_cells: set[Cell] | frozenset[Cell] = frozenset(),
+) -> set[Cell]:
+    previous = set(previous_cells)
+    latest = set(latest_cells)
+    authoritative = set(authoritative_cells)
+    expected_cells = sum(
+        int(length)
+        for length in completed_lengths
+        if int(length) > 0
+    )
+    merged = latest if expected_cells > 0 and len(latest) == expected_cells else previous
+    if not authoritative:
+        return merged
+
+    conflicting = {
+        cell
+        for cell in merged - authoritative
+        if any(
+            max(abs(cell[0] - row), abs(cell[1] - col)) <= 1
+            for row, col in authoritative
+        )
+    }
+    return (merged - conflicting) | authoritative
 
 
 def enforce_positive_hit_evidence(
@@ -2847,28 +3013,59 @@ def _run_red_scout_and_blue_strategy(
     online_completed_visual_hits = set(
         scan_kwargs.get("initial_completed_visual_hits") or set()
     )
+    initial_completed_lengths = tuple(
+        int(length)
+        for length in (scan_kwargs.get("initial_completed_lengths") or ())
+    )
+    initial_completed_visual_hits = set(
+        scan_kwargs.get("initial_completed_visual_hits") or set()
+    )
+    online_hit_evidence: dict[Cell, Mapping[str, object]] = {}
+    authoritative_completed_visual_hits: set[Cell] = set()
 
-    def current_board_states() -> list[list[str]]:
-        display_strategy = SubmarineStrategy(grid_size, submarines)
+    def current_red_state_strategy() -> SubmarineStrategy:
+        state_strategy = SubmarineStrategy(grid_size, submarines)
         real_hits = initial_real_hits | committed_hits
         for cell in real_hits:
-            display_strategy.report_result(cell, True)
+            state_strategy.report_result(cell, True)
         for cell in committed_misses - real_hits:
-            display_strategy.report_result(cell, False)
+            state_strategy.report_result(cell, False)
         if scout_hits or scout_misses:
-            display_strategy.report_scout_results(
+            state_strategy.report_scout_results(
                 hits=scout_hits - real_hits,
                 misses=scout_misses - real_hits - committed_misses,
             )
-        if online_sidebar_completed_lengths:
-            display_strategy.reconcile_completed_lengths(
-                online_sidebar_completed_lengths,
-                observed_completed_cells=online_completed_visual_hits,
+        completed_lengths = (
+            online_sidebar_completed_lengths
+            if online_sidebar_completed_lengths
+            else initial_completed_lengths
+        )
+        completed_visual_hits = (
+            online_completed_visual_hits
+            if online_sidebar_completed_lengths
+            else initial_completed_visual_hits
+        )
+        if completed_lengths:
+            state_strategy.reconcile_completed_lengths(
+                completed_lengths,
+                observed_completed_cells=completed_visual_hits,
             )
+        return state_strategy
+
+    def current_board_states() -> list[list[str]]:
         return build_runtime_board_states(
-            display_strategy,
+            current_red_state_strategy(),
             grid_size,
         )
+
+    def current_forbidden_red_centers() -> set[Cell]:
+        states = current_red_state_strategy().get_cell_states()
+        return {
+            (row, col)
+            for row in range(grid_size)
+            for col in range(grid_size)
+            if states[row][col] != "unknown"
+        }
 
     def current_display_hit_count() -> int:
         initial_visual_count = scan_kwargs.get("initial_visual_hit_count")
@@ -2880,22 +3077,22 @@ def _run_red_scout_and_blue_strategy(
         return min(sum(submarines), base_count + len(committed_hits))
 
     for _ in range(settings.count):
-        known_cells = (
-            scout_hits
-            | scout_misses
-            | initial_real_hits
-            | committed_hits
-            | committed_misses
-        )
+        forbidden_centers = current_forbidden_red_centers()
         center = planner.choose_center(
             footprint,
-            known_cells=known_cells,
+            known_cells=forbidden_centers,
             covered_cells=covered,
             cell_scores={},
             excluded_centers=attempted_centers,
         )
         if center is None:
             break
+        explored_cells = forbidden_centers | covered
+        if center in explored_cells:
+            raise RedScoutSafetyError(
+                "red scout planner selected an already explored or otherwise "
+                f"non-unknown center: {center}"
+            )
         if center in attempted_centers:
             raise RedScoutSafetyError(
                 f"red scout planner repeated an already used center: {center}"
@@ -2909,7 +3106,7 @@ def _run_red_scout_and_blue_strategy(
             index,
             grid_size,
             click_points,
-            excluded_cells=(),
+            excluded_cells=explored_cells,
             learned_footprint=footprint,
             submarine_lengths=submarines,
             attempt=attempts_completed + 1,
@@ -3013,6 +3210,7 @@ def _run_red_scout_and_blue_strategy(
                 probe_metadata=probe_metadata,
                 activity_ready=True,
             )
+            online_hit_evidence[cell] = dict(probe_metadata)
             level_completed = _probe_result_completed_level(probe_result)
             hit = _probe_result_is_hit(probe_result)
 
@@ -3034,9 +3232,64 @@ def _run_red_scout_and_blue_strategy(
                     last_result=probe_result.value,
                 )
                 return True
+            completed_lengths = tuple(
+                int(length)
+                for length in probe_metadata.get("sidebar_completed_lengths", ())
+            )
+            if completed_lengths:
+                online_sidebar_completed_lengths = completed_lengths
+                latest_completed_visual_hits = (
+                    _trusted_completed_cells_from_probe_metadata(
+                        probe_metadata,
+                        click_points,
+                        grid_size=grid_size,
+                        anchor=cell,
+                        preferred_cells=online_completed_visual_hits,
+                    )
+                )
+                online_completed_visual_hits = _merge_completed_visual_snapshot(
+                    online_completed_visual_hits,
+                    latest_completed_visual_hits,
+                    completed_lengths=completed_lengths,
+                    authoritative_cells=authoritative_completed_visual_hits,
+                )
             if hit:
-                committed_hits.add(cell)
-                committed_misses.discard(cell)
+                proposed_hits = initial_real_hits | committed_hits | {cell}
+                l_shaped_block = _find_l_shaped_hit_block(proposed_hits)
+                if l_shaped_block is not None and cell in l_shaped_block:
+                    false_cell = _resolve_false_hit_in_l_shape(
+                        l_shaped_block,
+                        online_hit_evidence,
+                    )
+                    if false_cell is not None:
+                        corrected_ship = set(l_shaped_block) - {false_cell}
+                        logger.warning(
+                            "correcting impossible L-shaped hits %s from online evidence; "
+                            "keeping straight ship cells %s and discarding false hit %s",
+                            list(l_shaped_block),
+                            sorted(corrected_ship),
+                            false_cell,
+                        )
+                        initial_real_hits.discard(false_cell)
+                        committed_hits.discard(false_cell)
+                        committed_misses.add(false_cell)
+                        scout_hits.discard(false_cell)
+                        scout_misses.discard(false_cell)
+                        if online_completed_visual_hits & set(l_shaped_block):
+                            online_completed_visual_hits.difference_update(
+                                l_shaped_block
+                            )
+                            online_completed_visual_hits.update(corrected_ship)
+                            authoritative_completed_visual_hits.update(corrected_ship)
+                    else:
+                        raise ProbeProtocolError(
+                            "online scout-hit result creates an impossible L-shaped hit block "
+                            "that cannot be resolved from online hit evidence: "
+                            f"{list(l_shaped_block)}"
+                        )
+                if cell not in committed_misses:
+                    committed_hits.add(cell)
+                    committed_misses.discard(cell)
             elif probe_result is ProbeResult.MISS:
                 committed_misses.add(cell)
                 committed_hits.discard(cell)
@@ -3047,20 +3300,6 @@ def _run_red_scout_and_blue_strategy(
 
             scout_hits.discard(cell)
             scout_misses.discard(cell)
-            completed_lengths = tuple(
-                int(length)
-                for length in probe_metadata.get("sidebar_completed_lengths", ())
-            )
-            if completed_lengths:
-                online_sidebar_completed_lengths = completed_lengths
-                online_completed_visual_hits.update(
-                    _trusted_completed_cells_from_probe_metadata(
-                        probe_metadata,
-                        click_points,
-                        grid_size=grid_size,
-                        anchor=cell,
-                    )
-                )
             write_runtime_status(
                 phase="level_complete" if level_completed else "blue_online_scout_hits",
                 level=level,
@@ -3346,8 +3585,14 @@ def _execute_online_scout_hit(
             reason="online_scout_already_visible",
         )
         if probe_metadata is not None:
-            probe_metadata["online_committed"] = False
-            probe_metadata["already_visible"] = True
+            probe_metadata.update(
+                online_committed=False,
+                already_visible=True,
+                hit_votes=MIN_HIT_RESULT_VOTES,
+                frame_count=MIN_HIT_RESULT_VOTES,
+                stable_state="hit",
+                decision_reason="already_visible",
+            )
         return ProbeResult.HIT
 
     logger.info(
@@ -3478,6 +3723,10 @@ def _execute_online_scout_hit(
             capture_online_frame(extra_index, frame_delay)
         hit_votes = sum(1 for result in hit_results if result.state == "hit")
 
+    stable_analysis = _analyze_stable_probe_frames(before_img, frame_captures, point)
+    stable_suspect = (
+        stable_analysis is not None and stable_hit_is_suspect(stable_analysis)
+    )
     if victory_screenshot is not None:
         hit, decision_reason = True, "victory_banner_frame"
     else:
@@ -3485,6 +3734,7 @@ def _execute_online_scout_hit(
     uncertain = not hit and (
         hit_votes == 1
         or any(_is_suspect_hit_frame(result) for result in hit_results)
+        or stable_suspect
     )
     preserve_all_images = _should_preserve_all_probe_images(
         frame_records,
@@ -3511,6 +3761,8 @@ def _execute_online_scout_hit(
         suspect_extra_checked=suspect_extra_checked,
         decision_reason=decision_reason,
         adaptive_frames_stopped=adaptive_frames_stopped,
+        result_unknown=uncertain,
+        stable_analysis=_stable_analysis_to_dict(stable_analysis),
     )
 
     if uncertain:
@@ -3571,6 +3823,14 @@ def _execute_online_scout_hit(
     if probe_metadata is not None:
         probe_metadata.update(
             online_committed=True,
+            hit_votes=hit_votes,
+            frame_count=len(hit_results),
+            stable_state=(
+                str(stable_analysis.result.state)
+                if stable_analysis is not None
+                else "unknown"
+            ),
+            decision_reason=decision_reason,
             sidebar_newly_completed_lengths=tuple(sidebar_newly_completed),
             sidebar_completed_lengths=(
                 tuple(latest_sidebar_progress.completed_lengths)
@@ -3985,6 +4245,14 @@ def _execute_probe_transaction(
                 list(sidebar_newly_completed),
                 latest_sidebar_progress.completed_cells if latest_sidebar_progress is not None else "--",
             )
+        stable_analysis = _analyze_stable_probe_frames(
+            before_img,
+            frame_captures,
+            (x, y),
+        )
+        stable_suspect = (
+            stable_analysis is not None and stable_hit_is_suspect(stable_analysis)
+        )
         first_result = hit_results[0]
         if victory_frame_detected:
             hit, decision_reason = True, "victory_banner_frame"
@@ -3994,6 +4262,7 @@ def _execute_probe_transaction(
             suspect_extra_checked
             or hit_votes == 1
             or any(_is_near_hit_frame(result) for result in hit_results)
+            or stable_suspect
         )
         preserve_all_images = _should_preserve_all_probe_images(
             frame_records,
@@ -4040,6 +4309,8 @@ def _execute_probe_transaction(
             suspect_extra_checked=suspect_extra_checked,
             decision_reason=decision_reason,
             adaptive_frames_stopped=adaptive_frames_stopped,
+            result_unknown=result_unknown,
+            stable_analysis=_stable_analysis_to_dict(stable_analysis),
         )
         transaction.hit = hit
         transaction.advance(ProbePhase.RESULT_RECORDED)

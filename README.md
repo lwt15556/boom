@@ -229,6 +229,8 @@ powershell -ExecutionPolicy Bypass -File .\run_control_panel.ps1
 
 ### 红色侦察 + 蓝色攻击
 
+红色炮弹只会选择尚未探索的格子作为投弹中心。初始可见命中、之前红色侦察覆盖过的格子，以及已经由蓝色炮弹确认命中或未命中的格子都属于已探索区域；即使规划器异常返回这些格子，主流程也会在点击前拒绝执行红弹事务。
+
 控制台可设置每关执行 `1..50 `次红色侦察。每次侦察执行以下流程：
 
 1. 断网并验证完整网络隔离。
@@ -396,6 +398,25 @@ powershell -ExecutionPolicy Bypass -File .\stop_all.ps1
 | `outputs/hit_map_level_<level>.png` | 每关结束时生成的命中图                |
 
 识别成功时只保存代表性的 `before`、`after`、弹药核验和选择关键帧；最终结果为 `unknown` 或流程异常时保存全部帧。容量超限时从最旧的已完成样本开始清理，仍有待提交请求的当前样本不会被删除。主日志单文件达到 5 MB 后自动轮转，当前文件加 3 个历史文件，合计保留 4 个。每关结束时日志和运行状态会记录当前进程的 Working Set 与 Private Memory。
+
+### 探测样本标注和离线评测
+
+每个 `_debug/screenshots/probes/<样本目录>/` 可以增加一个不会覆盖程序结果的 `review.json`：
+
+```json
+{
+  "ground_truth": "hit",
+  "note": "多帧可见稳定残骸"
+}
+```
+
+`ground_truth` 只接受 `hit` 或 `miss`。完成一批人工标注后运行：
+
+```powershell
+.\.venv\Scripts\python.exe tools\evaluate_probe_samples.py
+```
+
+报告会输出已标注/未标注数量、假命中、漏命中、`unknown` 数量、命中精确率和召回率。程序还会对普通蓝弹结果生成配准后的时间中位数图像分析，并把局部变化、外围变化和配准质量写入 `result.json` 的 `stable_analysis`。稳定分析目前只会把可疑的 `miss` 提升为 `unknown`，不会单独产生 `hit`，避免在标注样本不足时增加假命中风险。
 
 运行日志、运行时状态、探测截图和输出图片默认不会提交到 Git。
 

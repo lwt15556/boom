@@ -259,7 +259,7 @@ def detect_completed_submarine_candidate_cells(
             for anchor in anchors
         ):
             continue
-        if _completed_ship_body_score(screenshot, point) >= COMPLETED_SHIP_BODY_MIN_SCORE:
+        if completed_ship_body_score(screenshot, point) >= COMPLETED_SHIP_BODY_MIN_SCORE:
             candidates.add(cell)
     return candidates
 
@@ -333,7 +333,7 @@ def _detect_completed_ship_anchor_cells(
     return anchors
 
 
-def _completed_ship_body_score(image: np.ndarray, point: tuple[int, int]) -> float:
+def completed_ship_body_score(image: np.ndarray, point: tuple[int, int]) -> float:
     x, y = point
     height, width = image.shape[:2]
     step = max(20, int(round(min(width / 1280.0, height / 720.0) * 48)))

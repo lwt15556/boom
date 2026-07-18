@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import json
 import os
 import sys
 import tempfile
@@ -106,6 +107,45 @@ def dummy_hit_result(state):
 
 
 class MainFlowTest(unittest.TestCase):
+    def test_probe_result_json_preserves_unknown_decision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_dir = self.main.Path(temp_dir)
+            self.main._save_probe_result_json(
+                sample_dir,
+                level=1,
+                cell=(0, 1),
+                index=1,
+                point=(640, 360),
+                hit=False,
+                hit_votes=0,
+                frames=[],
+                suspect_extra_checked=True,
+                result_unknown=True,
+            )
+            payload = json.loads((sample_dir / "result.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["decision"], "unknown")
+
+    def test_optional_stable_analysis_failure_does_not_abort_probe(self):
+        image = np.zeros((20, 20, 3), dtype=np.uint8)
+        captures = [
+            (self.main.Path(f"after_{index}.png"), FakeScreenshotCapture(image))
+            for index in range(3)
+        ]
+
+        with patch.object(
+            self.main,
+            "analyze_stable_hit",
+            side_effect=RuntimeError("analysis failed"),
+        ):
+            analysis = self.main._analyze_stable_probe_frames(
+                image,
+                captures,
+                (10, 10),
+            )
+
+        self.assertIsNone(analysis)
+
     def setUp(self):
         FakeAdb.instances.clear()
         self.utils = importlib.import_module("utils")
@@ -431,8 +471,16 @@ class MainFlowTest(unittest.TestCase):
 
         self.assertTrue(completed)
         self.assertEqual(execute.call_count, 3)
+        excluded_by_attempt = [
+            set(call.kwargs["excluded_cells"])
+            for call in execute.call_args_list
+        ]
+        self.assertEqual(excluded_by_attempt[0], set())
         self.assertTrue(
-            all(call.kwargs["excluded_cells"] == () for call in execute.call_args_list)
+            all(
+                {(1, 1), (1, 2)} <= excluded
+                for excluded in excluded_by_attempt[1:]
+            )
         )
         self.assertEqual(
             [call.kwargs["attempt"] for call in execute.call_args_list],
@@ -1486,6 +1534,223 @@ class MainFlowTest(unittest.TestCase):
             )
         execute.assert_not_called()
         scan.assert_called_once()
+
+    def test_red_phase_rejects_explored_center_before_transaction(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        explored = (1, 1)
+        with (
+            patch.object(
+                self.main.RedScoutPlanner,
+                "choose_center",
+                return_value=explored,
+            ),
+            patch.object(self.main, "_execute_red_scout_transaction") as execute,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True),
+        ):
+            with self.assertRaisesRegex(
+                self.main.RedScoutSafetyError,
+                "already explored",
+            ):
+                self.main._run_red_scout_and_blue_strategy(
+                    1,
+                    [[0] * 3 for _ in range(3)],
+                    [(0, 0)] * 9,
+                    [3],
+                    {explored},
+                    settings,
+                )
+
+        execute.assert_not_called()
+
+    def test_red_phase_rejects_completed_ship_safety_area(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        completed_ship = {(1, 1), (1, 2)}
+        safety_cell = (0, 1)
+        with (
+            patch.object(
+                self.main.RedScoutPlanner,
+                "choose_center",
+                return_value=safety_cell,
+            ),
+            patch.object(self.main, "_execute_red_scout_transaction") as execute,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True),
+        ):
+            with self.assertRaisesRegex(
+                self.main.RedScoutSafetyError,
+                "non-unknown",
+            ):
+                self.main._run_red_scout_and_blue_strategy(
+                    1,
+                    [[0] * 3 for _ in range(3)],
+                    [(0, 0)] * 9,
+                    [2],
+                    completed_ship,
+                    settings,
+                    initial_completed_lengths=(2,),
+                    initial_completed_visual_hits=completed_ship,
+                )
+
+        execute.assert_not_called()
+
+    def test_red_online_hits_stop_before_recording_impossible_l_shape(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        l_hits = frozenset({(1, 1), (1, 2), (2, 1)})
+        result = self.main.RedScoutResult(
+            center_cell=(0, 0),
+            affected_cells=l_hits,
+            hit_cells=l_hits,
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(frozenset(l_hits)),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in l_hits},
+        )
+
+        with (
+            patch.object(
+                self.main.RedScoutPlanner,
+                "choose_center",
+                return_value=(0, 0),
+            ),
+            patch.object(
+                self.main,
+                "_execute_red_scout_transaction",
+                return_value=result,
+            ),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy") as scan,
+        ):
+            with self.assertRaisesRegex(
+                self.main.ProbeProtocolError,
+                "L-shaped",
+            ):
+                self.main._run_red_scout_and_blue_strategy(
+                    1,
+                    [[0] * 3 for _ in range(3)],
+                    [(0, 0)] * 9,
+                    [3],
+                    set(),
+                    settings,
+                )
+
+        self.assertEqual(online_hit.call_count, 3)
+        scan.assert_not_called()
+
+    def test_completed_ship_geometry_corrects_false_hit_in_l_shape(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        l_hits = frozenset({(1, 1), (1, 2), (2, 2)})
+        visually_misplaced_ship = {(1, 1), (1, 2)}
+        actual_ship = {(1, 2), (2, 2)}
+        false_hit = (1, 1)
+        result = self.main.RedScoutResult(
+            center_cell=(0, 0),
+            affected_cells=l_hits,
+            hit_cells=l_hits,
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(frozenset(l_hits)),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in l_hits},
+        )
+
+        def online_hit(**kwargs):
+            evidence = {
+                (1, 1): (1, 7, "miss"),
+                (1, 2): (3, 3, "hit"),
+                (2, 2): (3, 4, "hit"),
+            }
+            hit_votes, frame_count, stable_state = evidence[kwargs["cell"]]
+            kwargs["probe_metadata"].update(
+                hit_votes=hit_votes,
+                frame_count=frame_count,
+                stable_state=stable_state,
+            )
+            if kwargs["cell"] == (1, 2):
+                kwargs["probe_metadata"].update(
+                    sidebar_completed_lengths=(2,),
+                    sidebar_completion_screenshot=np.zeros(
+                        (720, 1280, 3),
+                        dtype=np.uint8,
+                    ),
+                )
+            return self.main.ProbeResult.HIT
+
+        with (
+            patch.object(
+                self.main.RedScoutPlanner,
+                "choose_center",
+                return_value=(0, 0),
+            ),
+            patch.object(
+                self.main,
+                "_execute_red_scout_transaction",
+                return_value=result,
+            ),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                side_effect=online_hit,
+            ) as online,
+            patch.object(
+                self.main,
+                "_trusted_completed_cells_from_probe_metadata",
+                return_value=visually_misplaced_ship,
+            ),
+            patch.object(
+                self.main,
+                "_scan_level_by_strategy",
+                return_value=True,
+            ) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _ in range(3)],
+                [(0, 0)] * 9,
+                [2, 3],
+                set(),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(online.call_count, 3)
+        scan.assert_called_once()
+        self.assertEqual(scan.call_args.kwargs["initial_hits"], actual_ship)
+        self.assertEqual(scan.call_args.kwargs["initial_misses"], {false_hit})
+        self.assertEqual(
+            scan.call_args.kwargs["initial_completed_visual_hits"],
+            actual_ship,
+        )
+
+    def test_down_right_l_shape_always_discards_the_upper_flag_cell(self):
+        l_hits = ((0, 5), (1, 5), (1, 6))
+        misleading_evidence = {
+            (0, 5): {
+                "stable_state": "hit",
+                "hit_votes": 7,
+                "frame_count": 7,
+            },
+            (1, 5): {
+                "stable_state": "hit",
+                "hit_votes": 3,
+                "frame_count": 4,
+            },
+            (1, 6): {
+                "stable_state": "unknown",
+                "hit_votes": 2,
+                "frame_count": 4,
+            },
+        }
+
+        false_cell = self.main._resolve_false_hit_in_l_shape(
+            l_hits,
+            misleading_evidence,
+        )
+
+        self.assertEqual(false_cell, (0, 5))
 
     def test_red_planner_progresses_covered_cells_and_resets_each_level(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
@@ -3541,6 +3806,82 @@ class MainFlowTest(unittest.TestCase):
             )
 
         self.assertEqual(trusted, {(2, 1), (2, 2), (2, 3)})
+
+    def test_probe_metadata_preserves_previously_confirmed_two_cell_ship(self):
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        click_points = [(400 + index, 300 + index) for index in range(100)]
+        metadata = {
+            "sidebar_completion_screenshot": screenshot,
+            "sidebar_completed_lengths": (3, 2),
+        }
+        previous_ship = {(3, 4), (3, 5)}
+        candidates = previous_ship | {(2, 4), (4, 7), (4, 8), (4, 9)}
+
+        with patch.object(
+            self.main,
+            "detect_completed_submarine_candidate_cells",
+            return_value=candidates,
+        ):
+            trusted = self.main._trusted_completed_cells_from_probe_metadata(
+                metadata,
+                click_points,
+                grid_size=10,
+                anchor=(4, 8),
+                preferred_cells=previous_ship,
+            )
+
+        self.assertEqual(
+            trusted,
+            previous_ship | {(4, 7), (4, 8), (4, 9)},
+        )
+        self.assertNotIn((2, 4), trusted)
+
+    def test_complete_visual_snapshot_replaces_stale_two_cell_ship_assignment(self):
+        merge_snapshot = getattr(
+            self.main,
+            "_merge_completed_visual_snapshot",
+            None,
+        )
+        self.assertIsNotNone(merge_snapshot)
+        previous = {(3, 4), (3, 5)}
+        latest = {(2, 4), (3, 4)}
+
+        merged = merge_snapshot(previous, latest, completed_lengths=(2,))
+
+        self.assertEqual(merged, latest)
+        self.assertNotIn((3, 5), merged)
+
+    def test_incomplete_visual_snapshot_does_not_corrupt_previous_assignment(self):
+        merge_snapshot = getattr(
+            self.main,
+            "_merge_completed_visual_snapshot",
+            None,
+        )
+        self.assertIsNotNone(merge_snapshot)
+        previous = {(3, 4), (3, 5)}
+
+        merged = merge_snapshot(
+            previous,
+            {(2, 4)},
+            completed_lengths=(2,),
+        )
+
+        self.assertEqual(merged, previous)
+
+    def test_authoritative_completed_ship_survives_a_conflicting_later_snapshot(self):
+        corrected_ship = {(9, 8), (9, 9)}
+        previous = corrected_ship | {(7, 3), (7, 4), (7, 5)}
+        latest = {(8, 8), (9, 8)} | {(7, 3), (7, 4), (7, 5)}
+
+        merged = self.main._merge_completed_visual_snapshot(
+            previous,
+            latest,
+            completed_lengths=(3, 2),
+            authoritative_cells=corrected_ship,
+        )
+
+        self.assertEqual(merged, previous)
+        self.assertNotIn((8, 8), merged)
 
     def test_consistent_incomplete_sidebar_frames_use_short_victory_wait(self):
         select_timeout = getattr(
