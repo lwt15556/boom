@@ -10,6 +10,7 @@ import numpy as np
 
 import utils.red_scout as red_scout_module
 from utils.image_match import MatchResult
+from utils.sidebar_progress import SidebarProgress
 from utils.red_scout import (
     AmmoFingerprint,
     ProbeMode,
@@ -308,6 +309,184 @@ class RedScoutSettingsTest(unittest.TestCase):
 
 
 class RedScoutAnalyzerTest(unittest.TestCase):
+    def test_completed_ship_evidence_uses_full_body_candidates(self):
+        before = np.zeros((720, 1280, 3), dtype=np.uint8)
+        after_images = tuple(before.copy() for _ in range(4))
+        fleet = (2, 2, 3, 4, 5)
+        before_progress = SidebarProgress(active_lengths=fleet)
+        after_progress = SidebarProgress(
+            active_lengths=(2, 2, 4, 5),
+            completed_lengths=(3,),
+        )
+        ship = {(6, 1), (6, 2), (6, 3)}
+        visual_spill = {(5, 1), (5, 2)}
+        points_by_cell = {
+            (row, col): (400 + col * 10, 200 + row * 10)
+            for row in range(10)
+            for col in range(10)
+        }
+        diagnostics = {}
+
+        with (
+            patch.object(
+                red_scout_module,
+                "detect_sidebar_progress",
+                side_effect=[before_progress] + [after_progress] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "detect_completed_submarine_candidate_cells",
+                side_effect=[set()] + [ship | visual_spill] * 4,
+            ),
+        ):
+            evidence = red_scout_module.RedScoutAnalyzer._completed_ship_evidence(
+                before_image=before,
+                after_images=after_images,
+                submarine_lengths=fleet,
+                before_visible=set(),
+                raw_stable_result_hits=set(),
+                grid_size=10,
+                points_by_cell=points_by_cell,
+                eligible_cells=set(points_by_cell) - {(6, 1), (6, 3)},
+                diagnostics=diagnostics,
+            )
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence.new_hit_cells, frozenset(ship))
+        self.assertEqual(evidence.ship_cells, frozenset(ship))
+        self.assertEqual(diagnostics["completed_body_candidates"], tuple(sorted(ship | visual_spill)))
+        self.assertEqual(
+            diagnostics["completed_body_overrides"],
+            ((6, 1), (6, 3)),
+        )
+        self.assertEqual(diagnostics["discarded_ship_cells"], tuple(sorted(visual_spill)))
+
+    def test_completed_ship_hits_take_priority_over_excess_miss_noise(self):
+        footprint = red_scout_module.RedFootprint(frozenset({(0, 0)}))
+        ship = {(6, 1), (6, 2), (6, 3)}
+        noisy_misses = {
+            (0, 0): 0.99,
+            (1, 0): 0.98,
+            (2, 0): 0.97,
+            (3, 0): 0.96,
+            (4, 0): 0.95,
+        }
+        evidence = {
+            **{cell: (score, "miss") for cell, score in noisy_misses.items()},
+        }
+        analyzer = self._analyzer(
+            self._classifier_for(evidence),
+            hit_detector=lambda _image, _point: False,
+        )
+        completed = red_scout_module._CompletedShipEvidence(
+            new_hit_cells=frozenset(ship),
+            ship_cells=frozenset(ship),
+            perimeter_cells=frozenset(),
+        )
+
+        with patch.object(
+            analyzer,
+            "_completed_ship_evidence",
+            return_value=completed,
+        ):
+            result = analyzer.analyze(
+                before_image=self.BEFORE_IMAGE,
+                after_images=self.AFTER_IMAGES,
+                grid_size=10,
+                click_points=tuple(
+                    (row, col)
+                    for row in range(10)
+                    for col in range(10)
+                ),
+                center_cell=(5, 5),
+                excluded_cells=ship,
+                learned_footprint=footprint,
+                submarine_lengths=(2, 2, 3, 4, 5),
+            )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.hit_cells, frozenset(ship))
+        self.assertEqual(len(result.affected_cells), 6)
+        self.assertEqual(
+            result.miss_cells,
+            frozenset({(0, 0), (1, 0), (2, 0)}),
+        )
+
+    def test_multiple_completed_ships_survive_six_cell_result_limit(self):
+        footprint = red_scout_module.RedFootprint(frozenset({(0, 0)}))
+        completed_cells = {
+            (0, 2), (0, 3), (0, 4),
+            (3, 3), (4, 3), (5, 3), (6, 3),
+        }
+        sea_noise = (0, 6)
+        analyzer = self._analyzer(
+            self._classifier_for({sea_noise: (0.99, "miss")}),
+            hit_detector=lambda _image, _point: False,
+        )
+        completed = red_scout_module._CompletedShipEvidence(
+            new_hit_cells=frozenset(completed_cells),
+            ship_cells=frozenset(completed_cells),
+            perimeter_cells=frozenset(),
+        )
+
+        with patch.object(
+            analyzer,
+            "_completed_ship_evidence",
+            return_value=completed,
+        ):
+            result = analyzer.analyze(
+                before_image=self.BEFORE_IMAGE,
+                after_images=self.AFTER_IMAGES,
+                grid_size=10,
+                click_points=tuple(
+                    (row, col)
+                    for row in range(10)
+                    for col in range(10)
+                ),
+                center_cell=(6, 3),
+                excluded_cells=completed_cells,
+                learned_footprint=footprint,
+                submarine_lengths=(2, 2, 3, 4, 5),
+            )
+
+        self.assertTrue(result.valid)
+        self.assertIsNone(result.invalid_reason)
+        self.assertEqual(result.affected_cells, frozenset(completed_cells))
+        self.assertEqual(result.hit_cells, frozenset(completed_cells))
+        self.assertEqual(result.miss_cells, frozenset())
+        self.assertEqual(result.unknown_cells, frozenset())
+        self.assertEqual(result.diagnostics["trimmed_strong_misses"], (sea_noise,))
+
+    def test_completed_ship_infers_stronger_missing_endpoint(self):
+        candidates = {(1, 4), (2, 4), (3, 4), (4, 4)}
+        points_by_cell = {
+            (row, col): (row, col)
+            for row in range(10)
+            for col in range(10)
+        }
+        frames = tuple(np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(4))
+
+        def body_score(_image, point):
+            return {
+                (0, 4): 0.06,
+                (5, 4): 0.31,
+            }.get(point, 0.0)
+
+        with patch.object(
+            red_scout_module,
+            "completed_ship_body_score",
+            side_effect=body_score,
+        ):
+            inferred = red_scout_module._infer_completed_ship_endpoints(
+                candidates,
+                unresolved_lengths=(5,),
+                grid_size=10,
+                after_images=frames,
+                points_by_cell=points_by_cell,
+            )
+
+        self.assertEqual(inferred, {(5, 4)})
+
     GRID_SIZE = 5
     CLICK_POINTS = tuple(
         (row, col)
