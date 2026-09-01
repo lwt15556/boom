@@ -136,6 +136,7 @@ RESULT_NAMES = {
 BOARD_STATE_NAMES = {
     "scout_miss": "侦察未命中",
     "scout_hit": "侦察命中",
+    "visual_candidate": "视觉候选",
     "unknown": "未探测",
     "miss": "未命中",
     "hit": "已命中",
@@ -145,6 +146,7 @@ BOARD_STATE_NAMES = {
 BOARD_STATE_COLORS = {
     "scout_miss": QColor("#aab7be"),
     "scout_hit": QColor("#d9822b"),
+    "visual_candidate": QColor("#e7b84b"),
     "unknown": QColor("#d9e7ed"),
     "miss": QColor("#718793"),
     "hit": QColor("#d34f4f"),
@@ -178,6 +180,35 @@ def format_red_scout_progress(
     )
 
 
+def overlay_visual_candidates(
+    board_states: object,
+    visual_candidates: object,
+) -> object:
+    """Overlay unverified visual hints without replacing real board states."""
+    if not isinstance(board_states, list) or not board_states:
+        return board_states
+    size = len(board_states)
+    if not all(isinstance(row, list) and len(row) == size for row in board_states):
+        return board_states
+
+    normalized = [list(row) for row in board_states]
+    if not isinstance(visual_candidates, (list, tuple, set)):
+        return normalized
+    for raw_cell in visual_candidates:
+        try:
+            row, col = raw_cell
+            row, col = int(row), int(col)
+        except (TypeError, ValueError, IndexError):
+            continue
+        if (
+            0 <= row < size
+            and 0 <= col < size
+            and normalized[row][col] == "unknown"
+        ):
+            normalized[row][col] = "visual_candidate"
+    return normalized
+
+
 def build_main_environment(mode: object, red_count: object) -> dict[str, str]:
     normalized = str(mode) if str(mode) in PROBE_MODE_NAMES else "blue_only"
     try:
@@ -206,6 +237,31 @@ def format_runtime(started_at: object, *, now: datetime | None = None) -> str:
     except (TypeError, ValueError, OverflowError):
         return "--"
     return format_elapsed(elapsed)
+
+
+def format_phase_timing(
+    phase: object,
+    phase_started_at: object,
+    phase_history: object,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Render the active phase and recent completed phase durations."""
+    current_elapsed = format_runtime(phase_started_at, now=now)
+    current = f"当前 {format_phase(phase)} {current_elapsed}"
+    if not isinstance(phase_history, list):
+        return current
+
+    completed: list[str] = []
+    for item in phase_history[-3:]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            seconds = max(0.0, float(item.get("seconds", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        completed.append(f"{format_phase(item.get('phase'))} {format_elapsed(seconds)}")
+    return current if not completed else f"{current}\n最近：{' · '.join(completed)}"
 
 
 def run_command(command: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -573,6 +629,21 @@ class SonarBoardWidget(QWidget):
                     painter.setPen(Qt.PenStyle.NoPen)
                     painter.setBrush(QColor("#ffffff"))
                     painter.drawPolygon(QPolygonF([QPointF(center_x, center_y - marker_size), QPointF(center_x + marker_size, center_y), QPointF(center_x, center_y + marker_size), QPointF(center_x - marker_size, center_y)]))
+                elif state == "visual_candidate":
+                    # A hollow amber diamond distinguishes a screenshot hint
+                    # from a committed blue hit without implying a result.
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.setPen(QPen(QColor("#8a6412"), max(1.2, marker_size * 0.45)))
+                    painter.drawPolygon(
+                        QPolygonF(
+                            [
+                                QPointF(center_x, center_y - marker_size),
+                                QPointF(center_x + marker_size, center_y),
+                                QPointF(center_x, center_y + marker_size),
+                                QPointF(center_x - marker_size, center_y),
+                            ]
+                        )
+                    )
                 elif state == "hit":
                     painter.setPen(Qt.PenStyle.NoPen)
                     painter.setBrush(QColor("#ffffff"))
@@ -1384,7 +1455,12 @@ class ControlPanel(QMainWindow):
         self._set_progress(self.shot_progress, shots_done, total_cells)
         self._set_progress(self.hit_progress, hits, total_ship_cells)
         self._set_progress(self.ship_progress, confirmed_ships, total_ships)
-        self.update_board_status(level, board_states, current_cell)
+        self.update_board_status(
+            level,
+            board_states,
+            current_cell,
+            self.runtime_status.get("visual_candidates", []),
+        )
         self.update_recent_results()
         self.update_controls(running=running)
 
@@ -1403,11 +1479,19 @@ class ControlPanel(QMainWindow):
         level: object,
         board_states: object,
         current_cell: object,
+        visual_candidates: object = None,
     ) -> None:
-        self.board_widget.set_board(board_states, current_cell)
+        # Candidate cells come from the first static screenshot and are not
+        # strategy shots yet. Overlay them only on still-unknown cells so a
+        # later blue result (hit/miss) always wins in the display.
+        normalized_states = overlay_visual_candidates(
+            board_states,
+            visual_candidates,
+        )
+        self.board_widget.set_board(normalized_states, current_cell)
         if self.board_widget.board_size == 0:
             self.board_level_label.setText("等待任务")
-            self.board_summary_label.setText("未探测 --  ·  未命中 --\n已命中 --  ·  完整潜艇 --\n侦察未命中 --  ·  侦察命中 --")
+            self.board_summary_label.setText("未探测 --  ·  视觉候选 --\n未命中 --  ·  已命中 --\n完整潜艇 --  ·  侦察未命中 --  ·  侦察命中 --")
             return
 
         size = self.board_widget.board_size
@@ -1417,9 +1501,9 @@ class ControlPanel(QMainWindow):
         counts = self.board_widget.state_counts()
         self.board_summary_label.setText(
             f"{current_text}\n"
-            f"未探测 {counts['unknown']}  ·  未命中 {counts['miss']}\n"
-            f"已命中 {counts['hit']}  ·  完整潜艇 {counts['ship']}\n"
-            f"安全区 {counts['blocked']}\n"
+            f"未探测 {counts['unknown']}  ·  视觉候选 {counts['visual_candidate']}\n"
+            f"未命中 {counts['miss']}  ·  已命中 {counts['hit']}\n"
+            f"完整潜艇 {counts['ship']}  ·  安全区 {counts['blocked']}\n"
             f"侦察未命中 {counts['scout_miss']}  ·  侦察命中 {counts['scout_hit']}"
         )
 

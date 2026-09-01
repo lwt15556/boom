@@ -1,4 +1,5 @@
 import atexit
+import hashlib
 import json
 import os
 import signal
@@ -71,7 +72,6 @@ from utils.pending_probe import (
 from utils.runtime_lock import AlreadyRunningError, acquire_main_lock, release_main_lock
 from utils.sidebar_progress import (
     SidebarProgress,
-    calculate_visible_hit_count,
     detect_partial_wreck_cells,
     detect_sidebar_progress,
     merge_confirmed_hit_count,
@@ -87,14 +87,18 @@ from utils.submarine_strategy import (
 )
 from utils.wreck_detection import (
     COMPLETED_SHIP_BODY_MIN_SCORE,
+    SurfaceWaterBaseline,
+    build_surface_water_baseline,
     completed_ship_body_score,
     detect_completed_submarine_candidate_cells,
     detect_red_submarine_marker_cells,
     VISIBLE_WRECK_TEMPLATES,
     detect_visible_wreck_cells,
     grid_cell_polygon,
+    is_title_occluded_cell,
     red_hit_marker_visible,
     red_submarine_marker_visible,
+    surface_reflection_detected,
     visible_wreck_static_detected,
 )
 from utils.red_scout import (
@@ -141,6 +145,10 @@ RED_SCOUT_RESULT_FRAME_DELAYS = (0.55, 0.15, 0.20)
 # vote requirement prevents a single potentially stale frame from becoming a
 # false positive while retaining the existing three-frame capture schedule.
 RED_SCOUT_MIN_ANALYSIS_FRAMES = 2
+# A freshly entered board can contain a moving water highlight.  Capture a
+# short pre-click baseline so static recognition can distinguish that motion
+# from a compact wreck without adding a full probe transaction.
+INITIAL_SURFACE_BASELINE_FRAME_DELAYS = (0.12, 0.16)
 # Online blue shots already have a confirmed target from the red scout. Keep
 # the same number of evidence frames, but sample the result sooner so the next
 # confirmed target is not delayed by the generic offline-probe timing.
@@ -190,6 +198,12 @@ ACTIVITY_DETAIL_WAIT_SECONDS = 8.0
 ACTIVITY_EXIT_WAIT_SECONDS = 1.0
 ACTIVITY_EXIT_STABLE_FRAMES = 2
 ACTIVITY_EXIT_CLICK_ATTEMPTS = 5
+# A victory banner can be observed by several recovery paths while the same
+# transition is still settling. Keep one bounded guard so an old frame cannot
+# tap the first cell of the next board.
+VICTORY_REPEAT_GUARD_SECONDS = 3.0
+VICTORY_CLEAR_CONFIRM_TIMEOUT_SECONDS = 0.8
+VICTORY_CLEAR_CONFIRM_POLL_SECONDS = 0.1
 ONLINE_SCOUT_NETWORK_SETTLE_SECONDS = 0.3
 ONLINE_SCOUT_BLUE_SELECT_SETTLE_SECONDS = 0.25
 ONLINE_SCOUT_BLUE_SELECT_FAST_SETTLE_SECONDS = 0.1
@@ -215,7 +229,13 @@ LEVEL_STATE_FILE = RUNTIME_DIR / "level_state.json"
 _weak_network_cleanup_done = False
 _active_probe: "ProbeTransaction | None" = None
 _runtime_status: dict[str, object] = {}
+_active_phase_started_at: float | None = None
+_active_phase_name: str | None = None
+MAX_PHASE_TIMING_HISTORY = 8
 _network_fail_closed_reason: str | None = None
+_victory_last_fingerprint: str | None = None
+_victory_last_screenshot_id: int | None = None
+_victory_last_click_at: float | None = None
 
 
 class RedScoutSafetyError(RuntimeError):
@@ -519,6 +539,47 @@ def _find_flag_overlap_l_shape(
 
 def write_runtime_status(**updates: object) -> None:
     """Write lightweight machine-readable status for the control panel."""
+    global _active_phase_name, _active_phase_started_at
+    global _victory_last_fingerprint, _victory_last_screenshot_id, _victory_last_click_at
+
+    next_phase = updates.get("phase")
+    is_new_run = "started_at" in updates
+    now_monotonic = monotonic()
+    if is_new_run:
+        _active_phase_name = None
+        _active_phase_started_at = None
+        _victory_last_fingerprint = None
+        _victory_last_screenshot_id = None
+        _victory_last_click_at = None
+        updates["phase_history"] = []
+
+    if isinstance(next_phase, str) and next_phase:
+        if _active_phase_name is None:
+            _active_phase_name = next_phase
+            _active_phase_started_at = now_monotonic
+            updates["phase_started_at"] = datetime.now().isoformat(timespec="seconds")
+            updates["phase_elapsed_seconds"] = 0.0
+        elif next_phase != _active_phase_name:
+            elapsed = max(0.0, now_monotonic - (_active_phase_started_at or now_monotonic))
+            history = list(_runtime_status.get("phase_history", []))
+            history.append(
+                {
+                    "phase": _active_phase_name,
+                    "seconds": round(elapsed, 1),
+                }
+            )
+            updates["phase_history"] = history[-MAX_PHASE_TIMING_HISTORY:]
+            logger.info("阶段耗时 phase=%s elapsed=%.3fs", _active_phase_name, elapsed)
+            _active_phase_name = next_phase
+            _active_phase_started_at = now_monotonic
+            updates["phase_started_at"] = datetime.now().isoformat(timespec="seconds")
+            updates["phase_elapsed_seconds"] = 0.0
+        else:
+            updates["phase_elapsed_seconds"] = round(
+                max(0.0, now_monotonic - (_active_phase_started_at or now_monotonic)),
+                1,
+            )
+
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     _runtime_status.update(updates)
     _runtime_status["updated_at"] = datetime.now().isoformat(timespec="seconds")
@@ -1167,6 +1228,9 @@ def _visible_wreck_for_hit_state(
     cell: Cell | None = None,
     cell_polygon: np.ndarray | None = None,
     require_strong_body: bool = False,
+    surface_baseline: SurfaceWaterBaseline | None = None,
+    relative_position: tuple[float, float] | None = None,
+    grid_size: int | None = None,
 ) -> bool:
     """Return real static-wreck evidence, excluding submarine decorations.
 
@@ -1189,6 +1253,10 @@ def _visible_wreck_for_hit_state(
         # do not let the wide local marker radius suppress its neighbor.
         ignore_submarine_marker=(red_marker_cells is not None and cell is not None),
         cell_polygon=cell_polygon,
+        surface_baseline=surface_baseline,
+        relative_position=relative_position,
+        cell=cell,
+        grid_size=grid_size,
     )
     if not visible or not require_strong_body:
         return visible
@@ -1210,7 +1278,16 @@ def _visible_wreck_for_hit_state(
 
 
 def apply_wreck_template_confirmation(after_img: np.ndarray, point: tuple[int, int], result) -> bool:
-    if not visible_wreck_static_detected(after_img, point):
+    # This is a post-click result frame.  The broad white explosion animation
+    # can resemble the moving water highlight, so the pre-click glare veto is
+    # intentionally disabled here.  Template/shape and paired-frame evidence
+    # still have to pass before the result can be promoted.
+    if not visible_wreck_static_detected(
+        after_img,
+        point,
+        filter_surface_reflection=False,
+        filter_activity_title_overlay=False,
+    ):
         return False
 
     result.state = "hit"
@@ -2478,6 +2555,8 @@ def reset_runtime_level_status(level: int) -> None:
         sidebar_newly_completed_lengths=[],
         initial_visual_hits=0,
         mapped_visual_hits=0,
+        visual_candidate_count=0,
+        visual_candidates=[],
         unmapped_visual_hits=0,
         board_size=grid_size,
         board_states=[
@@ -2590,6 +2669,89 @@ def get_click_points(
     return grid_result.points, grid_result.global_quad
 
 
+def _capture_surface_water_baseline(
+    initial_frame: np.ndarray,
+) -> SurfaceWaterBaseline | None:
+    """Capture a short pre-click baseline for reflection filtering.
+
+    The first frame is always retained for level/sidebar recognition.  Extra
+    captures are best-effort: a transient ADB read failure must not turn a
+    usable board into a hard failure, but it is logged so the run can be
+    diagnosed from the raw log.
+    """
+
+    frames: list[np.ndarray] = [initial_frame]
+    if not isinstance(initial_frame, np.ndarray):
+        return None
+    for delay_seconds in INITIAL_SURFACE_BASELINE_FRAME_DELAYS:
+        try:
+            adb.delay(delay_seconds)
+            frame = adb.read_screenshot()
+        except Exception as exc:
+            logger.warning(
+                "surface baseline frame failed after %.2fs: %s",
+                delay_seconds,
+                exc,
+            )
+            continue
+        if (
+            isinstance(frame, np.ndarray)
+            and frame.ndim == 3
+            and frame.shape == initial_frame.shape
+        ):
+            frames.append(frame)
+    baseline = build_surface_water_baseline(frames)
+    if baseline is not None:
+        logger.info(
+            "surface water baseline captured: frames=%s shape=%s",
+            baseline.frame_count,
+            tuple(baseline.median_gray.shape),
+        )
+    else:
+        logger.warning("surface water baseline unavailable; static filtering is spatial-only")
+    return baseline
+
+
+def _remove_surface_reflection_candidates(
+    image: np.ndarray,
+    click_points: Sequence[tuple[int, int]],
+    cells: set[Cell],
+    grid_size: int,
+    *,
+    baseline: SurfaceWaterBaseline | None,
+) -> set[Cell]:
+    """Drop cells dominated by broad water highlights from visual candidates."""
+
+    if not cells:
+        return set()
+    kept: set[Cell] = set()
+    for cell in cells:
+        row, col = cell
+        index = row * grid_size + col
+        if not (0 <= index < len(click_points)):
+            continue
+        relative_position = (
+            row / max(1, grid_size - 1),
+            col / max(1, grid_size - 1),
+        )
+        reflection = surface_reflection_detected(
+            image,
+            click_points[index],
+            baseline=baseline,
+            cell_polygon=grid_cell_polygon(click_points, index, grid_size),
+            relative_position=relative_position,
+        )
+        if reflection:
+            logger.info(
+                "surface reflection candidate discarded: cell=%s relative=%s",
+                cell,
+                tuple(round(value, 3) for value in relative_position),
+            )
+            continue
+        kept.add(cell)
+    return kept
+
+
 def handle_game_level(
     level: int,
     hit_map: list[list[int]],
@@ -2601,10 +2763,18 @@ def handle_game_level(
     grid_img = adb.read_screenshot()
     click_points, grid_quad = get_click_points(level, grid_img)
     grid_size = get_level_grid_size(level)
-
     submarines = get_configured_submarines(level, SUBMARINES)
+    # A baseline only helps the configured static-recovery path.  Unknown
+    # levels already fall back to a conservative grid scan, so avoid spending
+    # two extra screenshots and delays there.
+    surface_baseline = (
+        _capture_surface_water_baseline(grid_img)
+        if submarines is not None
+        else None
+    )
     visible_hits: set[Cell] = set()
     initial_visual_hits: set[Cell] = set()
+    initial_visual_candidates: set[Cell] = set()
     completed_visual_hits: set[Cell] = set()
     red_marker_completed_cells: set[Cell] = set()
     sidebar_progress: SidebarProgress | None = None
@@ -2624,7 +2794,12 @@ def handle_game_level(
             )
         else:
             logger.warning("level %s sidebar progress was not confidently recognized", level)
-        visible_hits = detect_visible_wreck_cells(grid_img, click_points, grid_size)
+        visible_hits = detect_visible_wreck_cells(
+            grid_img,
+            click_points,
+            grid_size,
+            surface_baseline=surface_baseline,
+        )
         max_visible_hits = sum(submarines)
         if len(visible_hits) > max_visible_hits:
             logger.warning(
@@ -2643,12 +2818,28 @@ def handle_game_level(
             grid_size=grid_size,
             template_paths=VISIBLE_WRECK_TEMPLATES,
         )
-        partial_cells = set(partial_wreck_cells or set())
+        partial_wreck_cells = _remove_surface_reflection_candidates(
+            grid_img,
+            click_points,
+            set(partial_wreck_cells or set()),
+            grid_size,
+            baseline=surface_baseline,
+        )
+        partial_cells = {
+            cell
+            for cell in set(partial_wreck_cells or set())
+            if not is_title_occluded_cell(cell, grid_size)
+        }
         completed_anchor_candidates = detect_completed_submarine_candidate_cells(
             grid_img,
             click_points,
             grid_size,
         )
+        completed_anchor_candidates = {
+            cell
+            for cell in completed_anchor_candidates
+            if not is_title_occluded_cell(cell, grid_size)
+        }
         if completed_anchor_candidates:
             logger.info(
                 "level %s completed ship anchor review found %s candidate cells",
@@ -2728,15 +2919,20 @@ def handle_game_level(
                     [list(cells) for cells in marker_resolution.placements],
                 )
 
-        initial_visual_hits = (
-            partial_cells
-            | completed_visual_hits
-            | (
-                (set(visible_hits) - partial_cells - completed_visual_hits)
-                if sidebar_progress is None
-                else set()
-            )
-        )
+        # A normal wreck/partial-wreck pixel is only a visual candidate.  It
+        # does not prove that this cell was previously clicked, so it must not
+        # enter ``hit_map`` or ``strategy.shots`` during recovery.  Only a
+        # legal completed-submarine placement backed by the sidebar or red
+        # completion marker is authoritative at this stage.
+        initial_visual_hits = set(completed_visual_hits)
+        initial_visual_candidates = (
+            set(partial_cells) | set(visible_hits)
+        ) - initial_visual_hits
+        initial_visual_candidates = {
+            cell
+            for cell in initial_visual_candidates
+            if not is_title_occluded_cell(cell, grid_size)
+        }
         fleet_visual_hits: set[Cell] = set()
         # Ordinary wreck/hit pixels are not sufficient evidence of a complete
         # submarine.  A straight run that happens to match a fleet length
@@ -2758,13 +2954,13 @@ def handle_game_level(
                     list(fleet_resolution.unresolved_lengths),
                     sorted(fleet_resolution.discarded_cells),
                 )
-            if len(fleet_visual_hits) > len(initial_visual_hits):
-                logger.info(
-                    "level %s visible fleet geometry restored %s additional hit cells",
-                    level,
-                    len(fleet_visual_hits - initial_visual_hits),
+            if fleet_visual_hits:
+                # Keep inferred, non-completed fleet geometry provisional.  A
+                # sidebar being readable is not proof that every gray patch
+                # belongs to an already completed submarine.
+                initial_visual_candidates.update(
+                    set(fleet_visual_hits) - initial_visual_hits
                 )
-                initial_visual_hits = fleet_visual_hits
         elif visible_hits:
             logger.info(
                 "level %s keeping %s ordinary visible hits provisional; "
@@ -2782,42 +2978,55 @@ def handle_game_level(
                 len(initial_visual_hits),
                 max_visible_hits,
             )
-            if 0 < len(fleet_visual_hits) <= max_visible_hits:
-                initial_visual_hits = fleet_visual_hits
-            else:
-                initial_visual_hits = set(completed_visual_hits)
+            # Never fall back to an inferred ordinary-wreck geometry here:
+            # that would reintroduce the very false-positive path this gate
+            # is intended to prevent.  Keep only independently confirmed
+            # completed-ship cells.
+            initial_visual_hits = set(completed_visual_hits)
 
+        initial_visual_candidates.difference_update(initial_visual_hits)
         for row, col in initial_visual_hits:
             hit_map[row][col] = 1
 
-        if sidebar_progress is not None and partial_wreck_cells is not None:
-            initial_visual_hit_count = calculate_visible_hit_count(
-                sidebar_progress,
-                partial_wreck_count=len(partial_wreck_cells),
-                fallback_hit_count=len(visible_hits),
+        # This count represents only cells already proven to belong to a
+        # completed submarine.  Ordinary wreck pixels remain candidates until
+        # a blue probe verifies them, so they must not advance progress or
+        # consume blue-batch capacity.
+        if sidebar_progress is not None:
+            initial_visual_hit_count = max(
+                sidebar_progress.completed_cells,
+                len(initial_visual_hits),
             )
-            initial_visual_hit_count = max(initial_visual_hit_count, len(initial_visual_hits))
             logger.info(
-                "level %s exact visual hit count: completed_cells=%s partial_wrecks=%s total=%s",
+                "level %s authoritative initial hit count: sidebar_completed=%s "
+                "mapped_completed=%s candidates=%s",
                 level,
                 sidebar_progress.completed_cells,
-                len(partial_wreck_cells),
-                initial_visual_hit_count,
+                len(initial_visual_hits),
+                len(initial_visual_candidates),
             )
         else:
             initial_visual_hit_count = len(initial_visual_hits)
-            logger.warning(
-                "level %s exact visual count unavailable; falling back to visible hit cells=%s",
+            logger.info(
+                "level %s authoritative initial hit count without sidebar: "
+                "mapped_completed=%s candidates=%s",
                 level,
-                initial_visual_hit_count,
+                len(initial_visual_hits),
+                len(initial_visual_candidates),
             )
 
         logger.info(
-            "level %s visual hit coordinates: mapped=%s exact_count=%s unmapped=%s",
+            "level %s visual cells: mapped_authoritative=%s candidates=%s "
+            "authoritative_count=%s unmapped_authoritative=%s",
             level,
             len(initial_visual_hits),
+            len(initial_visual_candidates),
             initial_visual_hit_count,
-            max(0, int(initial_visual_hit_count or 0) - len(initial_visual_hits)),
+            max(
+                0,
+                int(initial_visual_hit_count or 0)
+                - len(initial_visual_hits),
+            ),
         )
 
     if submarines is None:
@@ -2839,6 +3048,7 @@ def handle_game_level(
             run_started_at=run_started_at,
             settings=settings or RedScoutSettings(),
             initial_hits=initial_visual_hits,
+            initial_visual_candidates=initial_visual_candidates,
             initial_sidebar_progress=sidebar_progress,
             initial_visual_hit_count=initial_visual_hit_count,
             initial_completed_visual_hits=completed_visual_hits,
@@ -2862,6 +3072,11 @@ def handle_game_level(
                 if sidebar_progress is not None and sidebar_progress.valid
                 else marker_completed_lengths
             ),
+            # Keep the pre-click water baseline available to the online blue
+            # confirmation path.  It is used only for the static pre-check;
+            # post-click evidence frames remain governed by the normal hit
+            # classifier.
+            surface_baseline=surface_baseline,
         )
 
     return grid_img, grid_quad, completed
@@ -2993,6 +3208,7 @@ def _scan_level_by_strategy(
     submarines: list[int],
     run_started_at: float | None = None,
     initial_hits: set[Cell] | None = None,
+    initial_visual_candidates: set[Cell] | None = None,
     initial_misses: set[Cell] | None = None,
     initial_sidebar_progress: SidebarProgress | None = None,
     initial_visual_hit_count: int | None = None,
@@ -3004,6 +3220,7 @@ def _scan_level_by_strategy(
     initial_scout_hits: set[Cell] | None = None,
     initial_scout_misses: set[Cell] | None = None,
     commit_scout_hits_online: bool = False,
+    surface_baseline: SurfaceWaterBaseline | None = None,
 ) -> bool:
     """使用潜艇策略选择探测格；策略无法完成时回退扫描剩余格。"""
     grid_size = get_level_grid_size(level)
@@ -3033,6 +3250,16 @@ def _scan_level_by_strategy(
                 hit_map[row][col] = 1
 
     real_initial_hits = set(initial_hits or set())
+    visual_candidates: set[Cell] = set()
+    for raw_cell in initial_visual_candidates or set():
+        try:
+            if not isinstance(raw_cell, (tuple, list)) or len(raw_cell) != 2:
+                continue
+            candidate = (int(raw_cell[0]), int(raw_cell[1]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if 0 <= candidate[0] < grid_size and 0 <= candidate[1] < grid_size:
+            visual_candidates.add(candidate)
     # Completed cells confirmed by the initial sidebar/geometry pass are
     # carried through the final scan as durable facts.  They remain included
     # in the normal hit set for strategy accounting, but are kept separately
@@ -3045,6 +3272,7 @@ def _scan_level_by_strategy(
         else:
             real_initial_hits.update(tuple(tuple(cell) for cell in placement))
     real_initial_misses = set(initial_misses or set()) - real_initial_hits
+    visual_candidates.difference_update(real_initial_hits | real_initial_misses)
     for cell in real_initial_hits:
         if cell not in strategy.shots:
             strategy.report_result(cell, True)
@@ -3088,12 +3316,20 @@ def _scan_level_by_strategy(
         return [ship.length for ship in strategy.get_confirmed_ships()]
 
     initial_confirmed_lengths = accounted_completed_lengths()
-    mapped_visual_hits = len(initial_hits or set())
+    # A visual candidate has no authoritative result yet.  It must not make
+    # an unlocated completed cell appear mapped, otherwise the candidate can
+    # accidentally release blue-batch capacity before its own blue probe.
+    mapped_authoritative_hits = len(real_initial_hits)
+    visual_candidate_count = len(visual_candidates)
     # Only an explicitly supplied visual count can represent occupied cells
     # without coordinates. When the count is synthesized from strategy state,
     # subtracting it again from batch capacity would double-count known hits.
     unmapped_visual_hits = (
-        max(0, initial_display_hit_cells - mapped_visual_hits)
+        max(
+            0,
+            initial_display_hit_cells
+            - mapped_authoritative_hits,
+        )
         if initial_visual_hit_count is not None
         else 0
     )
@@ -3121,7 +3357,9 @@ def _scan_level_by_strategy(
             list(sidebar_progress.completed_lengths) if sidebar_progress is not None else []
         ),
         initial_visual_hits=initial_display_hit_cells,
-        mapped_visual_hits=mapped_visual_hits,
+        mapped_visual_hits=mapped_authoritative_hits,
+        visual_candidate_count=visual_candidate_count,
+        visual_candidates=sorted(visual_candidates),
         unmapped_visual_hits=unmapped_visual_hits,
         board_size=grid_size,
         board_states=build_runtime_board_states(strategy, grid_size),
@@ -3435,8 +3673,21 @@ def _scan_level_by_strategy(
                 return True
             return False
 
+        visual_candidate_queue = sorted(visual_candidates)
+
+        def next_visual_candidate() -> Cell | None:
+            while visual_candidate_queue:
+                candidate = visual_candidate_queue.pop(0)
+                if candidate in strategy.shots or candidate in strategy.blocked_cells:
+                    continue
+                return candidate
+            return None
+
         while not strategy.done and attempts < max_attempts:
-            cell = strategy.choose_next_cell()
+            cell = next_visual_candidate()
+            candidate_probe = cell is not None
+            if cell is None:
+                cell = strategy.choose_next_cell()
             if cell is None:
                 # Unknown cells are the normal-search priority. Only once the
                 # strategy has exhausted them do we spend blue bombs verifying
@@ -3456,6 +3707,7 @@ def _scan_level_by_strategy(
             probe_metadata: dict[str, object] = {}
             direct_scout_hit = (
                 commit_scout_hits_online
+                and not candidate_probe
                 and cell in strategy.get_scout_hit_cells()
             )
             if direct_scout_hit:
@@ -3507,6 +3759,7 @@ def _scan_level_by_strategy(
                         submarines=submarines,
                         activity_ready=True,
                         unmapped_visual_hits=unmapped_visual_hits,
+                        surface_baseline=surface_baseline,
                     )
                     for batch_cell in pending_scout_cells:
                         batch_metadata = dict(batch_outcome.metadata.get(batch_cell, {}))
@@ -3537,6 +3790,7 @@ def _scan_level_by_strategy(
                     index=index,
                     submarines=submarines,
                     probe_metadata=probe_metadata,
+                    surface_baseline=surface_baseline,
                 )
             else:
                 probe_result = _probe_cell(
@@ -3703,8 +3957,11 @@ def _run_red_scout_and_blue_strategy(
     planner = RedScoutPlanner(grid_size)
     footprint = None
     covered: set[Cell] = set()
-    scout_hits: set[Cell] = set()
-    scout_misses: set[Cell] = set()
+    # Preserve scout evidence supplied by the current-level preflight.  These
+    # are provisional observations, but they remain useful to the blue phase
+    # when red scouting stops early on a victory banner.
+    scout_hits: set[Cell] = set(scan_kwargs.get("initial_scout_hits") or set())
+    scout_misses: set[Cell] = set(scan_kwargs.get("initial_scout_misses") or set())
     committed_hits: set[Cell] = set()
     committed_misses: set[Cell] = set()
     direct_attempted_cells: set[Cell] = set()
@@ -3713,6 +3970,15 @@ def _run_red_scout_and_blue_strategy(
     # does not render inferred, not-yet-bombed cells as authoritative ships.
     visual_only_completed_cells: set[Cell] = set()
     initial_real_hits = set(initial_hits)
+    initial_visual_candidates: set[Cell] = set(
+        scan_kwargs.get("initial_visual_candidates") or set()
+    )
+    raw_surface_baseline = scan_kwargs.get("surface_baseline")
+    surface_baseline = (
+        raw_surface_baseline
+        if isinstance(raw_surface_baseline, SurfaceWaterBaseline)
+        else None
+    )
     initial_misses = set(scan_kwargs.get("initial_misses") or set())
     attempted_centers: set[Cell] = set()
     attempts_completed = 0
@@ -3732,28 +3998,6 @@ def _run_red_scout_and_blue_strategy(
     visual_only_completed_cells.update(
         initial_completed_visual_hits - initial_real_hits
     )
-    raw_initial_visual_count = scan_kwargs.get("initial_visual_hit_count")
-    if raw_initial_visual_count is None:
-        unmapped_initial_visual_hits = 0
-    else:
-        try:
-            initial_visual_count = max(0, int(raw_initial_visual_count))
-        except (TypeError, ValueError):
-            initial_visual_count = 0
-        mapped_initial_visual_hits = len(
-            initial_real_hits | initial_completed_visual_hits
-        )
-        unmapped_initial_visual_hits = max(
-            0,
-            initial_visual_count - mapped_initial_visual_hits,
-        )
-        if unmapped_initial_visual_hits:
-            logger.warning(
-                "level %s has %s initial visual submarine cells without coordinates; "
-                "reserving that capacity before any blue batch",
-                level,
-                unmapped_initial_visual_hits,
-            )
     online_hit_evidence: dict[Cell, Mapping[str, object]] = {}
     authoritative_completed_visual_hits: set[Cell] = set(
         scan_kwargs.get("initial_authoritative_completed_visual_hits") or set()
@@ -3786,6 +4030,33 @@ def _run_red_scout_and_blue_strategy(
         if placement.cells not in {item.cells for item in authoritative_completed_placements}:
             authoritative_completed_placements.append(placement)
             authoritative_completed_visual_hits.update(placement.cells)
+    raw_initial_visual_count = scan_kwargs.get("initial_visual_hit_count")
+    if raw_initial_visual_count is None:
+        unmapped_initial_visual_hits = 0
+    else:
+        try:
+            initial_visual_count = max(0, int(raw_initial_visual_count))
+        except (TypeError, ValueError):
+            initial_visual_count = 0
+        mapped_initial_authoritative_hits = len(
+            initial_real_hits
+            | initial_completed_visual_hits
+            | authoritative_completed_visual_hits
+        )
+        # Do not include ``initial_visual_candidates`` here.  A candidate has
+        # not been hit until its blue probe confirms it, so it cannot satisfy
+        # any part of the completed-cell count or release batch capacity.
+        unmapped_initial_visual_hits = max(
+            0,
+            initial_visual_count - mapped_initial_authoritative_hits,
+        )
+        if unmapped_initial_visual_hits:
+            logger.warning(
+                "level %s has %s authoritative initial submarine cells without coordinates; "
+                "reserving that capacity before any blue batch",
+                level,
+                unmapped_initial_visual_hits,
+            )
     discarded_flag_cells: set[Cell] = set()
     # Once a legal, contiguous completed-submarine placement is confirmed,
     # its cells are immutable for the remainder of this level.  Keep this
@@ -4600,11 +4871,15 @@ def _run_red_scout_and_blue_strategy(
             return True
         if result.invalid_reason == "local_victory_screen":
             # The red request was safely discarded by the transaction, but the
-            # victory screen means no remaining red-scout attempts are useful.
-            # Continue with the normal blue attack strategy instead.
+            # banner only means this uncommitted red preview exposed the last
+            # wrecks of the current level. It does not mean the client advanced
+            # to the next level. Stop spending red attempts, ignore this
+            # request's empty result, and keep every earlier current-level fact
+            # for the normal blue attack that actually commits those targets.
             logger.info(
                 "level %s red scout reached a victory screen after %s/%s attempts; "
-                "stopping remaining red scouts and switching to blue attack",
+                "stopping remaining red scouts, preserving current-level evidence, "
+                "and switching to blue attack",
                 level,
                 attempts_completed,
                 settings.count,
@@ -4970,6 +5245,7 @@ def _run_red_scout_and_blue_strategy(
                 blue_bomb_ready=blue_bomb_ready,
                 network_ready=online_network_ready,
                 unmapped_visual_hits=unmapped_initial_visual_hits,
+                surface_baseline=surface_baseline,
             )
             for batch_cell, batch_metadata in batch_outcome.metadata.items():
                 online_hit_evidence[batch_cell] = dict(batch_metadata)
@@ -5028,6 +5304,7 @@ def _run_red_scout_and_blue_strategy(
                     blue_bomb_ready=blue_bomb_ready,
                     network_ready=online_network_ready,
                     fast_batch=True,
+                    surface_baseline=surface_baseline,
                 )
                 blue_bomb_ready = bool(probe_metadata.get("blue_bomb_ready", False))
                 online_network_ready = bool(
@@ -5070,6 +5347,7 @@ def _run_red_scout_and_blue_strategy(
                         blue_bomb_ready=False,
                         network_ready=online_network_ready,
                         fast_batch=False,
+                        surface_baseline=surface_baseline,
                     )
                     retry_metadata["completed_pending_retry"] = retry_number
                     retry_metadata["first_probe_result"] = first_probe_result.value
@@ -5175,6 +5453,16 @@ def _run_red_scout_and_blue_strategy(
         ),
         initial_scout_hits=scout_hits,
         initial_scout_misses=scout_misses,
+        initial_visual_candidates=(
+            initial_visual_candidates
+            - initial_real_hits
+            - committed_hits
+            - scout_hits
+            - scout_misses
+            - online_completed_visual_hits
+            - authoritative_completed_visual_hits
+            - discarded_flag_cells
+        ),
         commit_scout_hits_online=True,
     )
     return _scan_level_by_strategy(
@@ -5340,6 +5628,7 @@ def _execute_online_scout_hit_batch(
     blue_bomb_ready: bool = False,
     network_ready: bool = False,
     unmapped_visual_hits: int = 0,
+    surface_baseline: SurfaceWaterBaseline | None = None,
 ) -> OnlineScoutBatchResult:
     """Fire several red-scout-confirmed targets, then analyse one frame set."""
     if targets is None:
@@ -5508,6 +5797,10 @@ def _execute_online_scout_hit_batch(
             index,
             grid_size,
         )
+        relative_position = (
+            cell[0] / max(1, grid_size - 1),
+            cell[1] / max(1, grid_size - 1),
+        )
         before_visible[cell] = _visible_wreck_for_hit_state(
             initial_screen,
             point,
@@ -5515,6 +5808,9 @@ def _execute_online_scout_hit_batch(
             cell=cell,
             cell_polygon=polygon,
             require_strong_body=True,
+            surface_baseline=surface_baseline,
+            relative_position=relative_position,
+            grid_size=grid_size,
         )
         if before_visible[cell]:
             row, col = cell
@@ -6202,6 +6498,7 @@ def _execute_online_scout_hit(
     blue_bomb_ready: bool = False,
     network_ready: bool = False,
     fast_batch: bool = False,
+    surface_baseline: SurfaceWaterBaseline | None = None,
 ) -> ProbeResult:
     """Commit one scout-confirmed blue hit online without the offline replay flow."""
     # Only a subsequent target in the same red-scout batch may use the
@@ -6288,15 +6585,20 @@ def _execute_online_scout_hit(
     )
 
     selection_screen = initial_screen if fast_activity_path else adb.read_screenshot()
+    grid_size = get_level_grid_size(level)
+    relative_position = (
+        cell[0] / max(1, grid_size - 1),
+        cell[1] / max(1, grid_size - 1),
+    )
     marker_cells = detect_red_submarine_marker_cells(
         selection_screen,
         list(click_points or ()),
-        get_level_grid_size(level),
+        grid_size,
     ) if click_points is not None else None
     cell_polygon = grid_cell_polygon(
         list(click_points or ()),
         index,
-        get_level_grid_size(level),
+        grid_size,
     )
     already_visible = _visible_wreck_for_hit_state(
         selection_screen,
@@ -6305,6 +6607,9 @@ def _execute_online_scout_hit(
         cell=cell,
         cell_polygon=cell_polygon,
         require_strong_body=True,
+        surface_baseline=surface_baseline,
+        relative_position=relative_position,
+        grid_size=grid_size,
     )
     if already_visible:
         before_img = selection_screen
@@ -6332,6 +6637,9 @@ def _execute_online_scout_hit(
         cell=cell,
         cell_polygon=cell_polygon,
         require_strong_body=True,
+        surface_baseline=surface_baseline,
+        relative_position=relative_position,
+        grid_size=grid_size,
     )
     if before_wreck_visible:
         row, col = cell
@@ -7424,6 +7732,62 @@ def find_victory_banner(
     )
 
 
+def _victory_frame_fingerprint(
+    screenshot: np.ndarray | None,
+    victory: object,
+) -> str:
+    """Build a stable token for one observed victory transition.
+
+    Matching coordinates alone are insufficient because every level uses the
+    same banner location. A small downsampled frame digest also distinguishes
+    a fresh level from the stale screenshot that caused the previous click.
+    The fallback still gives mocked/ADB-less callers a deterministic token.
+    """
+
+    if isinstance(screenshot, np.ndarray) and screenshot.size:
+        try:
+            normalized = np.ascontiguousarray(
+                cv2.resize(screenshot, (32, 18), interpolation=cv2.INTER_AREA)
+            )
+            digest = hashlib.blake2b(normalized.tobytes(), digest_size=12).hexdigest()
+        except Exception:
+            digest = "frame-error"
+    else:
+        digest = "no-frame"
+    center = getattr(victory, "center", None)
+    score = getattr(victory, "score", None)
+    template = getattr(victory, "template_path", "")
+    return f"{template}|{center}|{score!r}|{digest}"
+
+
+def _confirm_victory_banner_cleared() -> bool:
+    """Confirm that the continue tap removed the banner before re-entry.
+
+    A malformed or unavailable screenshot is treated as unconfirmed. The
+    caller keeps the short repeat guard in that case, so a later recovery path
+    may retry with a genuinely fresh frame without risking a blind second tap.
+    """
+
+    deadline = monotonic() + VICTORY_CLEAR_CONFIRM_TIMEOUT_SECONDS
+    while True:
+        try:
+            frame = adb.read_screenshot()
+        except Exception as exc:
+            logger.debug("victory clear confirmation screenshot failed: %s", exc)
+            return False
+        if not isinstance(frame, np.ndarray):
+            return False
+        try:
+            if find_victory_banner(frame) is None:
+                return True
+        except Exception as exc:
+            logger.debug("victory clear confirmation detection failed: %s", exc)
+            return False
+        if monotonic() >= deadline:
+            return False
+        sleep(VICTORY_CLEAR_CONFIRM_POLL_SECONDS)
+
+
 def handle_victory_prompt(
     timeout: float = 4.0,
     screenshot: np.ndarray | None = None,
@@ -7431,6 +7795,8 @@ def handle_victory_prompt(
     restore_network: bool = True,
 ) -> bool:
     """Skip the victory banner after a committed hit, if it appears."""
+    global _victory_last_fingerprint, _victory_last_screenshot_id, _victory_last_click_at
+
     victory = find_victory_banner(screenshot) if screenshot is not None else None
     if victory is None:
         if timeout > 0:
@@ -7438,6 +7804,30 @@ def handle_victory_prompt(
         victory = wait_until_victory_banner(timeout=timeout)
     if victory is None:
         return False
+
+    fingerprint = _victory_frame_fingerprint(screenshot, victory)
+    now = monotonic()
+    elapsed = (
+        None
+        if _victory_last_click_at is None
+        else max(0.0, now - _victory_last_click_at)
+    )
+    same_screenshot = (
+        screenshot is not None
+        and _victory_last_screenshot_id is not None
+        and id(screenshot) == _victory_last_screenshot_id
+    )
+    if (
+        same_screenshot
+        or (elapsed is not None and elapsed < VICTORY_REPEAT_GUARD_SECONDS)
+    ):
+        logger.info(
+            "victory banner already handled; suppressing duplicate continue tap "
+            "(elapsed=%s fingerprint_same=%s)",
+            "unknown" if elapsed is None else f"{elapsed:.2f}s",
+            fingerprint == _victory_last_fingerprint,
+        )
+        return True
 
     if restore_network:
         if _has_pending_probe_request():
@@ -7448,7 +7838,14 @@ def handle_victory_prompt(
     else:
         logger.info("victory banner detected while probe request is pending; keeping network isolated")
     adb.click(*SCREEN_CONTINUE_POINT)
+    _victory_last_fingerprint = fingerprint
+    _victory_last_screenshot_id = id(screenshot) if screenshot is not None else None
+    _victory_last_click_at = now
     adb.delay(VICTORY_SKIP_SETTLE_SECONDS)
+    if _confirm_victory_banner_cleared():
+        logger.info("victory banner disappeared after continue tap")
+    else:
+        logger.info("victory banner clear was not confirmed; keeping duplicate-tap guard")
     return True
 
 
@@ -7997,6 +8394,7 @@ def main(level: int | None = None) -> Path | None:
             red_scout_total=settings.count,
             red_scout_valid=0,
             red_scout_complete_six=0,
+            phase_history=[],
         )
         _prune_probe_sample_dirs()
         _prune_red_scout_sample_dirs()
