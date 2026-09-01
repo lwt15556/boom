@@ -32,6 +32,7 @@ class ScriptSafetyTest(unittest.TestCase):
 
         self.assertIn('$setup = Join-Path $root "setup.ps1"', script)
         self.assertIn('& $setup -SkipLaunch', script)
+        self.assertIn('-ArgumentList @("`"$panel`"")', script)
 
     def test_stop_script_delegates_main_shutdown_to_locked_process_control(self):
         script = (PROJECT_ROOT / "stop_all.ps1").read_text(encoding="utf-8")
@@ -51,7 +52,7 @@ class ScriptSafetyTest(unittest.TestCase):
         self.assertIn("if ($mainProcess.HasExited)", script)
         self.assertLess(
             script.index("$mainProcess = Start-Process"),
-            script.index("-ArgumentList @($overlay)"),
+            script.index('-ArgumentList @("`"$overlay`"")'),
         )
 
     def test_control_panel_launcher_uses_utf8_and_hides_console_window(self):
