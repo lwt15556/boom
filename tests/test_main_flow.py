@@ -842,6 +842,12 @@ class MainFlowTest(unittest.TestCase):
 
     def test_red_local_victory_stops_remaining_scouts_and_enters_blue_attack(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 3)
+        visual_candidates = {(0, 0)}
+        stale_baseline = self.main.SurfaceWaterBaseline(
+            median_gray=np.zeros((3, 3), dtype=np.uint8),
+            temporal_mad=np.zeros((3, 3), dtype=np.float32),
+            frame_count=2,
+        )
         local_victory = self.main.RedScoutResult(
             center_cell=(1, 1),
             affected_cells=frozenset(),
@@ -868,11 +874,82 @@ class MainFlowTest(unittest.TestCase):
                 [2, 3],
                 set(),
                 settings,
+                initial_visual_candidates=visual_candidates,
+                surface_baseline=stale_baseline,
             )
 
         self.assertTrue(completed)
         red_attempt.assert_called_once()
         scan.assert_called_once()
+        self.assertEqual(scan.call_args.kwargs["initial_visual_candidates"], visual_candidates)
+        self.assertIs(scan.call_args.kwargs["surface_baseline"], stale_baseline)
+        self.assertEqual(scan.call_args.kwargs["initial_hits"], set())
+
+    def test_red_local_victory_preserves_previous_level_evidence_and_hit_map(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 3)
+        local_victory = self.main.RedScoutResult(
+            center_cell=(1, 1),
+            affected_cells=frozenset(),
+            hit_cells=frozenset(),
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=None,
+            valid=False,
+            confidence_by_cell={},
+            invalid_reason="local_victory_screen",
+        )
+        hit_map = [[1, 0, 0], [0, 0, 0], [0, 0, 1]]
+        placement = self.main.Placement(
+            length=2,
+            direction="H",
+            cells=((0, 0), (0, 1)),
+        )
+        with (
+            patch.object(
+                self.main,
+                "_execute_red_scout_transaction",
+                return_value=local_victory,
+            ),
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                hit_map,
+                [(400, 300)] * 9,
+                [2, 3],
+                {(0, 0)},
+                settings,
+                initial_misses={(0, 1)},
+                initial_sidebar_progress=self.main.SidebarProgress(
+                    active_lengths=(3,), completed_lengths=(2,)
+                ),
+                initial_visual_hit_count=2,
+                initial_completed_visual_hits={(0, 0), (0, 1)},
+                initial_red_marker_completed_cells={(0, 0), (0, 1)},
+                initial_authoritative_completed_visual_hits={(0, 0), (0, 1)},
+                initial_authoritative_completed_placements=(placement,),
+                initial_completed_lengths=(2,),
+                initial_scout_hits={(2, 2)},
+                initial_scout_misses={(2, 1)},
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(hit_map, [[1, 0, 0], [0, 0, 0], [0, 0, 1]])
+        kwargs = scan.call_args.kwargs
+        self.assertTrue({(0, 0)} <= kwargs["initial_hits"])
+        self.assertTrue({(0, 1)} <= kwargs["initial_misses"])
+        self.assertTrue({(2, 2)} <= kwargs["initial_scout_hits"])
+        self.assertTrue({(2, 1)} <= kwargs["initial_scout_misses"])
+        self.assertEqual(kwargs["initial_completed_lengths"], (2,))
+        self.assertEqual(kwargs["initial_completed_visual_hits"], {(0, 0), (0, 1)})
+        self.assertEqual(kwargs["initial_authoritative_completed_visual_hits"], {(0, 0), (0, 1)})
+        self.assertEqual(kwargs["initial_authoritative_completed_placements"], (placement,))
+        self.assertEqual(kwargs["initial_visual_hit_count"], 2)
+        self.assertEqual(
+            kwargs["initial_sidebar_progress"],
+            self.main.SidebarProgress(active_lengths=(3,), completed_lengths=(2,)),
+        )
+        self.assertEqual(kwargs["initial_red_marker_completed_cells"], {(0, 0), (0, 1)})
 
     def test_red_mode_publishes_cumulative_board_after_each_attempt(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
@@ -3574,6 +3651,69 @@ class MainFlowTest(unittest.TestCase):
             self.main.handle_game_level(1, [[0] * 3 for _ in range(3)], settings=settings)
         self.assertIs(run.call_args.kwargs["settings"], settings)
 
+    def test_handle_level_skips_surface_baseline_without_submarine_config(self):
+        expected_points = [(row, col) for row in range(3) for col in range(3)]
+        grid_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        with (
+            patch.object(self.main.adb, "delay"),
+            patch.object(self.main.adb, "read_screenshot", return_value=grid_img),
+            patch.object(self.main, "get_click_points", return_value=(expected_points, None)),
+            patch.object(self.main, "get_configured_submarines", return_value=None),
+            patch.object(self.main, "_capture_surface_water_baseline") as capture_baseline,
+            patch.object(self.main, "_scan_level_by_grid_order", return_value=0) as scan,
+        ):
+            _grid_img_result, _quad, completed = self.main.handle_game_level(1, [[0] * 3 for _ in range(3)])
+
+        self.assertFalse(completed)
+        capture_baseline.assert_not_called()
+        scan.assert_called_once()
+
+    def test_handle_level_passes_surface_baseline_to_strategy(self):
+        expected_points = [(row, col) for row in range(3) for col in range(3)]
+        grid_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        baseline = self.main.SurfaceWaterBaseline(
+            median_gray=np.zeros((720, 1280), dtype=np.float32),
+            temporal_mad=np.zeros((720, 1280), dtype=np.float32),
+            frame_count=3,
+        )
+        with (
+            patch.object(self.main.adb, "delay"),
+            patch.object(self.main.adb, "read_screenshot", return_value=grid_img),
+            patch.object(self.main, "get_click_points", return_value=(expected_points, None)),
+            patch.object(self.main, "get_configured_submarines", return_value=[3]),
+            patch.object(self.main, "detect_sidebar_progress", return_value=None),
+            patch.object(self.main, "detect_visible_wreck_cells", return_value=set()),
+            patch.object(self.main, "detect_partial_wreck_cells", return_value=set()),
+            patch.object(self.main, "_capture_surface_water_baseline", return_value=baseline),
+            patch.object(self.main, "_run_red_scout_and_blue_strategy", return_value=True) as run,
+        ):
+            self.main.handle_game_level(1, [[0] * 3 for _ in range(3)])
+
+        self.assertIs(run.call_args.kwargs["surface_baseline"], baseline)
+
+    def test_visible_wreck_precheck_forwards_surface_baseline_context(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        baseline = self.main.SurfaceWaterBaseline(
+            median_gray=np.zeros((720, 1280), dtype=np.float32),
+            temporal_mad=np.zeros((720, 1280), dtype=np.float32),
+            frame_count=3,
+        )
+        with (
+            patch.object(self.main, "visible_wreck_static_detected", return_value=False) as detector,
+            patch.object(self.main, "red_submarine_marker_visible", return_value=False),
+        ):
+            visible = self.main._visible_wreck_for_hit_state(
+                image,
+                (400, 300),
+                cell=(1, 2),
+                surface_baseline=baseline,
+                relative_position=(0.5, 1.0),
+            )
+
+        self.assertFalse(visible)
+        self.assertIs(detector.call_args.kwargs["surface_baseline"], baseline)
+        self.assertEqual(detector.call_args.kwargs["relative_position"], (0.5, 1.0))
+
     def test_handle_game_level_keeps_visible_wreck_cells_from_midgame_frames(self):
         submarines = [2, 2, 3, 3, 4, 5]
         visible_hits = {
@@ -3595,11 +3735,28 @@ class MainFlowTest(unittest.TestCase):
         )
         click_points = [(400 + index, 300 + index) for index in range(81)]
         grid_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        hit_map = [[0] * 9 for _ in range(9)]
 
         def run_strategy(*_args, **kwargs):
-            self.assertEqual(kwargs["initial_hits"], visible_hits)
+            self.assertEqual(kwargs["initial_hits"], {(7, 1), (7, 2), (7, 3)})
+            self.assertEqual(
+                kwargs["initial_visual_candidates"],
+                visible_hits - {(7, 1), (7, 2), (7, 3)},
+            )
             self.assertEqual(kwargs["initial_completed_visual_hits"], {(7, 1), (7, 2), (7, 3)})
-            self.assertEqual(kwargs["initial_visual_hit_count"], 9)
+            # The sidebar-confirmed submarine is authoritative; the other
+            # wreck pixels remain blue-probe candidates and do not advance
+            # initial hit progress.
+            self.assertEqual(kwargs["initial_visual_hit_count"], 3)
+            self.assertEqual(
+                {
+                    (row, col)
+                    for row, values in enumerate(hit_map)
+                    for col, value in enumerate(values)
+                    if value
+                },
+                {(7, 1), (7, 2), (7, 3)},
+            )
             return True
 
         with (
@@ -3618,7 +3775,7 @@ class MainFlowTest(unittest.TestCase):
         ):
             grid_img_result, _, completed = self.main.handle_game_level(
                 7,
-                [[0] * 9 for _ in range(9)],
+                hit_map,
             )
 
         self.assertTrue(completed)
@@ -3631,9 +3788,13 @@ class MainFlowTest(unittest.TestCase):
         sidebar_unavailable = None
         click_points = [(400 + index, 300 + index) for index in range(100)]
         grid_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        hit_map = [[0] * 10 for _ in range(10)]
 
         def run_strategy(*_args, **kwargs):
-            self.assertEqual(kwargs["initial_hits"], completed_ship | {(0, 0)})
+            self.assertEqual(kwargs["initial_hits"], completed_ship)
+            # (0, 0) is title-obscured on 10x10 boards and must remain
+            # unknown until a blue probe confirms it.
+            self.assertEqual(kwargs["initial_visual_candidates"], set())
             self.assertEqual(kwargs["initial_completed_visual_hits"], completed_ship)
             self.assertEqual(
                 kwargs["initial_authoritative_completed_visual_hits"],
@@ -3657,17 +3818,17 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "get_configured_submarines", return_value=submarines),
             patch.object(self.main, "detect_sidebar_progress", return_value=sidebar_unavailable),
             patch.object(self.main, "detect_visible_wreck_cells", return_value={(0, 0)}),
-            patch.object(self.main, "detect_partial_wreck_cells", return_value=set()),
+            patch.object(self.main, "detect_partial_wreck_cells", return_value={(0, 1)}),
             patch.object(
                 self.main,
                 "detect_completed_submarine_candidate_cells",
-                return_value=completed_ship,
+                return_value=completed_ship | {(1, 1)},
             ),
             patch.object(self.main, "_run_red_scout_and_blue_strategy", side_effect=run_strategy) as run,
         ):
             _grid_img_result, _quad, completed = self.main.handle_game_level(
                 9,
-                [[0] * 10 for _row in range(10)],
+                hit_map,
             )
 
         self.assertTrue(completed)
@@ -3678,12 +3839,16 @@ class MainFlowTest(unittest.TestCase):
         contiguous_hits = {(6, 2), (6, 3), (6, 4), (6, 5)}
         click_points = [(400 + index, 300 + index) for index in range(100)]
         grid_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+        hit_map = [[0] * 10 for _ in range(10)]
 
         def run_strategy(*_args, **kwargs):
-            self.assertEqual(kwargs["initial_hits"], contiguous_hits)
+            self.assertEqual(kwargs["initial_hits"], set())
+            self.assertEqual(kwargs["initial_visual_candidates"], contiguous_hits)
             self.assertEqual(kwargs["initial_completed_visual_hits"], set())
             self.assertEqual(kwargs["initial_authoritative_completed_visual_hits"], set())
             self.assertEqual(kwargs["initial_completed_lengths"], ())
+            self.assertEqual(kwargs["initial_visual_hit_count"], 0)
+            self.assertTrue(all(value == 0 for row in hit_map for value in row))
             return True
 
         with (
@@ -3703,7 +3868,7 @@ class MainFlowTest(unittest.TestCase):
         ):
             _grid_img_result, _quad, completed = self.main.handle_game_level(
                 10,
-                [[0] * 10 for _row in range(10)],
+                hit_map,
             )
 
         self.assertTrue(completed)
@@ -3726,6 +3891,7 @@ class MainFlowTest(unittest.TestCase):
 
         def run_strategy(*_args, **kwargs):
             self.assertEqual(kwargs["initial_hits"], set())
+            self.assertEqual(kwargs["initial_visual_candidates"], set())
             self.assertEqual(kwargs["initial_completed_visual_hits"], set())
             self.assertEqual(kwargs["initial_visual_hit_count"], 15)
             return True
@@ -4880,6 +5046,31 @@ class MainFlowTest(unittest.TestCase):
             self.adb.calls,
         )
 
+    def test_victory_prompt_deduplicates_repeated_old_frame(self):
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        match = DummyMatch((10, 10))
+
+        with patch.object(self.main, "find_victory_banner", return_value=match):
+            self.assertTrue(
+                self.main.handle_victory_prompt(
+                    timeout=0.0,
+                    screenshot=screenshot,
+                    restore_network=False,
+                )
+            )
+            self.assertTrue(
+                self.main.handle_victory_prompt(
+                    timeout=0.0,
+                    screenshot=screenshot,
+                    restore_network=False,
+                )
+            )
+
+        self.assertEqual(
+            self.adb.calls.count(("click", *self.main.SCREEN_CONTINUE_POINT)),
+            1,
+        )
+
     def test_victory_detection_uses_center_roi_and_restores_screen_coordinates(self):
         screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
         local_match = self.main.MatchResult(
@@ -5515,19 +5706,30 @@ class MainFlowTest(unittest.TestCase):
 
     def test_loose_wreck_template_alone_does_not_promote_miss_to_hit(self):
         result = dummy_hit_result("miss")
+        frame = object()
 
         with (
             patch.object(self.main, "red_hit_marker_visible", return_value=False),
-            patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+            patch.object(
+                self.main,
+                "visible_wreck_static_detected",
+                return_value=False,
+            ) as detect,
         ):
             confirmed = self.main.apply_wreck_template_confirmation(
-                object(),
+                frame,
                 (400, 300),
                 result,
             )
 
         self.assertFalse(confirmed)
         self.assertEqual(result.state, "miss")
+        detect.assert_called_once_with(
+            frame,
+            (400, 300),
+            filter_surface_reflection=False,
+            filter_activity_title_overlay=False,
+        )
 
     def test_new_sidebar_completion_promotes_miss_to_hit(self):
         confirmation = getattr(self.main, "apply_sidebar_completion_confirmation", None)
@@ -6285,6 +6487,125 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(strategy.shots, {(0, 1): False})
         save_shots.assert_called_with(1, 3, {(0, 1): False})
         self.assertEqual(self.main._runtime_status["board_states"][0][1], "miss")
+
+    def test_visual_candidate_is_probed_before_becoming_a_real_hit(self):
+        hit_map = [[0] * 3 for _row in range(3)]
+        fake_bar = SimpleNamespace(
+            total=3,
+            n=0,
+            set_postfix_str=lambda *_args, **_kwargs: None,
+        )
+
+        with (
+            patch.object(self.main, "load_saved_level_shots", return_value={}),
+            patch.object(
+                self.main,
+                "_probe_cell",
+                return_value=self.main.ProbeResult.HIT,
+            ) as probe,
+            patch.object(
+                self.main.SubmarineStrategy,
+                "choose_next_cell",
+                return_value=None,
+            ),
+            patch.object(self.main, "fixed_progress_bar", return_value=nullcontext(fake_bar)),
+            patch.object(self.main, "update_fixed_progress"),
+            patch.object(self.main, "save_level_shots") as save_shots,
+            patch.object(self.main, "_scan_level_by_grid_order", return_value=0),
+        ):
+            completed = self.main._scan_level_by_strategy(
+                level=1,
+                hit_map=hit_map,
+                click_points=[(400, 300)] * 9,
+                submarines=[3],
+                initial_visual_candidates={(0, 2)},
+                initial_visual_hit_count=0,
+            )
+
+        self.assertFalse(completed)
+        probe.assert_called_once()
+        self.assertEqual(probe.call_args.args[2], (0, 2))
+        self.assertEqual(hit_map[0][2], 1)
+        self.assertTrue(
+            any(call.args[-1].get((0, 2)) is True for call in save_shots.call_args_list)
+        )
+
+    def test_visual_candidate_miss_is_not_promoted_to_a_hit(self):
+        hit_map = [[0] * 3 for _row in range(3)]
+        fake_bar = SimpleNamespace(
+            total=3,
+            n=0,
+            set_postfix_str=lambda *_args, **_kwargs: None,
+        )
+
+        with (
+            patch.object(self.main, "load_saved_level_shots", return_value={}),
+            patch.object(
+                self.main,
+                "_probe_cell",
+                return_value=self.main.ProbeResult.MISS,
+            ) as probe,
+            patch.object(
+                self.main.SubmarineStrategy,
+                "choose_next_cell",
+                return_value=None,
+            ),
+            patch.object(self.main, "fixed_progress_bar", return_value=nullcontext(fake_bar)),
+            patch.object(self.main, "update_fixed_progress"),
+            patch.object(self.main, "save_level_shots") as save_shots,
+            patch.object(self.main, "_scan_level_by_grid_order", return_value=0),
+        ):
+            completed = self.main._scan_level_by_strategy(
+                level=1,
+                hit_map=hit_map,
+                click_points=[(400, 300)] * 9,
+                submarines=[3],
+                initial_visual_candidates={(0, 2)},
+                initial_visual_hit_count=0,
+            )
+
+        self.assertFalse(completed)
+        probe.assert_called_once()
+        self.assertEqual(probe.call_args.args[2], (0, 2))
+        self.assertEqual(hit_map[0][2], 0)
+        self.assertTrue(
+            any(call.args[-1].get((0, 2)) is False for call in save_shots.call_args_list)
+        )
+
+    def test_visual_candidate_count_does_not_reserve_blue_batch_capacity(self):
+        strategy = self.main.SubmarineStrategy(3, [3])
+        fake_bar = SimpleNamespace(
+            total=3,
+            n=0,
+            set_postfix_str=lambda *_args, **_kwargs: None,
+        )
+
+        with (
+            patch.object(self.main, "SubmarineStrategy", return_value=strategy),
+            patch.object(self.main, "load_saved_level_shots", return_value={}),
+            patch.object(
+                self.main,
+                "_probe_cell",
+                side_effect=[
+                    self.main.ProbeResult.MISS,
+                    self.main.ProbeResult.LEVEL_COMPLETE,
+                ],
+            ),
+            patch.object(self.main, "fixed_progress_bar", return_value=nullcontext(fake_bar)),
+            patch.object(self.main, "update_fixed_progress"),
+            patch.object(self.main, "save_level_shots"),
+        ):
+            completed = self.main._scan_level_by_strategy(
+                level=1,
+                hit_map=[[0] * 3 for _row in range(3)],
+                click_points=[(400, 300)] * 9,
+                submarines=[3],
+                initial_visual_candidates={(0, 2)},
+                initial_visual_hit_count=0,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(self.main._runtime_status.get("unmapped_visual_hits"), 0)
 
     def test_strategy_does_not_record_old_cell_after_delayed_victory(self):
         report_result = Mock()

@@ -14,6 +14,8 @@ from tools.control_panel import (
     format_reason,
     format_result,
     format_runtime,
+    format_phase_timing,
+    overlay_visual_candidates,
     should_show_log_line,
 )
 
@@ -157,11 +159,32 @@ class ControlPanelHelperTest(unittest.TestCase):
         )
         self.assertEqual(format_runtime("not-a-time"), "--")
 
+    def test_phase_timing_shows_current_and_recent_completed_phases(self):
+        self.assertEqual(
+            format_phase_timing(
+                "blue_attack",
+                "2026-09-01T10:00:00",
+                [
+                    {"phase": "red_scout_capture", "seconds": 12.4},
+                    {"phase": "red_scout_discard", "seconds": 3},
+                ],
+                now=datetime(2026, 9, 1, 10, 0, 7),
+            ),
+            "当前 蓝色攻击 00:00:07\n最近：红色侦察取证 00:00:12 · 红色侦察丢弃请求 00:00:03",
+        )
+
     def test_red_scout_and_board_states_have_localized_names(self):
         self.assertEqual(control_panel.PHASE_NAMES["red_scout_preflight"], "红色侦察准备")
         self.assertEqual(control_panel.PHASE_NAMES["blue_attack"], "蓝色攻击")
+        self.assertEqual(control_panel.BOARD_STATE_NAMES["visual_candidate"], "视觉候选")
         self.assertEqual(control_panel.BOARD_STATE_NAMES["scout_miss"], "侦察未命中")
         self.assertEqual(control_panel.BOARD_STATE_NAMES["scout_hit"], "侦察命中")
+
+    def test_visual_candidates_overlay_only_unknown_cells(self):
+        states = [["unknown", "hit"], ["miss", "ship"]]
+        overlaid = overlay_visual_candidates(states, [(0, 0), (0, 1), (1, 0)])
+        self.assertEqual(overlaid, [["visual_candidate", "hit"], ["miss", "ship"]])
+        self.assertEqual(states[0][0], "unknown")
 
     def test_restore_network_refuses_while_main_is_running(self):
         with (

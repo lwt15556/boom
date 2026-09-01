@@ -13,6 +13,7 @@ from utils.wreck_detection import (
     detect_completed_submarine_candidate_cells,
     detect_red_submarine_marker_cells,
     detect_visible_wreck_cells,
+    is_title_occluded_cell,
     red_hit_marker_template_visible,
     red_hit_marker_visible,
     red_submarine_marker_visible,
@@ -23,6 +24,51 @@ from utils.red_scout import _default_hit_detector
 
 
 class WreckDetectionTest(unittest.TestCase):
+    def test_title_occlusion_is_limited_to_fixed_cells_on_10x10_board(self):
+        self.assertTrue(is_title_occluded_cell((0, 0), 10))
+        self.assertTrue(is_title_occluded_cell((1, 1), 10))
+        self.assertFalse(is_title_occluded_cell((0, 3), 10))
+        self.assertFalse(is_title_occluded_cell((0, 0), 9))
+
+    def test_visible_wreck_scan_skips_only_fixed_title_cells_on_10x10_board(self):
+        grid_size = 10
+        points = [
+            (600 + col * 35, 60 + row * 35)
+            for row in range(grid_size)
+            for col in range(grid_size)
+        ]
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        with patch(
+            "utils.wreck_detection.visible_wreck_static_detected",
+            return_value=True,
+        ) as detect:
+            hits = detect_visible_wreck_cells(frame, points, grid_size)
+
+        expected = {
+            (row, col)
+            for row in range(grid_size)
+            for col in range(grid_size)
+            if not is_title_occluded_cell((row, col), grid_size)
+        }
+        self.assertEqual(hits, expected)
+        self.assertEqual(detect.call_count, 95)
+
+    def test_visible_wreck_scan_does_not_apply_title_cells_to_9x9_board(self):
+        grid_size = 9
+        points = [
+            (600 + col * 35, 60 + row * 35)
+            for row in range(grid_size)
+            for col in range(grid_size)
+        ]
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        with patch(
+            "utils.wreck_detection.visible_wreck_static_detected",
+            return_value=True,
+        ):
+            hits = detect_visible_wreck_cells(frame, points, grid_size)
+
+        self.assertEqual(len(hits), 81)
+
     def test_title_overlay_is_not_static_hit_evidence(self):
         frame = np.full((720, 1280, 3), (160, 100, 40), dtype=np.uint8)
         point = (700, 80)

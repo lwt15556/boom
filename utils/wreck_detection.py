@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
+from typing import Sequence
 
 import cv2
 import numpy as np
 
 from config import TEMPLATE_DIR
-from utils.diamond_hit import DiamondHitConfig, classify_diamond_hit
+from utils.diamond_hit import DiamondHitConfig, classify_diamond_hit, make_diamond_mask
 from utils.image_match import find_template_multi_scale
 from utils.submarine_strategy import Cell
 
@@ -60,6 +62,58 @@ WRECK_TEMPLATE_MIN_CELL_COVERAGE = 0.70
 ACTIVITY_TITLE_OVERLAY_LEFT = 0.40
 ACTIVITY_TITLE_OVERLAY_RIGHT = 0.60
 ACTIVITY_TITLE_OVERLAY_BOTTOM = 0.13
+# On 10x10 boards the title/subtitle overlaps these five upper diamonds in
+# the calibrated layout.  Keep this as a cell-level rule: other board sizes
+# and other cells must retain the normal static recognition path.
+TITLE_OCCLUDED_CELLS_10X10 = frozenset(
+    {
+        (0, 0),
+        (0, 1),
+        (0, 2),
+        (1, 0),
+        (1, 1),
+    }
+)
+
+# Static recognition is intentionally conservative.  The game renders a
+# moving, blue/teal highlight over the upper-right part of the board; its
+# pixels can satisfy the gray/bright heuristics used for wrecks.  These
+# thresholds are deliberately exposed so replay tooling can tune them without
+# changing the recognition flow.
+SURFACE_GLARE_CYAN_MIN_RATIO = 0.16
+SURFACE_GLARE_BRIGHT_MIN_RATIO = 0.34
+SURFACE_GLARE_TEMPORAL_MAD = 3.5
+SURFACE_GLARE_WEAK_SHAPE_SCORE = 0.34
+WRECK_SHAPE_MIN_SCORE = 0.28
+
+
+@dataclass(frozen=True)
+class SurfaceWaterBaseline:
+    """Compact temporal baseline for an unclicked board.
+
+    ``median_gray`` describes the stable water/background appearance while
+    ``temporal_mad`` records how much each pixel moved during the baseline
+    capture.  Keeping the baseline in grayscale avoids retaining several full
+    colour screenshots in the long-running process.
+    """
+
+    median_gray: np.ndarray
+    temporal_mad: np.ndarray
+    frame_count: int
+
+
+@dataclass(frozen=True)
+class WreckShapeMetrics:
+    """Shape and colour evidence measured inside one calibrated diamond."""
+
+    center_gray_ratio: float
+    ring_gray_ratio: float
+    gray_excess: float
+    component_ratio: float
+    compactness: float
+    cyan_ratio: float
+    bright_ratio: float
+    score: float
 
 
 def _inside_activity_title_overlay(
@@ -92,6 +146,427 @@ def _exclude_activity_title_overlay(
     local_bottom = min(mask.shape[0], overlay_bottom - int(roi_top) + 1)
     if local_left < local_right and local_bottom > 0:
         mask[:local_bottom, local_left:local_right] = 0
+
+
+def build_surface_water_baseline(
+    frames: Sequence[np.ndarray],
+) -> SurfaceWaterBaseline | None:
+    """Build a temporal baseline from consecutive pre-click screenshots.
+
+    Invalid frames and frames with a different size are ignored.  A baseline
+    is useful with one frame as a spatial reference, but temporal glare
+    detection is enabled only when at least two valid frames are available.
+    Returning ``None`` for an entirely invalid input keeps callers fail-closed.
+    """
+
+    valid: list[np.ndarray] = []
+    shape: tuple[int, int] | None = None
+    for frame in frames:
+        if not isinstance(frame, np.ndarray) or frame.ndim != 3:
+            continue
+        if frame.shape[2] not in (3, 4) or frame.size == 0:
+            continue
+        if shape is None:
+            shape = frame.shape[:2]
+        if frame.shape[:2] != shape:
+            continue
+        if frame.shape[2] == 4:
+            try:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            except cv2.error:
+                continue
+        if frame.dtype != np.uint8:
+            try:
+                frame = np.clip(frame, 0, 255).astype(np.uint8)
+            except (TypeError, ValueError):
+                continue
+        valid.append(frame)
+
+    if not valid:
+        return None
+
+    try:
+        gray_frames = np.stack(
+            [cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) for frame in valid],
+            axis=0,
+        ).astype(np.float32)
+        median_gray = np.median(gray_frames, axis=0).astype(np.uint8)
+        # Median absolute deviation is less sensitive than a range to one
+        # dropped/transition frame and is inexpensive at 1280x720.
+        temporal_mad = np.median(
+            np.abs(gray_frames - median_gray.astype(np.float32)),
+            axis=0,
+        ).astype(np.float32)
+    except (cv2.error, TypeError, ValueError):
+        return None
+
+    return SurfaceWaterBaseline(
+        median_gray=median_gray,
+        temporal_mad=temporal_mad,
+        frame_count=len(valid),
+    )
+
+
+def is_title_occluded_cell(cell: Cell, grid_size: int) -> bool:
+    """Return whether a calibrated board cell is covered by the level title."""
+    try:
+        normalized = (int(cell[0]), int(cell[1]))
+        size = int(grid_size)
+    except (TypeError, ValueError, IndexError):
+        return False
+    return size == 10 and normalized in TITLE_OCCLUDED_CELLS_10X10
+
+
+def _diamond_evidence_mask(
+    image: np.ndarray,
+    point: tuple[int, int],
+    *,
+    cell_polygon: np.ndarray | None = None,
+    scale: float = 0.72,
+    exclude_activity_title_overlay: bool = True,
+) -> np.ndarray | None:
+    """Return an eroded interior mask that excludes grid borders/UI text."""
+
+    if not isinstance(image, np.ndarray) or image.ndim != 3 or image.size == 0:
+        return None
+    height, width = image.shape[:2]
+    try:
+        x, y = int(point[0]), int(point[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if not (0 <= x < width and 0 <= y < height):
+        return None
+
+    if cell_polygon is not None:
+        polygon = np.asarray(cell_polygon, dtype=np.float32)
+        if polygon.ndim != 2 or polygon.shape[0] < 3 or polygon.shape[1] != 2:
+            return None
+        mask = np.zeros((height, width), dtype=np.uint8)
+        cv2.fillPoly(mask, [np.round(polygon).astype(np.int32)], 255)
+        # Two erosions remove antialiased borders and the bright grid stroke.
+        mask = cv2.erode(mask, np.ones((3, 3), dtype=np.uint8), iterations=2)
+    else:
+        # The default dimensions match the 1280x720 calibration.  Scale them
+        # with the screenshot so replaying a resized image uses the same
+        # relative footprint.
+        scale_factor = max(0.25, min(width / 1280.0, height / 720.0))
+        diamond_w = max(20, int(round(80 * scale_factor)))
+        diamond_h = max(16, int(round(56 * scale_factor)))
+        local = make_diamond_mask(
+            (height, width),
+            (x, y),
+            diamond_w,
+            diamond_h,
+            scale=max(0.25, float(scale)),
+        )
+        mask = cv2.erode(local, np.ones((3, 3), dtype=np.uint8), iterations=1)
+
+    if exclude_activity_title_overlay:
+        _exclude_activity_title_overlay(
+            mask,
+            image_shape=image.shape,
+            roi_left=0,
+            roi_top=0,
+        )
+    if not np.any(mask):
+        return None
+    return mask
+
+
+def wreck_shape_metrics(
+    image: np.ndarray,
+    point: tuple[int, int],
+    *,
+    cell_polygon: np.ndarray | None = None,
+    exclude_activity_title_overlay: bool = True,
+) -> WreckShapeMetrics:
+    """Measure whether a bright/gray region resembles a compact wreck.
+
+    Grid lines and water reflections tend to occupy a broad, low-contrast or
+    blue/teal area.  A wreck has a neutral-gray core, a compact connected
+    component, and a positive centre-versus-ring contrast.  The result is a
+    score only; callers still need dynamic or completion evidence before
+    treating a cell as an authoritative hit.
+    """
+
+    zero = WreckShapeMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    mask = _diamond_evidence_mask(
+        image,
+        point,
+        cell_polygon=cell_polygon,
+        exclude_activity_title_overlay=exclude_activity_title_overlay,
+    )
+    if mask is None:
+        return zero
+
+    try:
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+        b, g, r = cv2.split(image)
+    except (cv2.error, ValueError):
+        return zero
+
+    # The centre is a second erosion, not a fixed screen-space rectangle.
+    center_mask = cv2.erode(mask, np.ones((7, 7), dtype=np.uint8), iterations=1)
+    if not np.any(center_mask):
+        center_mask = mask
+    ring_mask = cv2.subtract(mask, center_mask)
+    neutral_gray = (
+        (saturation <= 95)
+        & (value >= 90)
+        & (value <= 235)
+    ).astype(np.uint8) * 255
+    center_gray = cv2.bitwise_and(neutral_gray, neutral_gray, mask=center_mask)
+    ring_gray = cv2.bitwise_and(neutral_gray, neutral_gray, mask=ring_mask)
+    center_area = max(1, int(np.count_nonzero(center_mask)))
+    ring_area = max(1, int(np.count_nonzero(ring_mask)))
+    center_ratio = float(np.count_nonzero(center_gray)) / center_area
+    ring_ratio = float(np.count_nonzero(ring_gray)) / ring_area
+    gray_excess = center_ratio - ring_ratio
+
+    labels, _label_map, stats, _centroids = cv2.connectedComponentsWithStats(
+        center_gray,
+        connectivity=8,
+    )
+    largest = 0
+    largest_bbox_area = 0
+    for label_index in range(1, labels):
+        area = int(stats[label_index, cv2.CC_STAT_AREA])
+        if area > largest:
+            largest = area
+            largest_bbox_area = int(
+                stats[label_index, cv2.CC_STAT_WIDTH]
+                * stats[label_index, cv2.CC_STAT_HEIGHT]
+            )
+    component_ratio = largest / float(center_area)
+    compactness = (
+        largest / float(max(1, largest_bbox_area))
+        if largest_bbox_area
+        else 0.0
+    )
+
+    valid_mask = mask > 0
+    cyan = (
+        (saturation >= 60)
+        & (value >= 120)
+        & (
+            (b.astype(np.int16) - r.astype(np.int16) >= 8)
+            | (g.astype(np.int16) - r.astype(np.int16) >= 12)
+        )
+    )
+    bright = value >= 170
+    cyan_ratio = float(np.count_nonzero(cyan & valid_mask)) / max(
+        1, int(np.count_nonzero(valid_mask))
+    )
+    bright_ratio = float(np.count_nonzero(bright & valid_mask)) / max(
+        1, int(np.count_nonzero(valid_mask))
+    )
+
+    def _signal(value_: float, threshold: float, span: float) -> float:
+        return max(0.0, min(1.0, (value_ - threshold) / max(span, 1e-6)))
+
+    score = (
+        0.34 * _signal(center_ratio, 0.10, 0.22)
+        + 0.28 * _signal(max(0.0, gray_excess), 0.025, 0.12)
+        + 0.24 * _signal(component_ratio, 0.025, 0.18)
+        + 0.14 * compactness
+        - 0.24 * _signal(cyan_ratio, 0.08, 0.32)
+    )
+    return WreckShapeMetrics(
+        center_gray_ratio=center_ratio,
+        ring_gray_ratio=ring_ratio,
+        gray_excess=gray_excess,
+        component_ratio=component_ratio,
+        compactness=compactness,
+        cyan_ratio=cyan_ratio,
+        bright_ratio=bright_ratio,
+        score=max(0.0, min(1.0, score)),
+    )
+
+
+def surface_glare_score(
+    image: np.ndarray,
+    point: tuple[int, int],
+    *,
+    baseline: SurfaceWaterBaseline | None = None,
+    cell_polygon: np.ndarray | None = None,
+    relative_position: tuple[float, float] | None = None,
+    _metrics: WreckShapeMetrics | None = None,
+) -> float:
+    """Return a normalized score for broad blue/teal surface reflection."""
+
+    # ``surface_reflection_detected`` already computes the shape metrics for
+    # its final gate.  The private hand-off avoids running the full-frame HSV
+    # and connected-component pass twice for every cell while keeping the
+    # public helper convenient for replay tooling.
+    metrics = _metrics or wreck_shape_metrics(image, point, cell_polygon=cell_polygon)
+    mask = _diamond_evidence_mask(image, point, cell_polygon=cell_polygon)
+    if mask is None:
+        return 0.0
+    try:
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+        b, g, r = cv2.split(image)
+    except (cv2.error, ValueError):
+        return 0.0
+
+    valid_mask = mask > 0
+    cyan = (
+        (saturation >= 60)
+        & (value >= 120)
+        & (
+            (b.astype(np.int16) - r.astype(np.int16) >= 8)
+            | (g.astype(np.int16) - r.astype(np.int16) >= 12)
+        )
+    )
+    bright = value >= 170
+    cyan_ratio = float(np.count_nonzero(cyan & valid_mask)) / max(
+        1, int(np.count_nonzero(valid_mask))
+    )
+    bright_ratio = float(np.count_nonzero(bright & valid_mask)) / max(
+        1, int(np.count_nonzero(valid_mask))
+    )
+
+    temporal_score = 0.0
+    baseline_residual_score = 0.0
+    if (
+        baseline is not None
+        and baseline.temporal_mad.shape == image.shape[:2]
+        and baseline.median_gray.shape == image.shape[:2]
+    ):
+        if baseline.frame_count >= 2:
+            temporal = baseline.temporal_mad[valid_mask]
+            if temporal.size:
+                temporal_score = max(0.0, min(1.0, float(np.median(temporal)) / 8.0))
+        # MAD describes motion *within* the baseline and can be zero when a
+        # highlight appears in only one of the sampled frames.  Compare the
+        # current cell to the median water image as a second, local signal.
+        try:
+            current_gray = cv2.cvtColor(
+                image,
+                cv2.COLOR_BGR2GRAY,
+            ).astype(np.float32)
+        except (cv2.error, TypeError, ValueError):
+            current_gray = None
+        if current_gray is not None:
+            residual = np.abs(
+                current_gray - baseline.median_gray.astype(np.float32)
+            )
+            local_residual = residual[valid_mask]
+            if local_residual.size:
+                residual_p75 = float(np.percentile(local_residual, 75))
+                baseline_residual_score = max(
+                    0.0,
+                    min(1.0, (residual_p75 - 3.0) / 20.0),
+                )
+
+    # A reflection is broad and bright relative to the local board water, or
+    # varies over time.  Absolute cyan saturation is intentionally given only
+    # a small weight because the entire board is blue/teal in normal frames.
+    # The optional relative position lets the known upper-right glare band use
+    # a slightly more sensitive gate without hard-coding screen coordinates.
+    broad_score = max(0.0, min(1.0, 1.0 - metrics.score))
+    bright_excess = max(0.0, min(1.0, (bright_ratio - 0.24) / 0.34))
+    cyan_excess = max(0.0, min(1.0, (cyan_ratio - 0.62) / 0.32))
+    upper_right = bool(
+        relative_position is not None
+        and float(relative_position[0]) <= 0.55
+        and float(relative_position[1]) >= 0.55
+    )
+    score = (
+        0.42 * bright_excess
+        + 0.14 * cyan_excess
+        + 0.20 * temporal_score
+        + 0.12 * baseline_residual_score
+        + 0.12 * broad_score
+    )
+    if upper_right:
+        score += 0.10 * bright_excess
+    return max(0.0, min(1.0, score))
+
+
+def surface_reflection_detected(
+    image: np.ndarray,
+    point: tuple[int, int],
+    *,
+    baseline: SurfaceWaterBaseline | None = None,
+    cell_polygon: np.ndarray | None = None,
+    relative_position: tuple[float, float] | None = None,
+) -> bool:
+    """Return whether the cell is dominated by water reflection/highlight."""
+
+    metrics = wreck_shape_metrics(image, point, cell_polygon=cell_polygon)
+    score = surface_glare_score(
+        image,
+        point,
+        baseline=baseline,
+        cell_polygon=cell_polygon,
+        relative_position=relative_position,
+        _metrics=metrics,
+    )
+    temporal_dynamic = False
+    baseline_residual_dynamic = False
+    if (
+        baseline is not None
+        and baseline.temporal_mad.shape == image.shape[:2]
+        and baseline.median_gray.shape == image.shape[:2]
+    ):
+        mask = _diamond_evidence_mask(image, point, cell_polygon=cell_polygon)
+        if mask is not None and np.any(mask):
+            if baseline.frame_count >= 2:
+                temporal_dynamic = (
+                    float(np.median(baseline.temporal_mad[mask > 0]))
+                    >= SURFACE_GLARE_TEMPORAL_MAD
+                )
+            try:
+                current_gray = cv2.cvtColor(
+                    image,
+                    cv2.COLOR_BGR2GRAY,
+                ).astype(np.float32)
+            except (cv2.error, TypeError, ValueError):
+                current_gray = None
+            if current_gray is not None:
+                residual = np.abs(
+                    current_gray - baseline.median_gray.astype(np.float32)
+                )
+                local_residual = residual[mask > 0]
+                baseline_residual_dynamic = bool(
+                    local_residual.size
+                    and float(np.percentile(local_residual, 75)) >= 10.0
+                )
+
+    upper_right = bool(
+        relative_position is not None
+        and float(relative_position[0]) <= 0.55
+        and float(relative_position[1]) >= 0.55
+    )
+    # The upper-right band is where the supplied screenshots show the broad
+    # specular reflection.  Outside that band require stronger temporal or
+    # spatial evidence so ordinary blue water is not discarded.
+    temporal_reflection = (
+        (temporal_dynamic or baseline_residual_dynamic)
+        and metrics.score < 0.55
+    )
+    broad_blue = (
+        metrics.cyan_ratio >= SURFACE_GLARE_CYAN_MIN_RATIO
+        and (
+            temporal_reflection
+            or (
+                upper_right
+                and (
+                    metrics.score < SURFACE_GLARE_WEAK_SHAPE_SCORE
+                    or metrics.bright_ratio >= SURFACE_GLARE_BRIGHT_MIN_RATIO
+                )
+            )
+        )
+    )
+    broad_bright = (
+        metrics.bright_ratio >= 0.52
+        and metrics.score < SURFACE_GLARE_WEAK_SHAPE_SCORE
+    )
+    return bool(score >= 0.40 and (broad_blue or broad_bright))
 
 
 @lru_cache(maxsize=1)
@@ -420,6 +895,8 @@ def detect_visible_wreck_cells(
     screenshot: np.ndarray,
     click_points: list[tuple[int, int]],
     grid_size: int,
+    *,
+    surface_baseline: SurfaceWaterBaseline | None = None,
 ) -> set[Cell]:
     if not isinstance(screenshot, np.ndarray) or screenshot.ndim != 3:
         return set()
@@ -458,7 +935,13 @@ def detect_visible_wreck_cells(
 
     hits: set[Cell] = set()
     for index, point in enumerate(click_points):
-        cell = (index // grid_size, index % grid_size)
+        row, col = divmod(index, grid_size)
+        cell = (row, col)
+        # The title is drawn over the first five diamonds on 10x10 boards.
+        # Leave them unknown during the initial static review; a later blue
+        # probe still gets the full dynamic before/after confirmation path.
+        if is_title_occluded_cell(cell, grid_size):
+            continue
         if cell in red_marker_cells:
             continue
         if visible_wreck_static_detected(
@@ -466,6 +949,13 @@ def detect_visible_wreck_cells(
             point,
             ignore_submarine_marker=True,
             cell_polygon=cell_polygon(index),
+            surface_baseline=surface_baseline,
+            relative_position=(
+                row / max(1, grid_size - 1),
+                col / max(1, grid_size - 1),
+            ),
+            cell=cell,
+            grid_size=grid_size,
         ):
             hits.add(cell)
     return hits
@@ -826,6 +1316,12 @@ def visible_wreck_static_detected(
     *,
     ignore_submarine_marker: bool = False,
     cell_polygon: np.ndarray | None = None,
+    surface_baseline: SurfaceWaterBaseline | None = None,
+    relative_position: tuple[float, float] | None = None,
+    filter_surface_reflection: bool = True,
+    cell: Cell | None = None,
+    grid_size: int | None = None,
+    filter_activity_title_overlay: bool = True,
 ) -> bool:
     if not isinstance(image, np.ndarray) or image.ndim != 3:
         return False
@@ -834,8 +1330,15 @@ def visible_wreck_static_detected(
     # from a wreck in the diamonds directly underneath.  Leave these cells
     # unknown so a real blue probe or completed-submarine geometry can decide
     # them; this is safer than silently committing a false existing hit.
-    if _inside_activity_title_overlay(image, point):
-        return False
+    if filter_activity_title_overlay:
+        if cell is not None and grid_size is not None:
+            if is_title_occluded_cell(cell, grid_size):
+                return False
+        elif _inside_activity_title_overlay(image, point):
+            # Preserve the legacy point-only guard for callers that do not
+            # have board coordinates. Grid-aware callers use the fixed cell
+            # rule above, so unrelated 10x10 cells are not affected.
+            return False
 
     # The red object attached to a submarine is a visual decoration, not a
     # result marker.  Reject it unconditionally before template/classifier
@@ -848,8 +1351,30 @@ def visible_wreck_static_detected(
     # gray wreck template because the hull itself can still match that mask.
     if not ignore_submarine_marker and red_submarine_marker_visible(image, point):
         return False
+
+    # Reject broad blue/teal specular highlights before template matching.  A
+    # reflection can reach the old 0.965 template threshold even though it has
+    # no compact neutral hull.  The gate is spatially relative to the board
+    # (when supplied) and can also use the multi-frame temporal baseline.
+    if filter_surface_reflection:
+        if surface_reflection_detected(
+            image,
+            point,
+            baseline=surface_baseline,
+            cell_polygon=cell_polygon,
+            relative_position=relative_position,
+        ):
+            return False
     if wreck_template_visible(image, point, cell_polygon=cell_polygon):
-        return True
+        # Template correlation alone is not enough for the static recovery
+        # path: a small bright-water patch can match a masked template at a
+        # high score.  Require a compact, centre-weighted neutral shape too.
+        return wreck_shape_metrics(
+            image,
+            point,
+            cell_polygon=cell_polygon,
+            exclude_activity_title_overlay=filter_activity_title_overlay,
+        ).score >= WRECK_SHAPE_MIN_SCORE
     try:
         # Static review must stay tied to the requested cell.  The default
         # 14px refinement can jump across a tile edge and classify a nearby
@@ -863,6 +1388,14 @@ def visible_wreck_static_detected(
     except Exception:
         return False
     if str(getattr(result, "state", "")).strip().lower() != "hit":
+        return False
+    shape = wreck_shape_metrics(
+        image,
+        point,
+        cell_polygon=cell_polygon,
+        exclude_activity_title_overlay=filter_activity_title_overlay,
+    )
+    if shape.score < WRECK_SHAPE_MIN_SCORE:
         return False
     if cell_polygon is None:
         return True
