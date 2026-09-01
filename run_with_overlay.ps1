@@ -18,7 +18,7 @@ Remove-Item -LiteralPath $stdout, $stderr -ErrorAction SilentlyContinue
 
 $mainProcess = Start-Process `
     -FilePath $python `
-    -ArgumentList @($main) `
+    -ArgumentList @("`"$main`"") `
     -WorkingDirectory $root `
     -RedirectStandardOutput $stdout `
     -RedirectStandardError $stderr `
@@ -32,7 +32,7 @@ if ($mainProcess.HasExited) {
 
 Start-Process `
     -FilePath $python `
-    -ArgumentList @($overlay) `
+    -ArgumentList @("`"$overlay`"") `
     -WorkingDirectory $root `
     -WindowStyle Hidden
 
