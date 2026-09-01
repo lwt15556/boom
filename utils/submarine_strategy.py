@@ -168,6 +168,16 @@ class SubmarineStrategy:
         self._validate_cell(cell)
         self.scout_observations.pop(cell, None)
 
+        if any(cell in ship.cells for ship in self.confirmed_ships):
+            # A completed placement is authoritative.  A stale frame or a
+            # duplicate probe must not turn one of its cells into a miss.
+            if hit:
+                self.shots[cell] = True
+            elif self.shots.get(cell) is not True:
+                self.shots.pop(cell, None)
+            self._hunt_residue_cache.clear()
+            return
+
         if cell in self.shots:
             old = self.shots[cell]
             if old != hit:
@@ -247,19 +257,11 @@ class SubmarineStrategy:
             self.unlocated_completed[length] += 1
             unlocated.append(length)
 
-        if unlocated:
-            confirmed_cells = {
-                cell
-                for ship in self.confirmed_ships
-                for cell in ship.cells
-            }
-            recovered_cells = {
-                cell
-                for cell in trusted_completed_cells
-                if self._inside(cell) and cell not in confirmed_cells
-            }
-            self.accounted_hit_cells.update(recovered_cells)
-            self.blocked_cells.update(recovered_cells)
+        # An unlocated sidebar completion accounts for a fleet length, not for
+        # arbitrary coordinates.  Keep isolated/scattered observed hits as
+        # ordinary hits until they form an exact straight placement.  Marking
+        # them as accounted or blocked here would manufacture one-cell
+        # "completed submarines" and suppress valid follow-up probes.
 
         if located or unlocated:
             self._hunt_residue_cache.clear()
@@ -294,6 +296,81 @@ class SubmarineStrategy:
     def get_confirmed_ships(self) -> list[ConfirmedShip]:
         """返回已经确认完整位置的潜艇列表副本。"""
         return list(self.confirmed_ships)
+
+    def restore_confirmed_placements(
+        self,
+        placements: Iterable[Placement | Sequence[Cell]],
+    ) -> tuple[ConfirmedShip, ...]:
+        """Restore durable completed-ship placements before replaying hits.
+
+        A visual completion snapshot is allowed to be incomplete or noisy on a
+        later frame, but a placement that was already confirmed must remain a
+        concrete ``ConfirmedShip`` in the state strategy.  Accepting either a
+        ``Placement`` or a sequence of cells keeps this boundary convenient for
+        callers that receive geometry tuples from the image resolver.
+        """
+        restored: list[ConfirmedShip] = []
+        existing = {ship.cells for ship in self.confirmed_ships}
+
+        for raw_placement in placements:
+            if isinstance(raw_placement, Placement):
+                placement = raw_placement
+            else:
+                cells = tuple(tuple(cell) for cell in raw_placement)
+                if not cells:
+                    continue
+                rows = {row for row, _ in cells}
+                cols = {col for _, col in cells}
+                direction = "H" if len(rows) == 1 else "V" if len(cols) == 1 else ""
+                placement = Placement(
+                    length=len(cells),
+                    direction=direction,
+                    cells=cells,
+                )
+
+            cells = tuple(placement.cells)
+            if placement.length <= 0 or len(cells) != placement.length:
+                raise ValueError(f"invalid completed placement: {placement!r}")
+            normalized_cells = {
+                self._normalize_scout_cell(cell, label="completed placement")
+                for cell in cells
+            }
+            if len(normalized_cells) != placement.length:
+                raise ValueError(f"completed placement contains duplicate cells: {placement!r}")
+            contiguous = self._straight_contiguous_cells(normalized_cells)
+            if contiguous is None or len(contiguous) != placement.length:
+                raise ValueError(f"completed placement must be straight and contiguous: {placement!r}")
+            normalized = Placement(
+                length=placement.length,
+                direction=(
+                    "H"
+                    if len({row for row, _ in contiguous}) == 1
+                    else "V"
+                ),
+                cells=contiguous,
+            )
+            if normalized.cells in existing:
+                continue
+            if any(
+                set(normalized.cells) & set(ship.cells)
+                for ship in self.confirmed_ships
+            ):
+                # A later visual frame may expose only a prefix of an already
+                # locked ship.  Never add an overlapping shorter/alternate
+                # placement that could make the state appear downgraded.
+                continue
+            if self.remaining.get(normalized.length, 0) <= 0:
+                # A same-length ship may already have been confirmed by replayed
+                # shots.  Never manufacture an extra ship beyond the configured
+                # fleet count.
+                continue
+
+            self._confirm_placement(normalized)
+            ship = self.confirmed_ships[-1]
+            restored.append(ship)
+            existing.add(ship.cells)
+
+        return tuple(restored)
 
     def get_accounted_completed_lengths(self) -> list[int]:
         lengths = [ship.length for ship in self.confirmed_ships]
@@ -338,7 +415,22 @@ class SubmarineStrategy:
         for (row, col), hit in self.shots.items():
             states[row][col] = "hit" if hit else "miss"
 
-        confirmed_cells = set(self.accounted_hit_cells)
+        # ``accounted_hit_cells`` represents hit cells retained while the
+        # sidebar reported a completed length but no valid straight placement
+        # could be located.  Those cells are intentionally excluded from the
+        # green ``ship`` state: an isolated hit is not a completed submarine.
+        # Only a concrete placement in ``confirmed_ships`` may be rendered as
+        # a complete ship.
+        accounted_only_hits = self.accounted_hit_cells - {
+            cell
+            for ship in self.confirmed_ships
+            for cell in ship.cells
+        }
+        for row, col in accounted_only_hits:
+            if self._inside((row, col)):
+                states[row][col] = "hit"
+
+        confirmed_cells = set()
         for ship in self.confirmed_ships:
             confirmed_cells.update(ship.cells)
         for row, col in confirmed_cells:

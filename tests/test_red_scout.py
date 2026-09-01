@@ -487,6 +487,196 @@ class RedScoutAnalyzerTest(unittest.TestCase):
 
         self.assertEqual(inferred, {(5, 4)})
 
+    def test_completed_ship_endpoint_accepts_partially_occluded_score(self):
+        """A sidebar-confirmed ship may have a slightly weak end segment."""
+        candidates = {(1, 4), (2, 4), (3, 4)}
+        points_by_cell = {
+            (row, col): (row, col)
+            for row in range(10)
+            for col in range(10)
+        }
+        frames = tuple(np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(4))
+
+        def body_score(_image, point):
+            return {
+                (0, 4): 0.04,
+                # Below the ordinary 0.25 body threshold, but above the
+                # relaxed endpoint threshold used after sidebar confirmation.
+                (4, 4): 0.22,
+            }.get(point, 0.0)
+
+        with patch.object(
+            red_scout_module,
+            "completed_ship_body_score",
+            side_effect=body_score,
+        ):
+            inferred = red_scout_module._infer_completed_ship_endpoints(
+                candidates,
+                unresolved_lengths=(4,),
+                grid_size=10,
+                after_images=frames,
+                points_by_cell=points_by_cell,
+            )
+
+        self.assertEqual(inferred, {(4, 4)})
+
+    def test_completed_ship_endpoint_rejects_score_below_relaxed_threshold(self):
+        candidates = {(1, 4), (2, 4), (3, 4)}
+        points_by_cell = {
+            (row, col): (row, col)
+            for row in range(10)
+            for col in range(10)
+        }
+        frames = tuple(np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(4))
+
+        with patch.object(
+            red_scout_module,
+            "completed_ship_body_score",
+            return_value=0.19,
+        ):
+            inferred = red_scout_module._infer_completed_ship_endpoints(
+                candidates,
+                unresolved_lengths=(4,),
+                grid_size=10,
+                after_images=frames,
+                points_by_cell=points_by_cell,
+            )
+
+        self.assertEqual(inferred, set())
+
+    def test_completed_ship_recovers_isometric_l_projection(self):
+        """A sidebar-confirmed hull may project as an L but score as one row."""
+        body_candidates = {
+            (3, 5),
+            (3, 6),
+            (3, 7),
+            (4, 5),
+            (4, 6),
+        }
+        points_by_cell = {
+            (row, col): (row, col)
+            for row in range(10)
+            for col in range(10)
+        }
+        frames = tuple(np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(3))
+        surfaced_row = {
+            (4, 4): 0.37,
+            (4, 5): 0.61,
+            (4, 6): 0.62,
+            (4, 7): 0.67,
+            (4, 8): 0.30,
+        }
+
+        def body_score(_image, point):
+            return surfaced_row.get(point, 0.08)
+
+        with patch.object(
+            red_scout_module,
+            "completed_ship_body_score",
+            side_effect=body_score,
+        ):
+            inferred_cells, placements = (
+                red_scout_module._infer_completed_ship_body_placements(
+                    body_candidates,
+                    unresolved_lengths=(5,),
+                    grid_size=10,
+                    after_images=frames,
+                    points_by_cell=points_by_cell,
+                )
+            )
+
+        expected = ((4, 4), (4, 5), (4, 6), (4, 7), (4, 8))
+        self.assertEqual(placements, (expected,))
+        self.assertEqual(inferred_cells, set(expected))
+
+    def test_multiple_completed_ships_resolve_long_ship_before_short_ship(self):
+        """A shared raw hit must not let a 2-cell placement steal a 4-cell hull."""
+        body_candidates = {
+            (2, 1), (2, 2), (3, 2),
+            (6, 2), (6, 5), (6, 6),
+            (7, 5), (7, 6),
+        }
+        raw_hit = {(7, 4)}
+        points_by_cell = {
+            (row, col): (row, col)
+            for row in range(10)
+            for col in range(10)
+        }
+        frames = tuple(np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(3))
+        scores = {
+            (7, 4): 0.39,
+            (7, 5): 0.55,
+            (7, 6): 0.54,
+            (7, 7): 0.33,
+            (2, 1): 0.26,
+            (2, 2): 0.36,
+            (3, 2): 0.10,
+            (6, 2): 0.43,
+            (6, 5): 0.30,
+            (6, 6): 0.31,
+        }
+
+        with patch.object(
+            red_scout_module,
+            "completed_ship_body_score",
+            side_effect=lambda _image, point: scores.get(point, 0.05),
+        ):
+            inferred_cells, placements = (
+                red_scout_module._infer_completed_ship_body_placements(
+                    body_candidates | raw_hit,
+                    unresolved_lengths=(4, 2),
+                    grid_size=10,
+                    after_images=frames,
+                    points_by_cell=points_by_cell,
+                )
+            )
+
+        self.assertEqual(
+            placements,
+            (((7, 4), (7, 5), (7, 6), (7, 7)),),
+        )
+        self.assertEqual(
+            inferred_cells,
+            {(7, 4), (7, 5), (7, 6), (7, 7)},
+        )
+
+    def test_sidebar_change_does_not_promote_plain_hit_line_without_red_body(self):
+        """A raw straight hit line remains provisional without red hull evidence."""
+        before = np.zeros((720, 1280, 3), dtype=np.uint8)
+        after_images = tuple(before.copy() for _ in range(4))
+        points_by_cell = {
+            (row, col): (400 + col * 10, 200 + row * 10)
+            for row in range(10)
+            for col in range(10)
+        }
+        progress_before = SidebarProgress(active_lengths=(5,))
+        progress_after = SidebarProgress(completed_lengths=(5,))
+        diagnostics = {}
+
+        with patch.object(
+            red_scout_module,
+            "detect_sidebar_progress",
+            side_effect=[progress_before] + [progress_after] * 4,
+        ), patch.object(
+            red_scout_module,
+            "detect_completed_submarine_candidate_cells",
+            return_value=set(),
+        ):
+            evidence = red_scout_module.RedScoutAnalyzer._completed_ship_evidence(
+                before_image=before,
+                after_images=after_images,
+                submarine_lengths=(5,),
+                before_visible=set(),
+                raw_stable_result_hits={(4, 4), (4, 5), (4, 6), (4, 7), (4, 8)},
+                grid_size=10,
+                points_by_cell=points_by_cell,
+                eligible_cells=set(points_by_cell),
+                diagnostics=diagnostics,
+            )
+
+        self.assertIsNone(evidence)
+        self.assertEqual(diagnostics["completed_ship_failure"], "missing_red_body_evidence")
+
     GRID_SIZE = 5
     CLICK_POINTS = tuple(
         (row, col)
@@ -546,6 +736,27 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         self.assertIsNotNone(reference)
         self.assertFalse(red_scout_module._default_hit_detector(reference, (665, 318)))
 
+    def test_red_marker_guard_only_suppresses_its_assigned_cell(self):
+        analyzer = red_scout_module.RedScoutAnalyzer()
+        analyzer._marker_points = ((100, 100), (140, 100), (100, 140), (140, 140))
+        analyzer._marker_grid_size = 2
+        image = np.zeros((180, 180, 3), dtype=np.uint8)
+        with (
+            patch.object(
+                red_scout_module,
+                "detect_red_submarine_marker_cells",
+                return_value={(0, 0)},
+            ),
+            patch.object(
+                red_scout_module,
+                "_default_hit_detector",
+                return_value=True,
+            ) as detector,
+        ):
+            analyzer._hit_detector = red_scout_module._default_hit_detector
+            self.assertTrue(analyzer._detect_hit(image, (140, 100)))
+            self.assertTrue(detector.call_args.kwargs["ignore_submarine_marker"])
+
     def test_change_prefilter_keeps_shifted_candidate_and_rejects_clean_cell(self):
         before = np.zeros((200, 240, 3), dtype=np.uint8)
         after = before.copy()
@@ -562,6 +773,51 @@ class RedScoutAnalyzerTest(unittest.TestCase):
 
         self.assertEqual(filtered, {(0, 0)})
         self.assertEqual(candidates, {(0, 0), (0, 1)})
+
+    def test_transition_frame_filter_discards_connection_dialog_outlier(self):
+        rng = np.random.default_rng(20260829)
+        stable = rng.integers(30, 210, size=(120, 160, 3), dtype=np.uint8)
+        dialog = np.clip(stable.astype(np.float32) * 0.30, 0, 255).astype(np.uint8)
+
+        discarded = red_scout_module._find_transition_frame_indices(
+            (stable, stable.copy(), dialog)
+        )
+
+        self.assertEqual(discarded, {2})
+        filtered, indices = red_scout_module._filter_transition_frames(
+            (stable, stable.copy(), dialog)
+        )
+        self.assertEqual(indices, (2,))
+        self.assertEqual(len(filtered), 2)
+        self.assertTrue(np.array_equal(filtered[0], stable))
+        self.assertTrue(np.array_equal(filtered[1], stable))
+
+    def test_transition_frame_filter_keeps_consistent_result_frames(self):
+        rng = np.random.default_rng(20260830)
+        frames = tuple(
+            rng.integers(30, 210, size=(120, 160, 3), dtype=np.uint8)
+            for _ in range(3)
+        )
+
+        filtered, indices = red_scout_module._filter_transition_frames(frames)
+
+        self.assertEqual(indices, ())
+        self.assertEqual(len(filtered), 3)
+
+    def test_transition_frame_filter_requires_two_stable_frames(self):
+        rng = np.random.default_rng(20260831)
+        # Use low-frequency texture so the compact signature retains enough
+        # variance to distinguish the dimmed frame from a blank placeholder.
+        stable_small = rng.integers(30, 210, size=(18, 32, 3), dtype=np.uint8)
+        stable = cv2.resize(stable_small, (160, 120), interpolation=cv2.INTER_NEAREST)
+        dialog = np.clip(stable.astype(np.float32) * 0.30, 0, 255).astype(np.uint8)
+
+        filtered, indices = red_scout_module._filter_transition_frames(
+            (stable, dialog)
+        )
+
+        self.assertEqual(filtered, ())
+        self.assertEqual(indices, (1,))
 
     def test_first_scout_keeps_disconnected_changed_cells_from_multi_point_bomb(self):
         evidence = {
@@ -606,6 +862,38 @@ class RedScoutAnalyzerTest(unittest.TestCase):
                 (3, 2): 0.93,
             },
         )
+
+    def test_down_right_flag_overlap_converts_upper_hit_to_miss(self):
+        hit_cells = {(0, 5), (1, 5), (1, 6)}
+        miss_cells: set[tuple[int, int]] = set()
+        unknown_cells: set[tuple[int, int]] = set()
+
+        discarded = red_scout_module.RedScoutAnalyzer._filter_down_right_flag_overlap_hits(
+            hit_cells=hit_cells,
+            miss_cells=miss_cells,
+            unknown_cells=unknown_cells,
+        )
+
+        self.assertEqual(discarded, {(0, 5)})
+        self.assertEqual(hit_cells, {(1, 5), (1, 6)})
+        self.assertEqual(miss_cells, {(0, 5)})
+        self.assertEqual(unknown_cells, set())
+
+    def test_down_right_flag_overlap_converts_upper_right_hit_to_miss(self):
+        hit_cells = {(0, 6), (1, 5), (1, 6)}
+        miss_cells: set[tuple[int, int]] = set()
+        unknown_cells: set[tuple[int, int]] = set()
+
+        discarded = red_scout_module.RedScoutAnalyzer._filter_down_right_flag_overlap_hits(
+            hit_cells=hit_cells,
+            miss_cells=miss_cells,
+            unknown_cells=unknown_cells,
+        )
+
+        self.assertEqual(discarded, {(0, 6)})
+        self.assertEqual(hit_cells, {(1, 5), (1, 6)})
+        self.assertEqual(miss_cells, {(0, 6)})
+        self.assertEqual(unknown_cells, set())
 
     def test_first_scout_ignores_cells_visible_before_red_bomb(self):
         evidence = {
@@ -880,6 +1168,94 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         )
         self.assertEqual(len(result.diagnostics["affected_before_limit"]), 7)
 
+    def test_strong_miss_requires_cross_frame_consistency(self):
+        selected = red_scout_module._consistent_strong_miss_cells(
+            median_change_by_cell={
+                (0, 0): 0.96,
+                (0, 1): 0.97,
+                (0, 2): 0.98,
+            },
+            states_by_cell={
+                (0, 0): ("miss", "miss", "miss", "miss"),
+                # A contradictory hit means this cell is animation/transition
+                # evidence, even though the median change is high.
+                (0, 1): ("miss", "miss", "hit", "miss"),
+                # Two misses out of four are below the three-vote requirement.
+                (0, 2): ("miss", "miss", "unknown", "unknown"),
+            },
+            frame_count=4,
+        )
+
+        self.assertEqual(selected, {(0, 0)})
+
+    def test_two_retained_frames_require_both_strong_miss_votes(self):
+        selected = red_scout_module._consistent_strong_miss_cells(
+            median_change_by_cell={(0, 0): 0.96, (0, 1): 0.96},
+            states_by_cell={
+                (0, 0): ("miss", "miss"),
+                (0, 1): ("miss", "unknown"),
+            },
+            frame_count=2,
+        )
+
+        self.assertEqual(selected, {(0, 0)})
+
+    def test_transition_noise_is_removed_before_six_cell_limit(self):
+        rng = np.random.default_rng(20260832)
+        stable = rng.integers(30, 210, size=(120, 160, 3), dtype=np.uint8)
+        dialog = np.clip(stable.astype(np.float32) * 0.30, 0, 255).astype(np.uint8)
+        cells = {
+            (0, 0), (0, 1), (0, 2),
+            (1, 0), (1, 1), (1, 2),
+            (2, 0),
+        }
+        stable_cells = cells - {(2, 0)}
+
+        def classifier(_before_image, after_image, screen_point):
+            if screen_point in stable_cells:
+                return SimpleNamespace(
+                    changed_ratio=0.96,
+                    state="miss",
+                    score=0.96,
+                )
+            if screen_point == (2, 0) and after_image is dialog:
+                return SimpleNamespace(
+                    changed_ratio=0.96,
+                    state="miss",
+                    score=0.96,
+                )
+            return SimpleNamespace(
+                changed_ratio=0.10,
+                state="unknown",
+                score=0.10,
+            )
+
+        analyzer = self._analyzer(
+            classifier,
+            hit_detector=lambda _image, _point: False,
+        )
+
+        result = analyzer.analyze(
+            before_image=np.zeros_like(stable),
+            after_images=(stable, stable.copy(), dialog),
+            grid_size=3,
+            click_points=tuple(
+                (row, col)
+                for row in range(3)
+                for col in range(3)
+            ),
+            center_cell=(1, 1),
+            excluded_cells=set(),
+            learned_footprint=red_scout_module.RedFootprint(
+                frozenset({(0, 0)})
+            ),
+        )
+
+        self.assertTrue(result.valid)
+        self.assertEqual(result.diagnostics["transition_frame_indices"], (2,))
+        self.assertEqual(len(result.affected_cells), 6)
+        self.assertNotIn((2, 0), result.affected_cells)
+
     def test_scout_keeps_only_six_strong_results_and_discards_moderate_noise(self):
         footprint_type = getattr(red_scout_module, "RedFootprint", None)
         self.assertIsNotNone(footprint_type, "RedFootprint must be public")
@@ -1044,20 +1420,25 @@ class RedScoutAnalyzerTest(unittest.TestCase):
             ),
         )
 
-        result = analyzer.analyze(
-            before_image=before_image,
-            after_images=after_images,
-            grid_size=10,
-            click_points=tuple(
-                (row, col)
-                for row in range(10)
-                for col in range(10)
-            ),
-            center_cell=(5, 5),
-            excluded_cells=set(),
-            learned_footprint=None,
-            submarine_lengths=fleet,
-        )
+        with patch.object(
+            red_scout_module,
+            "detect_completed_submarine_candidate_cells",
+            side_effect=[set()] + [partial_ship | {new_ship_hit}] * 4,
+        ):
+            result = analyzer.analyze(
+                before_image=before_image,
+                after_images=after_images,
+                grid_size=10,
+                click_points=tuple(
+                    (row, col)
+                    for row in range(10)
+                    for col in range(10)
+                ),
+                center_cell=(5, 5),
+                excluded_cells=set(),
+                learned_footprint=None,
+                submarine_lengths=fleet,
+            )
 
         expected_fallback_miss = (0, 2)
         self.assertTrue(result.valid)

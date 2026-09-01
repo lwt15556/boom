@@ -266,6 +266,16 @@ class SidebarProgressTest(unittest.TestCase):
         )
         self.assertEqual(resolution.unresolved_lengths, ())
 
+    def test_completed_ship_resolution_drops_upper_visual_overhang(self):
+        resolution = sidebar_progress.resolve_completed_ship_cells(
+            {(4, 4), (5, 4), (6, 4)},
+            completed_lengths=(2,),
+            grid_size=8,
+        )
+
+        self.assertEqual(resolution.cells, frozenset({(5, 4), (6, 4)}))
+        self.assertEqual(resolution.discarded_cells, frozenset({(4, 4)}))
+
 
 if __name__ == "__main__":
     unittest.main()

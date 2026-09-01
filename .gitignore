@@ -22,6 +22,16 @@ COLLABORATION.md
 *.zip
 _screen.png
 
+# Local-only debugging workspace
+_debug/
+
+# Local test reports and captured screenshots
+*_latest.txt
+*.trace
+/*.png
+/*.jpg
+/*.jpeg
+
 outputs/*.png
 _debug/screenshots/**
 _debug/diamond_hit_probe/**

@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from tools.control_panel import (
     format_probe_mode,
     format_reason,
     format_result,
+    format_runtime,
     should_show_log_line,
 )
 
@@ -144,6 +146,16 @@ class ControlPanelHelperTest(unittest.TestCase):
             format_reason("victory_banner_during_reentry"),
             "重新进入时检测到胜利",
         )
+
+    def test_format_runtime_uses_persisted_start_time(self):
+        self.assertEqual(
+            format_runtime(
+                "2026-08-29T10:00:00",
+                now=datetime(2026, 8, 29, 11, 1, 1),
+            ),
+            "01:01:01",
+        )
+        self.assertEqual(format_runtime("not-a-time"), "--")
 
     def test_red_scout_and_board_states_have_localized_names(self):
         self.assertEqual(control_panel.PHASE_NAMES["red_scout_preflight"], "红色侦察准备")

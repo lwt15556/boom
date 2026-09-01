@@ -25,6 +25,10 @@ from utils.wreck_detection import (
     COMPLETED_SHIP_BODY_MIN_SCORE,
     completed_ship_body_score,
     detect_completed_submarine_candidate_cells,
+    detect_red_submarine_marker_cells,
+    red_hit_marker_visible,
+    red_submarine_marker_visible,
+    grid_cell_polygon,
 )
 
 
@@ -45,6 +49,27 @@ RED_SCOUT_MISS_MIN_CHANGE = 0.88
 RED_SCOUT_MISS_MIN_VOTES = 3
 RED_SCOUT_MISS_FALLBACK_MIN_CHANGE = 0.60
 COMPLETED_SHIP_ENDPOINT_MIN_MARGIN = 0.08
+# A surfaced ship's end cell is often partially occluded by the wake.  Keep
+# the normal body threshold for ordinary candidates, but allow a slightly
+# weaker endpoint when the sidebar has independently confirmed completion.
+COMPLETED_SHIP_ENDPOINT_MIN_SCORE = 0.20
+# A surfaced hull can project into an adjacent row/column in the isometric
+# grid.  When the sidebar has independently confirmed completion, use the
+# body score to recover the legal straight placement instead of treating the
+# projection as an irregular ship.  These guards keep the fallback fail-closed.
+COMPLETED_SHIP_GEOMETRY_MIN_MEAN_SCORE = 0.30
+COMPLETED_SHIP_GEOMETRY_MIN_STRONG_CELLS = 3
+COMPLETED_SHIP_GEOMETRY_MIN_SUPPORT_CELLS = 2
+COMPLETED_SHIP_GEOMETRY_MIN_MARGIN = 0.03
+
+# Result captures can straddle the connection-dialog animation.  These
+# thresholds are intentionally conservative: a frame is discarded only when
+# it is a clear outlier relative to the other captured frames.
+RED_SCOUT_TRANSITION_DOWNSAMPLE = (32, 18)
+RED_SCOUT_TRANSITION_PIXEL_DIFF = 24.0
+RED_SCOUT_TRANSITION_MIN_DISTANCE = 0.10
+RED_SCOUT_TRANSITION_MIN_CHANGED_RATIO = 0.35
+RED_SCOUT_TRANSITION_OUTLIER_FACTOR = 2.5
 
 
 def _infer_completed_ship_endpoints(
@@ -54,8 +79,16 @@ def _infer_completed_ship_endpoints(
     grid_size: int,
     after_images: Sequence[np.ndarray],
     points_by_cell: Mapping[Cell, tuple[int, int]],
+    minimum_score: float = COMPLETED_SHIP_ENDPOINT_MIN_SCORE,
 ) -> set[Cell]:
     inferred: set[Cell] = set()
+
+    try:
+        endpoint_min_score = float(minimum_score)
+    except (TypeError, ValueError):
+        return inferred
+    if not np.isfinite(endpoint_min_score) or not 0.0 <= endpoint_min_score <= 1.0:
+        return inferred
 
     def maximal_runs(values: set[int]) -> list[tuple[int, ...]]:
         runs: list[tuple[int, ...]] = []
@@ -71,7 +104,7 @@ def _infer_completed_ship_endpoints(
 
     for raw_length in unresolved_lengths:
         length = int(raw_length)
-        if length < 3 or length > grid_size:
+        if length < 2 or length > grid_size:
             continue
 
         endpoint_groups: list[tuple[Cell, ...]] = []
@@ -106,10 +139,22 @@ def _infer_completed_ship_endpoints(
                 point = points_by_cell.get(cell)
                 if point is None:
                     continue
-                scores = [
-                    float(completed_ship_body_score(image, point))
-                    for image in after_images
-                ]
+                polygon = grid_cell_polygon(
+                    [points_by_cell[(r, c)] for r in range(grid_size) for c in range(grid_size)],
+                    cell[0] * grid_size + cell[1],
+                    grid_size,
+                )
+                scores = []
+                for image in after_images:
+                    try:
+                        score = completed_ship_body_score(
+                            image,
+                            point,
+                            cell_polygon=polygon,
+                        )
+                    except TypeError:
+                        score = completed_ship_body_score(image, point)
+                    scores.append(float(score))
                 if scores:
                     scored.append((float(median(scores)), cell))
             if not scored:
@@ -118,11 +163,120 @@ def _infer_completed_ship_endpoints(
             best_score, best_cell = scored[0]
             second_score = scored[1][0] if len(scored) > 1 else 0.0
             if (
-                best_score >= COMPLETED_SHIP_BODY_MIN_SCORE
+                best_score >= endpoint_min_score
                 and best_score - second_score >= COMPLETED_SHIP_ENDPOINT_MIN_MARGIN
             ):
                 inferred.add(best_cell)
     return inferred
+
+
+def _infer_completed_ship_body_placements(
+    body_candidates: set[Cell],
+    *,
+    unresolved_lengths: Sequence[int],
+    grid_size: int,
+    after_images: Sequence[np.ndarray],
+    points_by_cell: Mapping[Cell, tuple[int, int]],
+    blocked_cells: set[Cell] | frozenset[Cell] = frozenset(),
+) -> tuple[set[Cell], tuple[tuple[Cell, ...], ...]]:
+    """Recover straight ship placements from a stable surfaced-hull projection.
+
+    The red marker and isometric hull can straddle two visual rows, producing
+    an L-shaped candidate set even though the game ship is straight.  Sidebar
+    completion is required by the caller; this helper only accepts a placement
+    when multiple candidate cells support it and the complete body has a clear
+    score margin over the next legal placement.
+    """
+    inferred_cells: set[Cell] = set()
+    inferred_placements: list[tuple[Cell, ...]] = []
+    occupied = set(blocked_cells)
+    candidates = set(body_candidates)
+    try:
+        images = tuple(after_images)
+    except TypeError:
+        return inferred_cells, tuple(inferred_placements)
+    if not images:
+        return inferred_cells, tuple(inferred_placements)
+
+    for raw_length in unresolved_lengths:
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError):
+            continue
+        if length < 3 or length > grid_size:
+            continue
+
+        scored: list[tuple[float, int, int, tuple[Cell, ...]]] = []
+
+        def consider(cells: tuple[Cell, ...]) -> None:
+            nonlocal scored
+            placement_set = set(cells)
+            if any(
+                max(abs(row - used_row), abs(col - used_col)) <= 1
+                for row, col in placement_set
+                for used_row, used_col in occupied
+            ):
+                return
+            support_count = len(placement_set & candidates)
+            if support_count < COMPLETED_SHIP_GEOMETRY_MIN_SUPPORT_CELLS:
+                return
+            scores: list[float] = []
+            for cell in cells:
+                point = points_by_cell.get(cell)
+                if point is None:
+                    return
+                polygon = grid_cell_polygon(
+                    [points_by_cell[(r, c)] for r in range(grid_size) for c in range(grid_size)],
+                    cell[0] * grid_size + cell[1],
+                    grid_size,
+                )
+                per_frame = []
+                for image in images:
+                    try:
+                        score = completed_ship_body_score(
+                            image,
+                            point,
+                            cell_polygon=polygon,
+                        )
+                    except TypeError:
+                        score = completed_ship_body_score(image, point)
+                    per_frame.append(float(score))
+                if not per_frame:
+                    return
+                scores.append(float(median(per_frame)))
+            strong_count = sum(
+                score >= COMPLETED_SHIP_BODY_MIN_SCORE for score in scores
+            )
+            if strong_count < max(
+                COMPLETED_SHIP_GEOMETRY_MIN_STRONG_CELLS,
+                length - 1,
+            ):
+                return
+            mean_score = sum(scores) / float(length)
+            if mean_score < COMPLETED_SHIP_GEOMETRY_MIN_MEAN_SCORE:
+                return
+            scored.append((mean_score, strong_count, support_count, cells))
+
+        for row in range(grid_size):
+            for start_col in range(grid_size - length + 1):
+                consider(tuple((row, start_col + offset) for offset in range(length)))
+        for col in range(grid_size):
+            for start_row in range(grid_size - length + 1):
+                consider(tuple((start_row + offset, col) for offset in range(length)))
+
+        if not scored:
+            continue
+        scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]), reverse=True)
+        best = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else 0.0
+        if len(scored) > 1 and best[0] - second_score < COMPLETED_SHIP_GEOMETRY_MIN_MARGIN:
+            continue
+        placement = best[3]
+        inferred_placements.append(placement)
+        inferred_cells.update(placement)
+        occupied.update(placement)
+
+    return inferred_cells, tuple(inferred_placements)
 
 
 class ProbeMode(str, Enum):
@@ -235,9 +389,24 @@ def _inside_grid(cell: Cell, grid_size: int) -> bool:
     return 0 <= row < grid_size and 0 <= col < grid_size
 
 
-def _default_hit_detector(image: np.ndarray, point: tuple[int, int]) -> bool:
+def _default_hit_detector(
+    image: np.ndarray,
+    point: tuple[int, int],
+    *,
+    ignore_submarine_marker: bool = False,
+) -> bool:
     # Match the visible wreck to the requested cell instead of searching the
     # whole crop for a template that can also occur in ordinary water tiles.
+    # A red component attached to a surfaced submarine marks that submarine as
+    # complete, but the component itself is not hit evidence; completed-ship
+    # geometry handles the real hull cells separately.
+    # Red submarine decorations are never positive hit evidence.  Keep this
+    # guard independent of the caller's marker-ownership mode so the red
+    # object cannot become a scout hit through the diamond classifier.
+    if red_hit_marker_visible(image, point):
+        return False
+    if not ignore_submarine_marker and red_submarine_marker_visible(image, point):
+        return False
     try:
         result = classify_diamond_hit(
             image,
@@ -348,6 +517,241 @@ def _prefilter_candidates_by_change_upper_bound(
     return filtered
 
 
+def _frame_luma_signature(image: object) -> np.ndarray | None:
+    """Return a compact luminance signature used to spot transition frames.
+
+    The signature deliberately keeps absolute luminance.  A connection dialog
+    dims the complete scene, while ordinary water animation changes only a
+    small fraction of the down-sampled pixels.  Invalid images are ignored by
+    the caller rather than raising from the diagnostic path.
+    """
+    if not _valid_screenshot(image):
+        return None
+    try:
+        if image.ndim == 2:
+            gray = image
+        elif image.shape[2] == 4:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+        else:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        width, height = RED_SCOUT_TRANSITION_DOWNSAMPLE
+        if width <= 0 or height <= 0:
+            return None
+        return cv2.resize(
+            gray,
+            (int(width), int(height)),
+            interpolation=cv2.INTER_AREA,
+        ).astype(np.float32)
+    except (cv2.error, TypeError, ValueError):
+        return None
+
+
+def _frame_pair_metrics(
+    first: np.ndarray,
+    second: np.ndarray,
+) -> tuple[float, float] | None:
+    """Return (normalized distance, changed-pixel ratio) for two frames."""
+    first_signature = _frame_luma_signature(first)
+    second_signature = _frame_luma_signature(second)
+    if first_signature is None or second_signature is None:
+        return None
+    if first_signature.shape != second_signature.shape:
+        return None
+    delta = np.abs(first_signature - second_signature)
+    return (
+        float(np.mean(delta) / 255.0),
+        float(np.mean(delta >= RED_SCOUT_TRANSITION_PIXEL_DIFF)),
+    )
+
+
+def _looks_like_transition_overlay(image: np.ndarray) -> bool:
+    """Detect a full-screen dim overlay without requiring a template match.
+
+    The connection-interrupted and victory prompts dim the game scene.  A
+    variance guard prevents synthetic/blank test images (and a black loading
+    frame) from being treated as a dialog.
+    """
+    if not _valid_screenshot(image):
+        return False
+    try:
+        signature = _frame_luma_signature(image)
+        # Keep a small variance floor so blank/loading frames are ignored,
+        # while still recognizing a genuinely textured scene after a strong
+        # dimming overlay (which can have variance below 10 after downsampling).
+        if signature is None or float(np.std(signature)) < 8.0:
+            return False
+        dark_ratio = float(np.mean(signature < 80.0))
+        bright_ratio = float(np.mean(signature > 180.0))
+        # A real dimmed game screen still has texture throughout the central
+        # play area.  This guard excludes the mostly-black synthetic/sidebar
+        # frames used by tests and avoids treating a loading placeholder as a
+        # connection dialog.
+        central = signature[
+            int(signature.shape[0] * 0.20) : int(signature.shape[0] * 0.80),
+            int(signature.shape[1] * 0.20) : int(signature.shape[1] * 0.80),
+        ]
+        central_nonzero_ratio = float(np.mean(central > 5.0))
+        return (
+            dark_ratio >= 0.90
+            and bright_ratio <= 0.15
+            and central_nonzero_ratio >= 0.80
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _find_transition_frame_indices(
+    frames: Sequence[np.ndarray],
+) -> set[int]:
+    """Find clear outlier/overlay frames in a result capture.
+
+    A real result can differ substantially from the pre-click image, so the
+    decision is made against *other result frames*, not against the baseline.
+    At least two mutually consistent frames are required before an outlier is
+    removed.  This keeps animated-but-consistent captures fail-closed.
+    """
+    snapshots = tuple(frames)
+    if not snapshots:
+        return set()
+
+    discarded = {
+        index
+        for index, frame in enumerate(snapshots)
+        if _looks_like_transition_overlay(frame)
+    }
+    if len(snapshots) < 3:
+        return discarded
+
+    pair_metrics: dict[tuple[int, int], tuple[float, float]] = {}
+    for first_index in range(len(snapshots)):
+        for second_index in range(first_index + 1, len(snapshots)):
+            metrics = _frame_pair_metrics(
+                snapshots[first_index],
+                snapshots[second_index],
+            )
+            if metrics is None:
+                return discarded
+            pair_metrics[(first_index, second_index)] = metrics
+
+    nearest_distance: list[float] = []
+    nearest_changed: list[float] = []
+    for index in range(len(snapshots)):
+        neighbours = [
+            (pair_metrics[(min(index, other), max(index, other))], other)
+            for other in range(len(snapshots))
+            if other != index
+        ]
+        (distance, changed_ratio), _other = min(
+            neighbours,
+            key=lambda item: item[0][0],
+        )
+        nearest_distance.append(distance)
+        nearest_changed.append(changed_ratio)
+
+    # Exclude the largest nearest-neighbour distance when estimating the
+    # stable cluster.  If fewer than two frames remain in that cluster, no
+    # automatic outlier removal is safe.
+    ordered_distances = sorted(nearest_distance)
+    stable_reference = float(median(ordered_distances[:-1]))
+    stable_cutoff = max(
+        RED_SCOUT_TRANSITION_MIN_DISTANCE,
+        stable_reference * RED_SCOUT_TRANSITION_OUTLIER_FACTOR,
+    )
+    stable_indices = {
+        index
+        for index, distance in enumerate(nearest_distance)
+        if distance < stable_cutoff
+    }
+    if len(stable_indices) < MINIMUM_FRAME_VOTES:
+        return discarded
+
+    for index, distance in enumerate(nearest_distance):
+        if (
+            distance >= stable_cutoff
+            and nearest_changed[index] >= RED_SCOUT_TRANSITION_MIN_CHANGED_RATIO
+        ):
+            discarded.add(index)
+    return discarded
+
+
+def _filter_transition_frames(
+    frames: Sequence[np.ndarray],
+) -> tuple[tuple[np.ndarray, ...], tuple[int, ...]]:
+    """Drop only confidently transient result frames.
+
+    Returning an empty frame tuple signals that fewer than the required two
+    stable frames remain; the analyzer then returns an invalid result instead
+    of silently accepting a single animation frame.
+    """
+    snapshots = tuple(frames)
+    discarded = _find_transition_frame_indices(snapshots)
+    if not discarded:
+        return snapshots, ()
+    retained = tuple(
+        frame
+        for index, frame in enumerate(snapshots)
+        if index not in discarded
+    )
+    if len(retained) < MINIMUM_FRAME_VOTES:
+        return (), tuple(sorted(discarded))
+    return retained, tuple(sorted(discarded))
+
+
+def _required_strong_miss_votes(frame_count: int) -> int:
+    """Return the minimum vote count for a stable miss decision.
+
+    Captures normally contain three frames.  When one transition frame is
+    discarded, two good frames remain and both must agree; never lower the
+    requirement below the global two-frame evidence floor.
+    """
+    try:
+        count = int(frame_count)
+    except (TypeError, ValueError):
+        return RED_SCOUT_MISS_MIN_VOTES
+    if count <= 0:
+        return RED_SCOUT_MISS_MIN_VOTES
+    return max(
+        MINIMUM_FRAME_VOTES,
+        min(RED_SCOUT_MISS_MIN_VOTES, count),
+    )
+
+
+def _consistent_strong_miss_cells(
+    *,
+    median_change_by_cell: Mapping[Cell, float],
+    states_by_cell: Mapping[Cell, tuple[str, ...]],
+    frame_count: int,
+    excluded_cells: set[Cell] | frozenset[Cell] = frozenset(),
+) -> set[Cell]:
+    """Select strong misses supported consistently across result frames.
+
+    A single-frame ``miss`` caused by an explosion or page redraw must not
+    become part of the six-cell footprint.  In addition to the change
+    threshold, require enough miss votes and reject any contradictory hit vote.
+    """
+    required_votes = _required_strong_miss_votes(frame_count)
+    excluded = set(excluded_cells)
+    selected: set[Cell] = set()
+    for cell, changed_ratio in median_change_by_cell.items():
+        if cell in excluded:
+            continue
+        try:
+            ratio = float(changed_ratio)
+        except (TypeError, ValueError):
+            continue
+        states = tuple(str(state).strip().lower() for state in states_by_cell.get(cell, ()))
+        miss_votes = states.count("miss")
+        hit_votes = states.count("hit")
+        if (
+            np.isfinite(ratio)
+            and ratio >= RED_SCOUT_MISS_MIN_CHANGE
+            and miss_votes >= required_votes
+            and hit_votes == 0
+        ):
+            selected.add(cell)
+    return selected
+
+
 class RedScoutAnalyzer:
     def __init__(
         self,
@@ -362,6 +766,35 @@ class RedScoutAnalyzer:
             raise TypeError("hit_detector must be callable")
         self._classifier = classifier
         self._hit_detector = hit_detector
+        self._marker_points: tuple[tuple[int, int], ...] = ()
+        self._marker_grid_size = 0
+
+    def _detect_hit(self, image: np.ndarray, point: tuple[int, int]) -> bool:
+        """Run hit detection with global red-marker ownership when possible."""
+        if self._hit_detector is not _default_hit_detector:
+            return bool(self._hit_detector(image, point))
+        if not self._marker_points or self._marker_grid_size <= 0:
+            return _default_hit_detector(image, point)
+        marker_cells = detect_red_submarine_marker_cells(
+            image,
+            list(self._marker_points),
+            self._marker_grid_size,
+        )
+        nearest_cell = min(
+            (
+                (index // self._marker_grid_size, index % self._marker_grid_size)
+                for index in range(len(self._marker_points))
+            ),
+            key=lambda cell: (
+                (self._marker_points[cell[0] * self._marker_grid_size + cell[1]][0] - point[0]) ** 2
+                + (self._marker_points[cell[0] * self._marker_grid_size + cell[1]][1] - point[1]) ** 2
+            ),
+        )
+        return _default_hit_detector(
+            image,
+            point,
+            ignore_submarine_marker=nearest_cell not in marker_cells,
+        )
 
     def analyze(
         self,
@@ -392,17 +825,31 @@ class RedScoutAnalyzer:
                 diagnostics={"stage": "preflight"},
             )
 
-        frames, points_by_cell, excluded, learned_offsets = preflight
+        raw_frames, points_by_cell, excluded, learned_offsets = preflight
+        self._marker_points = tuple((int(x), int(y)) for x, y in click_points)
+        self._marker_grid_size = int(grid_size)
+        frames, transition_frame_indices = _filter_transition_frames(raw_frames)
         diagnostics: dict[str, object] = {
             "stage": "candidate_detection",
             "center": result_center,
             "excluded_cells": tuple(sorted(excluded)),
+            "raw_frame_count": len(raw_frames),
+            "frame_count": len(frames),
+            "transition_frame_indices": transition_frame_indices,
             "learned_footprint": (
                 tuple(sorted(learned_offsets))
                 if learned_offsets is not None
                 else ()
             ),
         }
+        if len(frames) < MINIMUM_FRAME_VOTES:
+            diagnostics["stage"] = "transition_frame_filter"
+            diagnostics["retained_frame_count"] = len(frames)
+            return self._invalid_result(
+                result_center,
+                reason="transition_frames_insufficient",
+                diagnostics=diagnostics,
+            )
         # A learned footprint is a planning hint, not a fixed description of
         # every later red-bomb result. The affected cells can vary with the
         # target position, so every unknown cell must be considered by analysis.
@@ -502,20 +949,40 @@ class RedScoutAnalyzer:
                 states_by_cell.setdefault(cell, authoritative_states)
         diagnostics["resolved_ship_hits"] = tuple(sorted(stable_result_hits))
 
-        strong_result_misses = {
-            cell
-            for cell, changed_ratio in median_change_by_cell.items()
-            if (
-                cell not in raw_stable_result_hits
-                and cell not in completed_visual_zone
-                and changed_ratio >= RED_SCOUT_MISS_MIN_CHANGE
-                and states_by_cell[cell].count("miss") >= RED_SCOUT_MISS_MIN_VOTES
-            )
-        }
+        strong_result_misses = _consistent_strong_miss_cells(
+            median_change_by_cell=median_change_by_cell,
+            states_by_cell=states_by_cell,
+            frame_count=len(frames),
+            excluded_cells=(
+                raw_stable_result_hits
+                | completed_visual_zone
+            ),
+        )
+        diagnostics["strong_miss_required_votes"] = _required_strong_miss_votes(
+            len(frames)
+        )
         diagnostics["strong_misses"] = tuple(sorted(strong_result_misses))
         affected = stable_result_hits | strong_result_misses
         if before_visible:
             affected = affected - before_visible
+        # Remove the raised-flag cell before enforcing the six-cell red-bomb
+        # limit.  Without this early pass, the flag artifact itself can make a
+        # genuine six-cell result look like seven affected cells and invalidate
+        # the whole scout attempt.
+        early_flag_cells = self._find_down_right_flag_overlap_cells(
+            stable_result_hits,
+            affected,
+        )
+        if early_flag_cells:
+            affected.difference_update(early_flag_cells)
+            stable_result_hits.difference_update(early_flag_cells)
+            strong_result_misses.difference_update(early_flag_cells)
+            diagnostics["down_right_flag_discarded"] = tuple(
+                sorted(early_flag_cells)
+            )
+            diagnostics["down_right_flag_forced_misses"] = tuple(
+                sorted(early_flag_cells)
+            )
         diagnostics["affected_before_limit"] = tuple(sorted(affected))
         if len(affected) > RED_SCOUT_RESULT_CELL_COUNT:
             if completed_ship is None:
@@ -640,11 +1107,40 @@ class RedScoutAnalyzer:
                 diagnostics=diagnostics,
             )
         hit_cells, miss_cells, unknown_cells = classified
+        # The discarded flag cell is known to be a visual false positive. Keep
+        # it as a miss observation for the board even though it is excluded
+        # from the six-cell footprint used by the planner.
+        miss_cells.update(early_flag_cells)
+        unknown_cells.difference_update(early_flag_cells)
         if completed_ship is not None:
             authoritative_hits = set(completed_ship.new_hit_cells) & affected
             hit_cells.update(authoritative_hits)
             miss_cells.difference_update(authoritative_hits)
             unknown_cells.difference_update(authoritative_hits)
+
+        # Perspective overlap can make two cells above a real diagonal pair
+        # look like hits.  A submarine cannot occupy a diagonal, so when the
+        # result is an exact top-left -> bottom-right run, keep the lower pair
+        # only if it has independent hit evidence and discard the upper noise.
+        diagonal_discarded = self._filter_diagonal_overlap_hits(
+            hit_cells=hit_cells,
+            affected=affected,
+            confidence_by_cell=median_change_by_cell,
+            states_by_cell=states_by_cell,
+        )
+        if diagonal_discarded:
+            diagnostics["diagonal_overlap_discarded"] = tuple(
+                sorted(diagonal_discarded)
+            )
+        flag_discarded = self._filter_down_right_flag_overlap_hits(
+            hit_cells=hit_cells,
+            miss_cells=miss_cells,
+            unknown_cells=unknown_cells,
+        )
+        if flag_discarded:
+            diagnostics["down_right_flag_discarded"] = tuple(
+                sorted(flag_discarded)
+            )
 
         confidence_by_cell = {
             cell: median_change_by_cell[cell]
@@ -670,6 +1166,123 @@ class RedScoutAnalyzer:
             invalid_reason=None if valid else "insufficient_changed_cells",
             diagnostics=diagnostics,
         )
+
+    @staticmethod
+    def _filter_diagonal_overlap_hits(
+        *,
+        hit_cells: set[Cell],
+        affected: set[Cell],
+        confidence_by_cell: Mapping[Cell, float],
+        states_by_cell: Mapping[Cell, tuple[str, ...]],
+    ) -> set[Cell]:
+        """Drop upper false hits from the known diagonal-overlap layout.
+
+        The filter is deliberately narrow: it requires at least four hits on
+        one exact r-c diagonal and two contiguous lower cells with stronger,
+        multi-frame hit evidence.  Other layouts are left untouched.
+        """
+        if len(hit_cells) < 4:
+            return set()
+        groups: dict[int, list[Cell]] = {}
+        for cell in hit_cells:
+            row, col = cell
+            groups.setdefault(row - col, []).append(cell)
+        for cells in groups.values():
+            ordered = sorted(cells)
+            if len(ordered) < 4:
+                continue
+            lower = ordered[-2:]
+            if not (
+                lower[1][0] == lower[0][0] + 1
+                and lower[1][1] == lower[0][1] + 1
+            ):
+                continue
+            upper = ordered[:-2]
+            lower_votes = [
+                states_by_cell.get(cell, ()).count("hit") for cell in lower
+            ]
+            upper_votes = [
+                states_by_cell.get(cell, ()).count("hit") for cell in upper
+            ]
+            lower_confidence = min(
+                float(confidence_by_cell.get(cell, 0.0)) for cell in lower
+            )
+            upper_confidence = max(
+                float(confidence_by_cell.get(cell, 0.0)) for cell in upper
+            )
+            if (
+                min(lower_votes) >= 2
+                and max(upper_votes, default=0) <= min(lower_votes)
+                and lower_confidence >= upper_confidence
+            ):
+                discarded = set(upper)
+                hit_cells.difference_update(discarded)
+                affected.difference_update(discarded)
+                return discarded
+        return set()
+
+    @staticmethod
+    def _filter_down_right_flag_overlap_hits(
+        *,
+        hit_cells: set[Cell],
+        miss_cells: set[Cell],
+        unknown_cells: set[Cell],
+    ) -> set[Cell]:
+        """Convert the raised-flag cell above a down-right ship to a miss.
+
+        A screen-down-right submarine can produce an L-shaped visual result:
+        one cell on the upper row (the raised red flag) and two adjacent cells
+        on the row below (the actual hull).  Since ships are strictly straight,
+        the upper cell cannot be a third submarine cell.  Apply this narrowly
+        to any matching three-hit subset before blue targets are queued.
+        """
+        if len(hit_cells) < 3:
+            return set()
+        by_row: dict[int, set[Cell]] = {}
+        for cell in hit_cells:
+            by_row.setdefault(cell[0], set()).add(cell)
+        for upper_row, upper_cells in sorted(by_row.items()):
+            if len(upper_cells) != 1:
+                continue
+            lower_cells = by_row.get(upper_row + 1, set())
+            if len(lower_cells) < 2:
+                continue
+            lower_cols = sorted(col for _row, col in lower_cells)
+            for left_col in lower_cols:
+                pair = {(upper_row + 1, left_col), (upper_row + 1, left_col + 1)}
+                if pair.issubset(hit_cells) and next(iter(upper_cells))[1] in {
+                    left_col,
+                    left_col + 1,
+                }:
+                    false_cell = next(iter(upper_cells))
+                    hit_cells.discard(false_cell)
+                    miss_cells.add(false_cell)
+                    unknown_cells.discard(false_cell)
+                    return {false_cell}
+        return set()
+
+    @staticmethod
+    def _find_down_right_flag_overlap_cells(
+        hit_cells: set[Cell],
+        affected: set[Cell],
+    ) -> set[Cell]:
+        """Find upper flag cells before the affected-cell limit is enforced."""
+        if len(hit_cells) < 2:
+            return set()
+        discarded: set[Cell] = set()
+        for upper_row, upper_col in sorted(affected):
+            upper = (upper_row, upper_col)
+            # The raised flag can appear above either end of the two-cell
+            # horizontal hull. Check both possible pair anchors.
+            for left_col in (upper_col - 1, upper_col):
+                pair = {
+                    (upper_row + 1, left_col),
+                    (upper_row + 1, left_col + 1),
+                }
+                if pair.issubset(hit_cells):
+                    discarded.add(upper)
+                    break
+        return discarded
 
     @staticmethod
     def _completed_ship_evidence(
@@ -767,16 +1380,78 @@ class RedScoutAnalyzer:
         details["completed_body_candidates"] = tuple(
             sorted(stable_body_candidates)
         )
+        details["inferred_ship_body_placements"] = ()
         details["completed_body_overrides"] = tuple(
             sorted(stable_body_candidates - eligible_cells)
         )
 
-        resolution = resolve_completed_ship_cells(
-            before_visible | raw_stable_result_hits | stable_body_candidates,
-            completed_lengths,
-            grid_size=grid_size,
-            preferred_cells=raw_stable_result_hits - before_visible,
-        )
+        # A sidebar color change says that some submarine completed, but it
+        # does not locate that submarine.  Only a stable red surfaced-submarine
+        # marker and its nearby hull evidence may promote coordinates to a
+        # complete placement.  Without the red object, keep ordinary wrecks as
+        # provisional hits so an unrelated old hit line cannot steal the newly
+        # completed fleet length.
+        if not stable_body_candidates:
+            details["completed_ship_failure"] = "missing_red_body_evidence"
+            return None
+
+        # Resolve all newly completed ships from the red-marked hull evidence
+        # before allowing raw hit coordinates to participate.  In a frame that
+        # surfaces multiple ships, a short exact run can otherwise greedily
+        # consume a hit cell that belongs to a longer ship and make the longer
+        # placement impossible to recover.
+        geometry_candidates = set(stable_body_candidates)
+        if geometry_candidates:
+            inferred_geometry_cells, inferred_geometry_placements = (
+                _infer_completed_ship_body_placements(
+                    geometry_candidates | raw_stable_result_hits,
+                    unresolved_lengths=completed_lengths,
+                    grid_size=grid_size,
+                    after_images=after_images,
+                    points_by_cell=points_by_cell,
+                )
+            )
+            if inferred_geometry_cells:
+                details["inferred_ship_body_placements"] = tuple(
+                    tuple(sorted(placement))
+                    for placement in inferred_geometry_placements
+                )
+                geometry_candidates.update(inferred_geometry_cells)
+
+            resolution = resolve_completed_ship_cells(
+                geometry_candidates,
+                completed_lengths,
+                grid_size=grid_size,
+                preferred_cells=raw_stable_result_hits - before_visible,
+            )
+        else:
+            # Preserve the legacy perimeter/spill filtering when the marker
+            # detector misses a frame.  The caller still requires an exact
+            # straight placement; no geometry can be inferred from an empty
+            # candidate set.
+            raw_resolution = resolve_completed_ship_cells(
+                before_visible | raw_stable_result_hits,
+                completed_lengths,
+                grid_size=grid_size,
+                preferred_cells=raw_stable_result_hits - before_visible,
+            )
+            # A plain straight run of changed cells is still ordinary hit
+            # evidence.  Without an independently detected red component or
+            # gray hull body, do not promote that run to a completed ship just
+            # because the sidebar color classifier changed for one frame.
+            raw_exact_completion = any(
+                set(placement).issubset(raw_stable_result_hits)
+                for placement in raw_resolution.placements
+            )
+            if raw_exact_completion:
+                details["completed_ship_failure"] = "missing_red_body_evidence"
+                resolution = resolve_completed_ship_cells(
+                    set(),
+                    completed_lengths,
+                    grid_size=grid_size,
+                )
+            else:
+                resolution = raw_resolution
         inferred_endpoints: set[Cell] = set()
         if resolution.unresolved_lengths:
             inferred_endpoints = _infer_completed_ship_endpoints(
@@ -785,12 +1460,15 @@ class RedScoutAnalyzer:
                 grid_size=grid_size,
                 after_images=after_images,
                 points_by_cell=points_by_cell,
+                # The sidebar completion vote is an independent confirmation
+                # that justifies the relaxed endpoint threshold.  The helper
+                # still requires a contiguous length-1 run and a clear score
+                # margin before adding either endpoint.
+                minimum_score=COMPLETED_SHIP_ENDPOINT_MIN_SCORE,
             )
             if inferred_endpoints:
                 resolution = resolve_completed_ship_cells(
-                    before_visible
-                    | raw_stable_result_hits
-                    | stable_body_candidates
+                    geometry_candidates
                     | inferred_endpoints,
                     completed_lengths,
                     grid_size=grid_size,
@@ -800,12 +1478,39 @@ class RedScoutAnalyzer:
                         | inferred_endpoints
                     ),
                 )
+        if resolution.unresolved_lengths:
+            inferred_body_cells, inferred_body_placements = (
+                _infer_completed_ship_body_placements(
+                    stable_body_candidates,
+                    unresolved_lengths=resolution.unresolved_lengths,
+                    grid_size=grid_size,
+                    after_images=after_images,
+                    points_by_cell=points_by_cell,
+                    blocked_cells=resolution.cells,
+                )
+            )
+            if inferred_body_cells:
+                details["inferred_ship_body_placements"] = tuple(
+                    tuple(sorted(placement))
+                    for placement in inferred_body_placements
+                )
+                resolution = resolve_completed_ship_cells(
+                    geometry_candidates | inferred_body_cells,
+                    completed_lengths,
+                    grid_size=grid_size,
+                    preferred_cells=(
+                        raw_stable_result_hits
+                        - before_visible
+                        | inferred_body_cells
+                    ),
+                )
         details["inferred_ship_endpoints"] = tuple(sorted(inferred_endpoints))
         details["resolved_ship_placements"] = resolution.placements
         details["unresolved_ship_lengths"] = resolution.unresolved_lengths
         details["discarded_ship_cells"] = tuple(sorted(resolution.discarded_cells))
         if resolution.unresolved_lengths:
-            details["completed_ship_failure"] = "ship_geometry_unresolved"
+            if details.get("completed_ship_failure") is None:
+                details["completed_ship_failure"] = "ship_geometry_unresolved"
             return None
 
         new_hit_cells = set(resolution.cells) - before_visible
@@ -967,7 +1672,7 @@ class RedScoutAnalyzer:
             for after_image in after_images:
                 try:
                     detector_votes += bool(
-                        self._hit_detector(after_image, points_by_cell[cell])
+                        self._detect_hit(after_image, points_by_cell[cell])
                     )
                 except Exception:
                     return None
@@ -1029,7 +1734,7 @@ class RedScoutAnalyzer:
         visible: set[Cell] = set()
         for cell in sorted(candidates):
             try:
-                if self._hit_detector(before_image, points_by_cell[cell]):
+                if self._detect_hit(before_image, points_by_cell[cell]):
                     visible.add(cell)
             except Exception:
                 return None
@@ -1051,7 +1756,7 @@ class RedScoutAnalyzer:
             detector_votes = 0
             for after_image in after_images:
                 try:
-                    detector_votes += bool(self._hit_detector(after_image, point))
+                    detector_votes += bool(self._detect_hit(after_image, point))
                 except Exception:
                     return None
 

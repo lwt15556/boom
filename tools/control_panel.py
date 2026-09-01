@@ -60,6 +60,7 @@ from PyQt6.QtWidgets import (
 from config import ADB_EXE, ADB_SERIAL, GAME_PACKAGE_NAME, LOG_FILE, RED_SCOUT_MAX_COUNT
 from utils.adb_control import AdbController
 from utils.pending_probe import clear_pending_probe, has_pending_probe
+from utils.progress import format_elapsed
 from utils.runtime_lock import MAIN_PID_FILE, get_main_process, is_pid_running, remove_pid
 
 
@@ -188,6 +189,23 @@ def build_main_environment(mode: object, red_count: object) -> dict[str, str]:
 
 def now_text() -> str:
     return datetime.now().strftime("%H:%M:%S")
+
+
+def format_runtime(started_at: object, *, now: datetime | None = None) -> str:
+    """Format the persisted main-process start time as ``HH:MM:SS``."""
+    if not started_at:
+        return "--"
+    try:
+        start = datetime.fromisoformat(str(started_at))
+        current = now or datetime.now(tz=start.tzinfo)
+        if start.tzinfo is None and current.tzinfo is not None:
+            current = current.replace(tzinfo=None)
+        elif start.tzinfo is not None and current.tzinfo is None:
+            current = current.replace(tzinfo=start.tzinfo)
+        elapsed = (current - start).total_seconds()
+    except (TypeError, ValueError, OverflowError):
+        return "--"
+    return format_elapsed(elapsed)
 
 
 def run_command(command: list[str], timeout: int = 30) -> subprocess.CompletedProcess[str]:
@@ -707,6 +725,7 @@ class ControlPanel(QMainWindow):
         self.last_result_value = QLabel("--")
         self.completed_ships_value = QLabel("--")
         self.visual_mapping_value = QLabel("--")
+        self.runtime_value = QLabel("--")
 
         self.shot_progress = self._new_progress_bar("shotProgress")
         self.hit_progress = self._new_progress_bar("hitProgress")
@@ -848,6 +867,7 @@ class ControlPanel(QMainWindow):
             ("最近结果", self.last_result_value),
             ("已完成潜艇", self.completed_ships_value),
             ("视觉坐标", self.visual_mapping_value),
+            ("运行时间", self.runtime_value),
         )
         state_box.setMinimumHeight(178)
         row_count = (len(rows) + 1) // 2
@@ -1304,6 +1324,8 @@ class ControlPanel(QMainWindow):
         if running:
             self.last_running_pid = self.main_pid
         self.was_running = running
+
+        self.runtime_value.setText(format_runtime(self.runtime_status.get("started_at")))
 
         process_signature = (running, self.main_pid)
         if initial or process_signature != self.last_process_render_signature:

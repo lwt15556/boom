@@ -80,11 +80,13 @@ function Find-CompatiblePython {
         }
     }
 
-    $knownPython = Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"
-    if (Test-Path -LiteralPath $knownPython) {
-        $candidate = Test-PythonCandidate -FilePath $knownPython
-        if ($null -ne $candidate) {
-            return $candidate
+    $knownPythonRoot = Join-Path $env:LOCALAPPDATA "Programs\Python"
+    if (Test-Path -LiteralPath $knownPythonRoot) {
+        foreach ($knownPython in (Get-ChildItem -LiteralPath $knownPythonRoot -Directory -Filter "Python3*" -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
+            $candidate = Test-PythonCandidate -FilePath (Join-Path $knownPython.FullName "python.exe")
+            if ($null -ne $candidate) {
+                return $candidate
+            }
         }
     }
 
@@ -104,23 +106,61 @@ function Find-CompatiblePython {
 
 function Install-Python311 {
     $winget = Get-Command "winget.exe" -ErrorAction SilentlyContinue
-    if ($null -eq $winget) {
-        throw "未找到 Python 3.10+，并且系统没有 winget。请先从 https://www.python.org/downloads/windows/ 安装 Python 3.11，然后重新双击一键启动文件。"
+    if ($null -ne $winget) {
+        Write-Step "未找到可用的 Python，正在通过 winget 安装 Python 3.11"
+        try {
+            Invoke-Checked `
+                -FilePath $winget.Source `
+                -Arguments @(
+                    "install",
+                    "--id", "Python.Python.3.11",
+                    "--exact",
+                    "--scope", "user",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                    "--silent"
+                ) `
+                -FailureMessage "Python 3.11 自动安装失败"
+            $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+            return
+        }
+        catch {
+            Write-Host "winget 安装失败，改用 Python 官方安装包：$($_.Exception.Message)" -ForegroundColor Yellow
+        }
     }
 
-    Write-Step "未找到可用的 Python，正在通过 winget 安装 Python 3.11"
-    Invoke-Checked `
-        -FilePath $winget.Source `
-        -Arguments @(
-            "install",
-            "--id", "Python.Python.3.11",
-            "--exact",
-            "--scope", "user",
-            "--accept-package-agreements",
-            "--accept-source-agreements",
-            "--silent"
-        ) `
-        -FailureMessage "Python 3.11 自动安装失败"
+    Write-Step "通过 Python 官方安装包安装 Python 3.11"
+    $architecture = $env:PROCESSOR_ARCHITECTURE.ToUpperInvariant()
+    $installerName = if ($architecture -eq "ARM64") {
+        "python-3.11.9-arm64.exe"
+    }
+    elseif ($architecture -eq "X86") {
+        "python-3.11.9.exe"
+    }
+    else {
+        "python-3.11.9-amd64.exe"
+    }
+    $installerUrl = "https://www.python.org/ftp/python/3.11.9/$installerName"
+    $installerPath = Join-Path ([System.IO.Path]::GetTempPath()) $installerName
+    try {
+        Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
+        $process = Start-Process -FilePath $installerPath -ArgumentList @(
+            "/quiet", "InstallAllUsers=0", "PrependPath=1", "Include_test=0"
+        ) -Wait -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "官方安装程序退出码 $($process.ExitCode)"
+        }
+    }
+    catch {
+        throw "无法自动安装 Python。请从 $installerUrl 下载并安装 Python 3.11，然后重新双击一键启动文件。原因：$($_.Exception.Message)"
+    }
+    finally {
+        Remove-Item -LiteralPath $installerPath -Force -ErrorAction SilentlyContinue
+    }
+
+    # The current PowerShell process does not automatically inherit the PATH
+    # changed by the installer; refresh it before the second detection pass.
+    $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
 }
 
 Write-Host "BoomBeachSonarAuto 一键环境配置" -ForegroundColor Green
