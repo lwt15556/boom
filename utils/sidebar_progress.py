@@ -265,6 +265,21 @@ def resolve_completed_ship_cells(
             )
         return sum(neighbor in candidates for neighbor in neighbors)
 
+    def upper_visual_overhang_score(
+        placement: tuple[tuple[int, int], ...],
+    ) -> int:
+        if len(placement) < 2:
+            return 0
+        first_row, first_col = placement[0]
+        last_row, last_col = placement[-1]
+        if first_row == last_row:
+            upper_neighbor = (first_row, first_col - 1)
+            lower_neighbor = (last_row, last_col + 1)
+        else:
+            upper_neighbor = (first_row - 1, first_col)
+            lower_neighbor = (last_row + 1, last_col)
+        return int(upper_neighbor in candidates and lower_neighbor not in candidates)
+
     def supported_placements(length: int) -> tuple[tuple[tuple[int, int], ...], ...]:
         if length <= 0 or length > grid_size:
             return ()
@@ -306,11 +321,12 @@ def resolve_completed_ship_cells(
         int,
         int,
         int,
+        int,
         tuple[tuple[tuple[int, int], ...], ...],
         tuple[int, ...],
     ]:
         if index >= len(lengths):
-            return 0, 0, 0, 0, (), ()
+            return 0, 0, 0, 0, 0, (), ()
 
         length = lengths[index]
         skipped = solve(index + 1, used)
@@ -320,7 +336,8 @@ def resolve_completed_ship_cells(
             skipped[2],
             skipped[3],
             skipped[4],
-            (length,) + skipped[5],
+            skipped[5],
+            (length,) + skipped[6],
         )
 
         for placement in placements_by_length.get(length, ()):
@@ -333,11 +350,12 @@ def resolve_completed_ship_cells(
                 1 + remainder[1],
                 len(set(placement) & preferred) + remainder[2],
                 remainder[3] - placement_extension_count(placement),
-                (placement,) + remainder[4],
-                remainder[5],
+                upper_visual_overhang_score(placement) + remainder[4],
+                (placement,) + remainder[5],
+                remainder[6],
             )
-            candidate_score = candidate[:4]
-            best_score = best[:4]
+            candidate_score = candidate[:5]
+            best_score = best[:5]
             if candidate_score > best_score or (
                 candidate_score == best_score
                 and (candidate[4], candidate[5]) < (best[4], best[5])
@@ -350,6 +368,7 @@ def resolve_completed_ship_cells(
         _resolved_count,
         _preferred_count,
         _negative_extensions,
+        _upper_visual_overhang,
         placements,
         unresolved,
     ) = solve(

@@ -8,7 +8,7 @@ import unittest
 from contextlib import nullcontext
 from threading import Event
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import cv2
 import numpy as np
@@ -346,6 +346,82 @@ class MainFlowTest(unittest.TestCase):
 
         self.assertIs(result, primary)
         self.assertEqual(analyze.call_count, 2)
+
+    def test_red_result_transition_filter_discards_dialog_frame_with_two_clean_frames(self):
+        before = np.zeros((120, 160, 3), dtype=np.uint8)
+        frames = [
+            np.full_like(before, 10),
+            np.full_like(before, 20),
+            np.full_like(before, 30),
+        ]
+        with (
+            patch.object(self.main, "find_connection_interrupted_dialog", side_effect=[None, DummyMatch((80, 60)), None]),
+            patch.object(self.main, "find_victory_banner", return_value=None),
+        ):
+            filtered, diagnostics = self.main._filter_red_result_transition_frames(
+                before,
+                frames,
+            )
+
+        self.assertEqual(filtered, (frames[0], frames[2]))
+        self.assertTrue(diagnostics["filter_applied"])
+        self.assertEqual(diagnostics["kept_indices"], (0, 2))
+        self.assertEqual(
+            diagnostics["discarded_frames"],
+            ({"index": 1, "reasons": ("connection_interrupted_dialog",)},),
+        )
+
+    def test_red_result_transition_filter_keeps_raw_frames_when_fewer_than_two_clean(self):
+        before = np.zeros((120, 160, 3), dtype=np.uint8)
+        frames = [np.full_like(before, value) for value in (10, 20, 30)]
+        with (
+            patch.object(
+                self.main,
+                "find_connection_interrupted_dialog",
+                return_value=DummyMatch((80, 60)),
+            ),
+            patch.object(self.main, "find_victory_banner", return_value=None),
+        ):
+            filtered, diagnostics = self.main._filter_red_result_transition_frames(
+                before,
+                frames,
+            )
+
+        self.assertIs(filtered, frames)
+        self.assertFalse(diagnostics["filter_applied"])
+        self.assertEqual(diagnostics["reason"], "insufficient_stable_frames")
+
+    def test_red_analysis_attaches_transition_filter_diagnostics(self):
+        before = np.zeros((120, 160, 3), dtype=np.uint8)
+        frames = [np.full_like(before, value) for value in (10, 20, 30)]
+        result = self._valid_red_result()
+        with (
+            patch.object(
+                self.main,
+                "find_connection_interrupted_dialog",
+                side_effect=[None, DummyMatch((80, 60)), None],
+            ),
+            patch.object(self.main, "find_victory_banner", return_value=None),
+            patch.object(self.main, "_analyze_red_result", return_value=result),
+        ):
+            analyzed = self.main._analyze_red_result_with_baseline_consensus(
+                before_images=[before],
+                after_images=frames,
+                click_points=[(0, 0)] * 9,
+                grid_size=3,
+                center_cell=(1, 1),
+                submarine_lengths=[3],
+            )
+
+        self.assertIsNot(analyzed, result)
+        self.assertEqual(
+            analyzed.diagnostics["capture_frame_filter"]["kept_indices"],
+            (0, 2),
+        )
+        self.assertEqual(
+            analyzed.diagnostics["capture_frame_filter"]["discarded_frames"][0]["index"],
+            1,
+        )
 
     def test_red_scout_sample_retention_removes_only_oldest_managed_directory(self):
         sample_root = self.main.Path(self.runtime_temp.name) / "red_scout_samples"
@@ -712,7 +788,11 @@ class MainFlowTest(unittest.TestCase):
                 "_execute_red_scout_transaction",
                 return_value=self._valid_red_result(),
             ),
-            patch.object(self.main, "_execute_online_scout_hit") as online_hit,
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
             patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
         ):
             completed = self.main._run_red_scout_and_blue_strategy(
@@ -759,6 +839,40 @@ class MainFlowTest(unittest.TestCase):
         red_attempt.assert_called_once()
         online_hit.assert_called_once()
         scan.assert_not_called()
+
+    def test_red_local_victory_stops_remaining_scouts_and_enters_blue_attack(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 3)
+        local_victory = self.main.RedScoutResult(
+            center_cell=(1, 1),
+            affected_cells=frozenset(),
+            hit_cells=frozenset(),
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=None,
+            valid=False,
+            confidence_by_cell={},
+            invalid_reason="local_victory_screen",
+        )
+        with (
+            patch.object(
+                self.main,
+                "_execute_red_scout_transaction",
+                return_value=local_victory,
+            ) as red_attempt,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _row in range(3)],
+                [(400, 300)] * 9,
+                [2, 3],
+                set(),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        red_attempt.assert_called_once()
+        scan.assert_called_once()
 
     def test_red_mode_publishes_cumulative_board_after_each_attempt(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
@@ -1003,7 +1117,7 @@ class MainFlowTest(unittest.TestCase):
             completed = self.main._run_red_scout_and_blue_strategy(
                 1,
                 [[0] * 3 for _ in range(3)],
-                [(0, 0)] * 9,
+                [(400, 300)] * 9,
                 [3],
                 set(),
                 settings,
@@ -1130,6 +1244,731 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(result, self.main.ProbeResult.MISS)
         self.assertEqual(hit_map[1][1], 0)
 
+    def test_online_scout_batch_clicks_before_shared_result_analysis(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=image)
+        self.adb.capture_screenshot = Mock(
+            side_effect=[
+                FakeScreenshotCapture(image)
+                for _ in self.main.ONLINE_SCOUT_BATCH_FRAME_DELAYS
+            ]
+        )
+        events = []
+
+        def classify(*args, **_kwargs):
+            events.append(("classify", args[2]))
+            return dummy_hit_result("hit")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_root = self.main.Path(temp_dir)
+            with (
+                patch.object(self.main, "handle_victory_prompt", return_value=False),
+                patch.object(self.main, "detect_sidebar_progress", return_value=None),
+                patch.object(self.main, "red_hit_marker_visible", return_value=False),
+                patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+                patch.object(self.main, "find_victory_banner", return_value=None),
+                patch.object(
+                    self.main,
+                    "find_connection_interrupted_dialog",
+                    return_value=None,
+                ),
+                patch.object(self.main, "classify_diamond_hit", side_effect=classify),
+                patch.object(
+                    self.main,
+                    "apply_wreck_template_confirmation",
+                    return_value=True,
+                ),
+                patch.object(
+                    self.main,
+                    "apply_sidebar_completion_confirmation",
+                    return_value=(False, None, ()),
+                ),
+                patch.object(
+                    self.main,
+                    "_create_probe_sample_dir",
+                    side_effect=lambda _level, _cell, index, **_kwargs: (
+                        sample_root / f"cell_{index}"
+                    ),
+                ),
+                patch.object(self.main, "_write_probe_status"),
+                patch.object(self.main, "_save_probe_result_json"),
+                patch.object(self.main, "_persist_probe_debug_images"),
+                patch.object(self.main, "_analyze_stable_probe_frames", return_value=None),
+                patch.object(self.main, "append_recent_probe_result"),
+                patch.object(self.main, "_raise_if_blue_ammo_depleted"),
+            ):
+                result = self.main._execute_online_scout_hit_batch(
+                    level=1,
+                    hit_map=[[0] * 3 for _row in range(3)],
+                    targets=[
+                        ((1, 1), (400, 300), 4),
+                        ((1, 2), (500, 300), 5),
+                    ],
+                    submarines=[3],
+                    activity_ready=True,
+                )
+
+        self.assertEqual(
+            self.adb.calls.count(("click", *self.main.BLUE_BOMB_POINT)),
+            1,
+        )
+        target_events = [event for event in self.adb.calls if event[0] == "click"]
+        self.assertEqual(target_events[-2:], [("click", 400, 300), ("click", 500, 300)])
+        self.assertEqual(result.clicked_cells, ((1, 1), (1, 2)))
+        self.assertEqual(result.results[(1, 1)], self.main.ProbeResult.HIT)
+        self.assertEqual(result.results[(1, 2)], self.main.ProbeResult.HIT)
+        self.assertTrue(events)
+
+    def test_online_scout_batch_red_marker_is_not_visible_hit(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        with (
+            patch.object(self.main, "red_hit_marker_visible", return_value=True),
+            patch.object(self.main, "red_submarine_marker_visible", return_value=False),
+            patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+        ):
+            visible = self.main._visible_wreck_for_hit_state(image, (400, 300))
+
+        self.assertFalse(visible)
+
+    def test_online_scout_precheck_rejects_neighbor_wreck_without_strong_cell_body(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        polygon = np.asarray(
+            [(380, 300), (400, 280), (420, 300), (400, 320)],
+            dtype=np.float32,
+        )
+        with (
+            patch.object(self.main, "visible_wreck_static_detected", return_value=True),
+            patch.object(self.main, "completed_ship_body_score", return_value=0.183),
+        ):
+            visible = self.main._visible_wreck_for_hit_state(
+                image,
+                (400, 300),
+                red_marker_cells=set(),
+                cell=(0, 7),
+                cell_polygon=polygon,
+                require_strong_body=True,
+            )
+
+        self.assertFalse(visible)
+
+    def test_online_scout_precheck_accepts_wreck_with_strong_cell_body(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        polygon = np.asarray(
+            [(380, 300), (400, 280), (420, 300), (400, 320)],
+            dtype=np.float32,
+        )
+        with (
+            patch.object(self.main, "visible_wreck_static_detected", return_value=True),
+            patch.object(
+                self.main,
+                "completed_ship_body_score",
+                return_value=self.main.COMPLETED_SHIP_BODY_MIN_SCORE,
+            ),
+        ):
+            visible = self.main._visible_wreck_for_hit_state(
+                image,
+                (400, 300),
+                red_marker_cells=set(),
+                cell=(1, 7),
+                cell_polygon=polygon,
+                require_strong_body=True,
+            )
+
+        self.assertTrue(visible)
+
+    def test_online_scout_batch_fires_targets_when_red_marker_is_present(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=image)
+        self.adb.capture_screenshot = Mock(
+            side_effect=[
+                FakeScreenshotCapture(image)
+                for _ in self.main.ONLINE_SCOUT_BATCH_FRAME_DELAYS
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_root = self.main.Path(temp_dir)
+            with (
+                patch.object(self.main, "handle_victory_prompt", return_value=False),
+                patch.object(self.main, "detect_sidebar_progress", return_value=None),
+                patch.object(
+                    self.main,
+                    "red_hit_marker_visible",
+                    side_effect=[True, True],
+                ),
+                patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+                patch.object(self.main, "find_victory_banner", return_value=None),
+                patch.object(
+                    self.main,
+                    "find_connection_interrupted_dialog",
+                    return_value=None,
+                ),
+                patch.object(
+                    self.main,
+                    "classify_diamond_hit",
+                    return_value=dummy_hit_result("hit"),
+                ),
+                patch.object(
+                    self.main,
+                    "apply_wreck_template_confirmation",
+                    return_value=True,
+                ),
+                patch.object(
+                    self.main,
+                    "apply_sidebar_completion_confirmation",
+                    return_value=(False, None, ()),
+                ),
+                patch.object(
+                    self.main,
+                    "_create_probe_sample_dir",
+                    side_effect=lambda _level, _cell, index, **_kwargs: (
+                        sample_root / f"cell_{index}"
+                    ),
+                ),
+                patch.object(self.main, "_write_probe_status"),
+                patch.object(self.main, "_save_probe_result_json"),
+                patch.object(self.main, "_persist_probe_debug_images"),
+                patch.object(self.main, "_analyze_stable_probe_frames", return_value=None),
+                patch.object(self.main, "append_recent_probe_result"),
+                patch.object(self.main, "_raise_if_blue_ammo_depleted"),
+            ):
+                result = self.main._execute_online_scout_hit_batch(
+                    level=1,
+                    hit_map=[[0] * 3 for _row in range(3)],
+                    targets=[
+                        ((1, 1), (400, 300), 4),
+                        ((1, 2), (500, 300), 5),
+                    ],
+                    submarines=[3],
+                    activity_ready=True,
+                )
+
+        self.assertEqual(result.results[(1, 1)], self.main.ProbeResult.HIT)
+        self.assertEqual(result.results[(1, 2)], self.main.ProbeResult.HIT)
+        self.assertEqual(result.clicked_cells, ((1, 1), (1, 2)))
+        self.assertIn(("click", 400, 300), self.adb.calls)
+        self.assertIn(("click", 500, 300), self.adb.calls)
+
+    def test_online_scout_batch_without_submarine_lengths_does_not_reject_targets(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=image)
+        self.adb.capture_screenshot = Mock(
+            side_effect=[
+                FakeScreenshotCapture(image)
+                for _ in self.main.ONLINE_SCOUT_BATCH_FRAME_DELAYS
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_root = self.main.Path(temp_dir)
+            with (
+                patch.object(self.main, "handle_victory_prompt", return_value=False),
+                patch.object(self.main, "detect_sidebar_progress", return_value=None),
+                patch.object(self.main, "red_hit_marker_visible", return_value=False),
+                patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+                patch.object(self.main, "find_victory_banner", return_value=None),
+                patch.object(
+                    self.main,
+                    "find_connection_interrupted_dialog",
+                    return_value=None,
+                ),
+                patch.object(
+                    self.main,
+                    "classify_diamond_hit",
+                    return_value=dummy_hit_result("hit"),
+                ),
+                patch.object(
+                    self.main,
+                    "apply_wreck_template_confirmation",
+                    return_value=True,
+                ),
+                patch.object(
+                    self.main,
+                    "apply_sidebar_completion_confirmation",
+                    return_value=(False, None, ()),
+                ),
+                patch.object(
+                    self.main,
+                    "_create_probe_sample_dir",
+                    side_effect=lambda _level, _cell, index, **_kwargs: (
+                        sample_root / f"cell_{index}"
+                    ),
+                ),
+                patch.object(self.main, "_write_probe_status"),
+                patch.object(self.main, "_save_probe_result_json"),
+                patch.object(self.main, "_persist_probe_debug_images"),
+                patch.object(self.main, "_analyze_stable_probe_frames", return_value=None),
+                patch.object(self.main, "append_recent_probe_result"),
+                patch.object(self.main, "_raise_if_blue_ammo_depleted"),
+            ):
+                result = self.main._execute_online_scout_hit_batch(
+                    level=1,
+                    hit_map=[[0] * 3 for _row in range(3)],
+                    targets=[
+                        ((1, 1), (400, 300), 4),
+                        ((1, 2), (500, 300), 5),
+                    ],
+                    activity_ready=True,
+                )
+
+        self.assertEqual(result.results[(1, 1)], self.main.ProbeResult.HIT)
+        self.assertEqual(result.results[(1, 2)], self.main.ProbeResult.HIT)
+
+    def test_online_scout_batch_keeps_mixed_target_results_independent(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=image)
+        self.adb.capture_screenshot = Mock(
+            side_effect=[
+                FakeScreenshotCapture(image)
+                for _ in self.main.ONLINE_SCOUT_BATCH_FRAME_DELAYS
+            ]
+        )
+
+        def classify(_before, _after, point):
+            return dummy_hit_result("hit" if point == (400, 300) else "miss")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_root = self.main.Path(temp_dir)
+            with (
+                patch.object(self.main, "handle_victory_prompt", return_value=False),
+                patch.object(self.main, "detect_sidebar_progress", return_value=None),
+                patch.object(self.main, "red_hit_marker_visible", return_value=False),
+                patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+                patch.object(self.main, "find_victory_banner", return_value=None),
+                patch.object(
+                    self.main,
+                    "find_connection_interrupted_dialog",
+                    return_value=None,
+                ),
+                patch.object(self.main, "classify_diamond_hit", side_effect=classify),
+                patch.object(
+                    self.main,
+                    "apply_wreck_template_confirmation",
+                    side_effect=lambda _image, point, _result: point == (400, 300),
+                ),
+                patch.object(
+                    self.main,
+                    "apply_sidebar_completion_confirmation",
+                    return_value=(False, None, ()),
+                ),
+                patch.object(
+                    self.main,
+                    "_create_probe_sample_dir",
+                    side_effect=lambda _level, _cell, index, **_kwargs: (
+                        sample_root / f"cell_{index}"
+                    ),
+                ),
+                patch.object(self.main, "_write_probe_status"),
+                patch.object(self.main, "_save_probe_result_json"),
+                patch.object(self.main, "_persist_probe_debug_images"),
+                patch.object(self.main, "_analyze_stable_probe_frames", return_value=None),
+                patch.object(self.main, "append_recent_probe_result"),
+                patch.object(self.main, "_raise_if_blue_ammo_depleted"),
+            ):
+                result = self.main._execute_online_scout_hit_batch(
+                    level=1,
+                    hit_map=[[0] * 3 for _row in range(3)],
+                    targets=[
+                        ((1, 1), (400, 300), 4),
+                        ((1, 2), (500, 300), 5),
+                    ],
+                    submarines=[3],
+                    activity_ready=True,
+                )
+
+        self.assertEqual(result.results[(1, 1)], self.main.ProbeResult.HIT)
+        self.assertEqual(result.results[(1, 2)], self.main.ProbeResult.MISS)
+        self.assertEqual(result.clicked_cells, ((1, 1), (1, 2)))
+
+    def test_online_scout_batch_does_not_promote_final_miss_from_sidebar_completion(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=image)
+        self.adb.capture_screenshot = Mock(
+            side_effect=[
+                FakeScreenshotCapture(image)
+                for _ in self.main.ONLINE_SCOUT_BATCH_FRAME_DELAYS
+            ]
+        )
+        completed_progress = SidebarProgress(completed_lengths=(3,))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_root = self.main.Path(temp_dir)
+            with (
+                patch.object(self.main, "handle_victory_prompt", return_value=False),
+                patch.object(self.main, "detect_sidebar_progress", return_value=None),
+                patch.object(self.main, "red_hit_marker_visible", return_value=False),
+                patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+                patch.object(self.main, "find_victory_banner", return_value=None),
+                patch.object(
+                    self.main,
+                    "find_connection_interrupted_dialog",
+                    return_value=None,
+                ),
+                patch.object(
+                    self.main,
+                    "classify_diamond_hit",
+                    side_effect=lambda *_args, **_kwargs: dummy_hit_result("miss"),
+                ),
+                patch.object(
+                    self.main,
+                    "apply_wreck_template_confirmation",
+                    return_value=False,
+                ),
+                patch.object(
+                    self.main,
+                    "apply_sidebar_completion_confirmation",
+                    return_value=(False, completed_progress, ()),
+                ),
+                patch.object(
+                    self.main,
+                    "_create_probe_sample_dir",
+                    side_effect=lambda _level, _cell, index, **_kwargs: (
+                        sample_root / f"cell_{index}"
+                    ),
+                ),
+                patch.object(self.main, "_write_probe_status"),
+                patch.object(self.main, "_save_probe_result_json"),
+                patch.object(self.main, "_persist_probe_debug_images"),
+                patch.object(self.main, "_analyze_stable_probe_frames", return_value=None),
+                patch.object(self.main, "append_recent_probe_result"),
+                patch.object(self.main, "_raise_if_blue_ammo_depleted"),
+            ):
+                result = self.main._execute_online_scout_hit_batch(
+                    level=1,
+                    hit_map=[[0] * 3 for _row in range(3)],
+                    targets=[
+                        ((1, 1), (400, 300), 4),
+                        ((1, 2), (500, 300), 5),
+                    ],
+                    submarines=[3],
+                    activity_ready=True,
+                )
+
+        self.assertEqual(result.results[(1, 1)], self.main.ProbeResult.MISS)
+        self.assertEqual(result.results[(1, 2)], self.main.ProbeResult.MISS)
+        self.assertFalse(result.level_completed)
+
+    def test_online_scout_batch_isolates_sidebar_result_mutation_from_target_result(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=image)
+        self.adb.capture_screenshot = Mock(
+            side_effect=[
+                FakeScreenshotCapture(image)
+                for _ in self.main.ONLINE_SCOUT_BATCH_FRAME_DELAYS
+            ]
+        )
+        completed_progress = SidebarProgress(completed_lengths=(3,))
+
+        def mutate_sidebar_result(_before, _after, _fleet, target_result):
+            target_result.state = "hit"
+            target_result.score = 1.0
+            target_result.confidence = 1.0
+            return True, completed_progress, (3,)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_root = self.main.Path(temp_dir)
+            with (
+                patch.object(self.main, "handle_victory_prompt", return_value=False),
+                patch.object(self.main, "detect_sidebar_progress", return_value=None),
+                patch.object(self.main, "red_hit_marker_visible", return_value=False),
+                patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+                patch.object(self.main, "find_victory_banner", return_value=None),
+                patch.object(
+                    self.main,
+                    "find_connection_interrupted_dialog",
+                    return_value=None,
+                ),
+                patch.object(
+                    self.main,
+                    "classify_diamond_hit",
+                    side_effect=lambda *_args, **_kwargs: dummy_hit_result("miss"),
+                ),
+                patch.object(
+                    self.main,
+                    "apply_wreck_template_confirmation",
+                    return_value=False,
+                ),
+                patch.object(
+                    self.main,
+                    "apply_sidebar_completion_confirmation",
+                    side_effect=mutate_sidebar_result,
+                ),
+                patch.object(
+                    self.main,
+                    "_create_probe_sample_dir",
+                    side_effect=lambda _level, _cell, index, **_kwargs: (
+                        sample_root / f"cell_{index}"
+                    ),
+                ),
+                patch.object(self.main, "_write_probe_status"),
+                patch.object(self.main, "_save_probe_result_json"),
+                patch.object(self.main, "_persist_probe_debug_images"),
+                patch.object(self.main, "_analyze_stable_probe_frames", return_value=None),
+                patch.object(self.main, "append_recent_probe_result"),
+                patch.object(self.main, "_raise_if_blue_ammo_depleted"),
+            ):
+                result = self.main._execute_online_scout_hit_batch(
+                    level=1,
+                    hit_map=[[0] * 3 for _row in range(3)],
+                    targets=[
+                        ((1, 1), (400, 300), 4),
+                        ((1, 2), (500, 300), 5),
+                    ],
+                    submarines=[3],
+                    activity_ready=True,
+                )
+
+        self.assertEqual(result.results[(1, 1)], self.main.ProbeResult.MISS)
+        self.assertEqual(result.results[(1, 2)], self.main.ProbeResult.MISS)
+        self.assertFalse(result.level_completed)
+
+    def test_online_scout_batch_wraps_click_interval_failure_without_retrying(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=image)
+        original_delay = self.adb.delay
+
+        def delay(seconds):
+            if seconds == self.main.ONLINE_SCOUT_BATCH_CLICK_INTERVAL_SECONDS:
+                raise RuntimeError("interval failure")
+            return original_delay(seconds)
+
+        self.adb.delay = Mock(side_effect=delay)
+        self.adb.capture_screenshot = Mock(
+            side_effect=[
+                FakeScreenshotCapture(image)
+                for _ in self.main.ONLINE_SCOUT_BATCH_FRAME_DELAYS
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_root = self.main.Path(temp_dir)
+            with (
+                patch.object(self.main, "handle_victory_prompt", return_value=False),
+                patch.object(self.main, "detect_sidebar_progress", return_value=None),
+                patch.object(self.main, "red_hit_marker_visible", return_value=False),
+                patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+                patch.object(self.main, "_create_probe_sample_dir", return_value=sample_root),
+                patch.object(self.main, "_write_probe_status"),
+                patch.object(self.main, "_raise_if_blue_ammo_depleted"),
+            ):
+                with self.assertRaisesRegex(
+                    self.main.ProbeProtocolError,
+                    "click interval failed after 1 taps",
+                ):
+                    self.main._execute_online_scout_hit_batch(
+                        level=1,
+                        hit_map=[[0] * 3 for _row in range(3)],
+                        targets=[
+                            ((1, 1), (400, 300), 4),
+                            ((1, 2), (500, 300), 5),
+                            ((1, 0), (300, 300), 3),
+                        ],
+                        submarines=[4],
+                        activity_ready=True,
+                    )
+
+        self.assertIn(("click", 400, 300), self.adb.calls)
+        self.assertNotIn(("click", 500, 300), self.adb.calls)
+        self.assertNotIn(("click", 300, 300), self.adb.calls)
+
+    def test_online_scout_batch_stops_when_connection_dialog_detection_fails(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=image)
+        self.adb.capture_screenshot = Mock(
+            return_value=FakeScreenshotCapture(image)
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_root = self.main.Path(temp_dir)
+            with (
+                patch.object(self.main, "handle_victory_prompt", return_value=False),
+                patch.object(self.main, "detect_sidebar_progress", return_value=None),
+                patch.object(self.main, "red_hit_marker_visible", return_value=False),
+                patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+                patch.object(
+                    self.main,
+                    "find_connection_interrupted_dialog",
+                    side_effect=RuntimeError("dialog matcher failed"),
+                ),
+                patch.object(self.main, "classify_diamond_hit") as classify,
+                patch.object(self.main, "_create_probe_sample_dir", return_value=sample_root),
+                patch.object(self.main, "_write_probe_status"),
+                patch.object(self.main, "_raise_if_blue_ammo_depleted"),
+            ):
+                with self.assertRaisesRegex(
+                    self.main.ProbeProtocolError,
+                    "connection dialog detection failed",
+                ):
+                    self.main._execute_online_scout_hit_batch(
+                        level=1,
+                        hit_map=[[0] * 3 for _row in range(3)],
+                        targets=[((1, 1), (400, 300), 4)],
+                        submarines=[3],
+                        activity_ready=True,
+                    )
+
+        classify.assert_not_called()
+
+    def test_online_scout_batch_victory_resolves_overlay_unknowns_and_closes_prompt(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        victory_frame = np.ones((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=image)
+        self.adb.capture_screenshot = Mock(
+            side_effect=[
+                FakeScreenshotCapture(image),
+                FakeScreenshotCapture(victory_frame),
+            ]
+        )
+
+        def classify(_before, _after, point):
+            if point == (400, 300):
+                weak = dummy_hit_result("hit")
+                weak.score = 0.70
+                weak.confidence = 0.70
+                return weak
+            return dummy_hit_result("miss")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_root = self.main.Path(temp_dir)
+            with (
+                patch.object(self.main, "handle_victory_prompt", side_effect=[False, True]) as handle_victory,
+                patch.object(self.main, "detect_sidebar_progress", return_value=None),
+                patch.object(self.main, "red_hit_marker_visible", return_value=False),
+                patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+                patch.object(self.main, "find_victory_banner", side_effect=[None, DummyMatch((640, 360))]),
+                patch.object(self.main, "find_connection_interrupted_dialog", return_value=None),
+                patch.object(self.main, "classify_diamond_hit", side_effect=classify),
+                patch.object(
+                    self.main,
+                    "apply_wreck_template_confirmation",
+                    side_effect=[True, False, False, False],
+                ),
+                patch.object(
+                    self.main,
+                    "apply_sidebar_completion_confirmation",
+                    return_value=(False, None, ()),
+                ),
+                patch.object(
+                    self.main,
+                    "_create_probe_sample_dir",
+                    side_effect=lambda _level, _cell, index, **_kwargs: (
+                        sample_root / f"cell_{index}"
+                    ),
+                ),
+                patch.object(self.main, "_write_probe_status"),
+                patch.object(self.main, "_save_probe_result_json"),
+                patch.object(self.main, "_persist_probe_debug_images"),
+                patch.object(self.main, "_analyze_stable_probe_frames", return_value=None),
+                patch.object(self.main, "append_recent_probe_result"),
+                patch.object(self.main, "_raise_if_blue_ammo_depleted"),
+            ):
+                result = self.main._execute_online_scout_hit_batch(
+                    level=1,
+                    hit_map=[[0] * 3 for _row in range(3)],
+                    targets=[
+                        ((1, 1), (400, 300), 4),
+                        ((1, 2), (500, 300), 5),
+                    ],
+                    submarines=[3],
+                    activity_ready=True,
+                )
+
+        self.assertEqual(result.results[(1, 1)], self.main.ProbeResult.HIT)
+        self.assertEqual(
+            result.results[(1, 2)],
+            self.main.ProbeResult.HIT_AND_LEVEL_COMPLETE,
+        )
+        self.assertTrue(result.level_completed)
+        self.assertEqual(result.stopped_reason, "victory_banner")
+        self.assertEqual(handle_victory.call_count, 2)
+        self.assertEqual(handle_victory.call_args.kwargs["timeout"], 0.0)
+
+    def test_online_scout_batch_reserves_unmapped_visual_capacity(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=image)
+        with (
+            patch.object(self.main, "handle_victory_prompt", return_value=False),
+            patch.object(self.main, "detect_sidebar_progress", return_value=None),
+            patch.object(self.main, "red_hit_marker_visible", return_value=False),
+            patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+            patch.object(self.main, "find_connection_interrupted_dialog", return_value=None),
+            patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
+            patch.object(self.main, "_write_probe_status"),
+            patch.object(self.main, "_raise_if_blue_ammo_depleted"),
+        ):
+            with self.assertRaisesRegex(
+                self.main.ProbeProtocolError,
+                "remaining submarine-cell capacity",
+            ):
+                self.main._execute_online_scout_hit_batch(
+                    level=1,
+                    hit_map=[[1, 0, 0], [0, 0, 0], [0, 0, 0]],
+                    targets=[
+                        ((1, 1), (400, 300), 4),
+                        ((1, 2), (500, 300), 5),
+                    ],
+                    submarines=[3],
+                    unmapped_visual_hits=1,
+                    activity_ready=True,
+                )
+
+        self.assertNotIn(("click", *self.main.BLUE_BOMB_POINT), self.adb.calls)
+
+    def test_online_scout_batch_discards_connection_overlay_frame(self):
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        self.adb.read_screenshot = Mock(return_value=image)
+        self.adb.capture_screenshot = Mock(
+            side_effect=[
+                FakeScreenshotCapture(image),
+                FakeScreenshotCapture(image),
+            ]
+        )
+        dialog_match = DummyMatch((640, 360))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sample_root = self.main.Path(temp_dir)
+            with (
+                patch.object(self.main, "handle_victory_prompt", return_value=False),
+                patch.object(self.main, "detect_sidebar_progress", return_value=None),
+                patch.object(self.main, "red_hit_marker_visible", return_value=False),
+                patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+                patch.object(
+                    self.main,
+                    "find_connection_interrupted_dialog",
+                    side_effect=[None, None, dialog_match],
+                ),
+                patch.object(self.main, "find_victory_banner", return_value=None),
+                patch.object(
+                    self.main,
+                    "classify_diamond_hit",
+                    return_value=dummy_hit_result("miss"),
+                ) as classify,
+                patch.object(self.main, "apply_wreck_template_confirmation", return_value=False),
+                patch.object(
+                    self.main,
+                    "apply_sidebar_completion_confirmation",
+                    return_value=(False, None, ()),
+                ),
+                patch.object(self.main, "_create_probe_sample_dir", return_value=sample_root),
+                patch.object(self.main, "_write_probe_status"),
+                patch.object(self.main, "_save_probe_result_json"),
+                patch.object(self.main, "_persist_probe_debug_images"),
+                patch.object(self.main, "_analyze_stable_probe_frames", return_value=None),
+                patch.object(self.main, "append_recent_probe_result"),
+                patch.object(self.main, "_raise_if_blue_ammo_depleted"),
+            ):
+                result = self.main._execute_online_scout_hit_batch(
+                    level=1,
+                    hit_map=[[0] * 3 for _row in range(3)],
+                    targets=[((1, 1), (400, 300), 4)],
+                    submarines=[3],
+                    activity_ready=True,
+                )
+
+        self.assertEqual(result.results[(1, 1)], self.main.ProbeResult.UNKNOWN)
+        self.assertEqual(result.stopped_reason, "unknown_result")
+        # Only the clean frame was classified; the dialog frame was discarded.
+        self.assertEqual(classify.call_count, 1)
+        self.assertEqual(self.adb.capture_screenshot.call_count, 2)
+
     def test_online_scout_hit_ready_fast_path_skips_redundant_waits(self):
         hit_map = [[0, 0, 0] for _row in range(3)]
         screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -1210,49 +2049,35 @@ class MainFlowTest(unittest.TestCase):
                 fast=True,
             )
 
-        self.assertIs(result, confirmed_screen)
-        self.assertEqual(selected.call_count, 2)
+        self.assertIs(result, early_screen)
+        selected.assert_not_called()
         self.assertIn(("delay", 0.1), self.adb.calls)
-        self.assertIn(("delay", 0.15), self.adb.calls)
+        self.assertNotIn(("delay", 0.15), self.adb.calls)
         self.assertEqual(self.adb.calls.count(("click", *self.main.BLUE_BOMB_POINT)), 1)
 
-    def test_blue_selection_refuses_to_fire_when_red_button_cannot_be_verified(self):
+    def test_blue_selection_does_not_require_red_button_verification(self):
         with patch.object(self.main, "locate_red_bomb_button", return_value=None):
-            with self.assertRaisesRegex(self.main.ProbeNotReadyError, "red bomb button"):
-                self.main._select_blue_bomb_for_online_scout(
-                    self.main.Path("unused"),
-                    object(),
-                    fast=True,
-                )
+            self.main._select_blue_bomb_for_online_scout(
+                self.main.Path("unused"),
+                object(),
+                fast=True,
+            )
 
-        self.assertNotIn(("click", *self.main.BLUE_BOMB_POINT), self.adb.calls)
+        self.assertIn(("click", *self.main.BLUE_BOMB_POINT), self.adb.calls)
 
-    def test_standard_blue_selection_stops_when_red_bomb_remains_selected(self):
+    def test_standard_blue_selection_does_not_recheck_red_bomb_state(self):
         selection_screen = object()
         before_screen = object()
         red_match = DummyMatch((1100, 660))
         self.adb.read_screenshot = Mock(return_value=before_screen)
 
-        with (
-            patch.object(
-                self.main,
-                "locate_red_bomb_button",
-                return_value=red_match,
-            ),
-            patch.object(
-                self.main,
-                "red_bomb_selected",
-                return_value=True,
-            ) as selected,
-        ):
-            with self.assertRaises(self.main.ProbeNotReadyError):
-                self.main._select_blue_bomb_for_online_scout(
-                    self.main.Path("unused"),
-                    selection_screen,
-                    fast=False,
-                )
+        with patch.object(self.main, "red_bomb_selected") as selected:
+            result = self.main._select_blue_bomb_for_online_scout(
+                self.main.Path("unused"), selection_screen, fast=False
+            )
 
-        selected.assert_called_once_with(before_screen, red_match)
+        self.assertIs(result, before_screen)
+        selected.assert_not_called()
         self.assertIn(
             ("delay", self.main.ONLINE_SCOUT_BLUE_SELECT_SETTLE_SECONDS),
             self.adb.calls,
@@ -1427,7 +2252,7 @@ class MainFlowTest(unittest.TestCase):
         for delay in self.main.SUSPECT_HIT_EXTRA_FRAME_DELAYS:
             self.assertIn(("delay", delay), self.adb.calls)
 
-    def test_online_scout_hit_skips_cell_that_is_already_visible(self):
+    def test_online_scout_hit_does_not_treat_red_submarine_decoration_as_visible_hit(self):
         hit_map = [[0, 0, 0] for _row in range(3)]
         screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
         self.adb.read_screenshot = Mock(return_value=screenshot)
@@ -1436,11 +2261,17 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "wait_until_occur", return_value=DummyMatch((40, 38))),
             patch.object(self.main, "handle_victory_prompt", return_value=False),
             patch.object(self.main, "locate_red_bomb_button", return_value=None),
+            # Red above a submarine is decoration, never an already-visible hit.
             patch.object(self.main, "red_hit_marker_visible", return_value=True),
             patch.object(self.main, "visible_wreck_static_detected", return_value=False),
-            patch.object(self.main, "classify_diamond_hit") as classify,
+            patch.object(
+                self.main,
+                "classify_diamond_hit",
+                side_effect=lambda *_args, **_kwargs: dummy_hit_result("miss"),
+            ) as classify,
             patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
             patch.object(self.main, "_write_probe_status"),
+            patch.object(self.main, "_save_probe_result_json"),
             patch.object(self.main, "append_recent_probe_result"),
             patch.object(self.main, "write_runtime_status"),
         ):
@@ -1453,10 +2284,71 @@ class MainFlowTest(unittest.TestCase):
                 submarines=[3],
             )
 
-        self.assertEqual(result, self.main.ProbeResult.HIT)
-        self.assertEqual(hit_map[1][1], 1)
-        self.assertEqual(self.adb.calls.count(("click", 640, 360)), 0)
-        classify.assert_not_called()
+        self.assertEqual(result, self.main.ProbeResult.MISS)
+        self.assertEqual(hit_map[1][1], 0)
+        self.assertEqual(self.adb.calls.count(("click", 640, 360)), 1)
+        classify.assert_called()
+
+    def test_blue_ammo_zero_stops_online_scout_before_target_click(self):
+        hit_map = [[0, 0, 0] for _row in range(3)]
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        with (
+            patch.object(self.main, "wait_until_occur", return_value=DummyMatch((40, 38))),
+            patch.object(self.main, "handle_victory_prompt", return_value=False),
+            patch.object(self.main, "red_hit_marker_visible", return_value=False),
+            patch.object(self.main, "visible_wreck_static_detected", return_value=False),
+            patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
+            patch.object(self.main, "_write_probe_status"),
+            patch.object(self.main, "_raise_if_blue_ammo_depleted", side_effect=self.main.BlueAmmoDepletedError("zero")),
+        ):
+            with self.assertRaises(self.main.BlueAmmoDepletedError):
+                self.main._execute_online_scout_hit(
+                    level=1,
+                    hit_map=hit_map,
+                    cell=(1, 1),
+                    point=(640, 360),
+                    index=4,
+                    submarines=[3],
+                )
+
+        self.assertNotIn(("click", 640, 360), self.adb.calls)
+
+    def test_blue_ammo_zero_returns_to_base_through_reconnect_dialog(self):
+        retry = DummyMatch((377, 435))
+        package_name = self.main.GAME_PACKAGE_NAME
+
+        with (
+            patch.object(
+                self.main,
+                "wait_until_connection_interrupted_dialog",
+                return_value=DummyMatch((640, 360)),
+            ),
+            patch.object(self.main, "wait_until_retry_button", return_value=retry),
+            patch.object(
+                self.main,
+                "wait_until_occur",
+                return_value=DummyMatch((1249, 269)),
+            ),
+        ):
+            self.main._return_to_base_after_blue_ammo_depleted()
+
+        enable_drop = ("enable_weak_network", package_name)
+        enable_reject = ("enable_reject_network", package_name)
+        disable_drop = ("disable_weak_network", package_name)
+        disable_reject = ("disable_reject_network", package_name)
+        retry_click = ("click", *retry.center)
+        self.assertLess(self.adb.calls.index(enable_drop), self.adb.calls.index(enable_reject))
+        self.assertLess(self.adb.calls.index(enable_reject), self.adb.calls.index(disable_drop))
+        self.assertLess(self.adb.calls.index(disable_drop), self.adb.calls.index(disable_reject))
+        self.assertLess(self.adb.calls.index(disable_reject), self.adb.calls.index(retry_click))
+
+    def test_blue_ammo_zero_template_matches_counter_roi(self):
+        template = cv2.imread(str(self.main.BLUE_BOMB_ZERO_TEMPLATE))
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        screenshot[678:694, 1146:1160] = template
+
+        self.assertTrue(self.main._blue_bomb_zero_visible(screenshot))
 
     def test_online_scout_hit_stops_before_click_when_sidebar_is_complete(self):
         hit_map = [[0, 0, 0] for _row in range(3)]
@@ -1521,6 +2413,59 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(scan.call_args.kwargs["initial_hits"], {(1, 2)})
         self.assertEqual(scan.call_args.kwargs["initial_scout_hits"], set())
         self.assertEqual(scan.call_args.kwargs["initial_scout_misses"], {(1, 1)})
+
+    def test_red_batch_unknown_is_not_hidden_by_later_level_complete(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        scout_cells = frozenset({(1, 1), (1, 2)})
+        red_result = self.main.RedScoutResult(
+            center_cell=(0, 0),
+            affected_cells=scout_cells,
+            hit_cells=scout_cells,
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(scout_cells),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in scout_cells},
+        )
+        batch_result = self.main.OnlineScoutBatchResult(
+            results={
+                (1, 1): self.main.ProbeResult.UNKNOWN,
+                (1, 2): self.main.ProbeResult.HIT_AND_LEVEL_COMPLETE,
+            },
+            metadata={
+                (1, 1): {"batch": True, "stable_state": "unknown"},
+                (1, 2): {"batch": True, "stable_state": "hit"},
+            },
+        )
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(0, 0)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=red_result),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit_batch",
+                return_value=batch_result,
+            ) as batch,
+            patch.object(self.main, "_execute_online_scout_hit") as single,
+            patch.object(self.main, "_scan_level_by_strategy") as scan,
+        ):
+            with self.assertRaisesRegex(
+                self.main.ProbeProtocolError,
+                "unknown",
+            ):
+                self.main._run_red_scout_and_blue_strategy(
+                    1,
+                    [[0] * 3 for _row in range(3)],
+                    [(0, 0), (100, 0), (200, 0), (0, 100), (100, 100), (200, 100),
+                     (0, 200), (100, 200), (200, 200)],
+                    [3],
+                    set(),
+                    settings,
+                )
+
+        batch.assert_called_once()
+        single.assert_not_called()
+        scan.assert_not_called()
 
     def test_red_phase_ends_when_planner_has_no_center(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 3)
@@ -1592,9 +2537,11 @@ class MainFlowTest(unittest.TestCase):
 
         execute.assert_not_called()
 
-    def test_red_online_hits_stop_before_recording_impossible_l_shape(self):
+    def test_red_online_hits_remove_upper_cell_from_rotated_l_before_blue_shots(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
-        l_hits = frozenset({(1, 1), (1, 2), (2, 1)})
+        upper_visual = (1, 1)
+        lower_ship = frozenset({(1, 2), (2, 2)})
+        l_hits = lower_ship | {upper_visual}
         result = self.main.RedScoutResult(
             center_cell=(0, 0),
             affected_cells=l_hits,
@@ -1624,11 +2571,148 @@ class MainFlowTest(unittest.TestCase):
             ) as online_hit,
             patch.object(self.main, "_scan_level_by_strategy") as scan,
         ):
-            with self.assertRaisesRegex(
-                self.main.ProbeProtocolError,
-                "L-shaped",
+            self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _ in range(3)],
+                [(0, 0)] * 9,
+                [3],
+                set(),
+                settings,
+            )
+
+        self.assertEqual(
+            [call.kwargs["cell"] for call in online_hit.call_args_list],
+            sorted(lower_ship),
+        )
+        self.assertEqual(scan.call_args.kwargs["initial_scout_misses"], {upper_visual})
+        scan.assert_called_once()
+
+    def test_red_online_hits_remove_corner_from_three_by_three_l_before_blue_shots(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        upper_visual = (0, 0)
+        lower_ship = frozenset({(2, 0), (2, 1), (2, 2)})
+        l_hits = lower_ship | {upper_visual}
+        result = self.main.RedScoutResult(
+            center_cell=(1, 1),
+            affected_cells=l_hits,
+            hit_cells=l_hits,
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(frozenset(l_hits)),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in l_hits},
+        )
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(1, 1)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _ in range(3)],
+                [(0, 0)] * 9,
+                [3],
+                set(),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(
+            [call.kwargs["cell"] for call in online_hit.call_args_list],
+            sorted(lower_ship),
+        )
+        self.assertEqual(scan.call_args.kwargs["initial_scout_misses"], {upper_visual})
+
+    def test_red_online_hits_remove_corner_from_vertical_three_by_three_l(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        upper_visual = (0, 0)
+        lower_ship = frozenset({(0, 2), (1, 2), (2, 2)})
+        l_hits = lower_ship | {upper_visual}
+        result = self.main.RedScoutResult(
+            center_cell=(1, 1),
+            affected_cells=l_hits,
+            hit_cells=l_hits,
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(frozenset(l_hits)),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in l_hits},
+        )
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(1, 1)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _ in range(3)],
+                [(0, 0)] * 9,
+                [3],
+                set(),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(
+            [call.kwargs["cell"] for call in online_hit.call_args_list],
+            sorted(lower_ship),
+        )
+        self.assertEqual(scan.call_args.kwargs["initial_scout_misses"], {upper_visual})
+
+    def test_red_scout_filters_both_flag_l_shapes_before_blue_targets(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+
+        for l_hits, upper_flag in (
+            (frozenset({(0, 1), (1, 1), (1, 2)}), (0, 1)),
+            (frozenset({(0, 2), (1, 1), (1, 2)}), (0, 2)),
+            (frozenset({(0, 1), (0, 2), (1, 2)}), (0, 1)),
+            (frozenset({(0, 1), (0, 2), (1, 1)}), (0, 2)),
+        ):
+            result = self.main.RedScoutResult(
+                center_cell=(2, 2),
+                affected_cells=l_hits,
+                hit_cells=l_hits,
+                miss_cells=frozenset(),
+                unknown_cells=frozenset(),
+                footprint=self.main.RedFootprint(frozenset(l_hits)),
+                valid=True,
+                confidence_by_cell={cell: 0.95 for cell in l_hits},
+            )
+            with (
+                patch.object(
+                    self.main.RedScoutPlanner,
+                    "choose_center",
+                    return_value=(2, 2),
+                ),
+                patch.object(
+                    self.main,
+                    "_execute_red_scout_transaction",
+                    return_value=result,
+                ),
+                patch.object(
+                    self.main,
+                    "_execute_online_scout_hit",
+                    return_value=self.main.ProbeResult.HIT,
+                ) as online_hit,
+                patch.object(
+                    self.main,
+                    "_scan_level_by_strategy",
+                    return_value=True,
+                ) as scan,
             ):
-                self.main._run_red_scout_and_blue_strategy(
+                completed = self.main._run_red_scout_and_blue_strategy(
                     1,
                     [[0] * 3 for _ in range(3)],
                     [(0, 0)] * 9,
@@ -1637,8 +2721,618 @@ class MainFlowTest(unittest.TestCase):
                     settings,
                 )
 
-        self.assertEqual(online_hit.call_count, 3)
-        scan.assert_not_called()
+            self.assertTrue(completed)
+            self.assertEqual(
+                [call.kwargs["cell"] for call in online_hit.call_args_list],
+                sorted(l_hits - {upper_flag}),
+            )
+            self.assertEqual(scan.call_args.kwargs["initial_scout_misses"], {upper_flag})
+
+    def test_red_batch_filters_2x2_l_upper_cell_before_blue_taps(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        upper = (0, 1)
+        lower = frozenset({(1, 1), (1, 2)})
+        l_hits = lower | {upper}
+        red_result = self.main.RedScoutResult(
+            center_cell=(0, 0),
+            affected_cells=l_hits,
+            hit_cells=l_hits,
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(l_hits),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in l_hits},
+        )
+        batch_result = self.main.OnlineScoutBatchResult(
+            results={cell: self.main.ProbeResult.HIT for cell in lower},
+            metadata={
+                cell: {
+                    "batch": True,
+                    "stable_state": "hit",
+                    "blue_bomb_ready": True,
+                    "network_ready": True,
+                }
+                for cell in lower
+            },
+        )
+        click_points = [
+            (400 + (index % 3) * 100, 300 + (index // 3) * 100)
+            for index in range(9)
+        ]
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(0, 0)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=red_result),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit_batch",
+                return_value=batch_result,
+            ) as batch,
+            patch.object(self.main, "_execute_online_scout_hit") as single,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _row in range(3)],
+                click_points,
+                [3],
+                set(),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        batch.assert_called_once()
+        self.assertEqual(
+            {target[0] for target in batch.call_args.kwargs["targets"]},
+            set(lower),
+        )
+        single.assert_not_called()
+        self.assertIn(upper, scan.call_args.kwargs["initial_misses"])
+        self.assertNotIn(upper, scan.call_args.kwargs["initial_scout_hits"])
+
+    def test_red_scout_does_not_join_hits_with_unrelated_completed_visual_ship(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        result_hits = frozenset({(0, 5), (1, 5), (2, 5)})
+        result = self.main.RedScoutResult(
+            center_cell=(2, 5),
+            affected_cells=result_hits,
+            hit_cells=result_hits,
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(result_hits),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in result_hits},
+        )
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(2, 5)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                10,
+                [[0] * 10 for _ in range(10)],
+                [(0, 0)] * 100,
+                [3],
+                set(),
+                settings,
+                initial_completed_visual_hits={(2, 5), (2, 6), (2, 7)},
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(
+            [call.kwargs["cell"] for call in online_hit.call_args_list],
+            [(0, 5)],
+        )
+        self.assertNotIn((0, 5), scan.call_args.kwargs["initial_misses"])
+
+    def test_l_shape_overrides_committed_hit_protection_from_later_scout(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
+        first = self.main.RedScoutResult(
+            center_cell=(0, 0),
+            affected_cells=frozenset({(0, 0)}),
+            hit_cells=frozenset({(0, 0)}),
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(frozenset({(0, 0)})),
+            valid=False,
+            confidence_by_cell={(0, 0): 0.95},
+        )
+        second_hits = frozenset({(1, 0), (1, 1)})
+        second = self.main.RedScoutResult(
+            center_cell=(2, 2),
+            affected_cells=second_hits,
+            hit_cells=second_hits,
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(second_hits),
+            valid=False,
+            confidence_by_cell={cell: 0.95 for cell in second_hits},
+        )
+
+        with (
+            patch.object(
+                self.main.RedScoutPlanner,
+                "choose_center",
+                side_effect=[(0, 0), (2, 2)],
+            ),
+            patch.object(
+                self.main,
+                "_execute_red_scout_transaction",
+                side_effect=[first, second],
+            ),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _ in range(3)],
+                [(0, 0)] * 9,
+                [3],
+                set(),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        # The ordinary committed-hit lock remains in force outside an L, but
+        # the explicit 2x2 L rule has priority and removes its upper flag cell.
+        self.assertNotIn((0, 0), scan.call_args.kwargs["initial_hits"])
+        self.assertIn((0, 0), scan.call_args.kwargs["initial_misses"])
+        self.assertIn((0, 0), {call.kwargs["cell"] for call in online_hit.call_args_list})
+
+    def test_l_shape_clears_upper_cell_when_initial_hit_is_confirmed(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        upper = (0, 1)
+        lower_pair = frozenset({(1, 1), (1, 2)})
+        result = self.main.RedScoutResult(
+            center_cell=(0, 0),
+            affected_cells=lower_pair,
+            hit_cells=lower_pair,
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(frozenset(lower_pair)),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in lower_pair},
+        )
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(0, 0)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _ in range(3)],
+                [(0, 0)] * 9,
+                [2],
+                {upper},
+                settings,
+                initial_completed_visual_hits={upper, *lower_pair},
+            )
+
+        self.assertTrue(completed)
+        online_hit.assert_not_called()
+        self.assertNotIn(upper, scan.call_args.kwargs["initial_hits"])
+        self.assertIn(upper, scan.call_args.kwargs["initial_misses"])
+        self.assertEqual(
+            scan.call_args.kwargs["initial_completed_visual_hits"],
+            set(lower_pair),
+        )
+
+    def test_l_shape_moves_completed_upper_cell_to_current_lower_pair(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        upper = (0, 1)
+        lower_pair = frozenset({(1, 1), (1, 2)})
+        result = self.main.RedScoutResult(
+            center_cell=(0, 0),
+            affected_cells=lower_pair,
+            hit_cells=lower_pair,
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(lower_pair),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in lower_pair},
+        )
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(0, 0)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_execute_online_scout_hit_batch") as online_batch,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _ in range(3)],
+                [(0, 0)] * 9,
+                [2],
+                {upper},
+                settings,
+                initial_completed_visual_hits={upper},
+                initial_completed_lengths=(2,),
+            )
+
+        self.assertTrue(completed)
+        online_hit.assert_not_called()
+        online_batch.assert_not_called()
+        self.assertNotIn(upper, scan.call_args.kwargs["initial_hits"])
+        self.assertIn(upper, scan.call_args.kwargs["initial_misses"])
+        self.assertEqual(
+            scan.call_args.kwargs["initial_completed_visual_hits"],
+            set(lower_pair),
+        )
+
+    def test_l_shape_overrides_red_marker_completion_lock(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 0)
+        upper = (0, 1)
+        lower_pair = frozenset({(1, 1), (1, 2)})
+
+        with patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan:
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _ in range(3)],
+                [(0, 0)] * 9,
+                [2],
+                {upper, *lower_pair},
+                settings,
+                initial_completed_visual_hits={upper, *lower_pair},
+                initial_red_marker_completed_cells={upper, *lower_pair},
+                initial_authoritative_completed_visual_hits={upper, *lower_pair},
+                initial_authoritative_completed_placements=(
+                    self.main.Placement(length=2, direction="V", cells=((0, 1), (1, 1))),
+                ),
+                initial_completed_lengths=(2,),
+            )
+
+        self.assertTrue(completed)
+        self.assertNotIn(upper, scan.call_args.kwargs["initial_hits"])
+        self.assertIn(upper, scan.call_args.kwargs["initial_misses"])
+        self.assertNotIn(upper, scan.call_args.kwargs["initial_red_marker_completed_cells"])
+        self.assertTrue(
+            all(upper not in placement.cells
+                for placement in scan.call_args.kwargs["initial_authoritative_completed_placements"])
+        )
+
+    def test_red_scout_completed_geometry_is_locked_without_duplicate_blue_shot(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        ship = ((0, 1), (0, 2), (0, 3), (0, 4))
+        result = self.main.RedScoutResult(
+            center_cell=(2, 2),
+            affected_cells=frozenset(ship),
+            hit_cells=frozenset(ship),
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(frozenset(ship)),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in ship},
+            diagnostics={
+                "completed_ship_failure": None,
+                "completed_lengths": (4,),
+                "resolved_ship_placements": (ship,),
+            },
+        )
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(2, 2)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(self.main, "_execute_online_scout_hit") as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                9,
+                [[0] * 10 for _ in range(10)],
+                [(0, 0)] * 100,
+                [4],
+                set(ship),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        online_hit.assert_not_called()
+        placements = scan.call_args.kwargs["initial_authoritative_completed_placements"]
+        self.assertEqual({placement.cells for placement in placements}, {ship})
+
+    def test_completed_ship_representative_prefers_cell_without_existing_wreck(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        existing_wreck = (1, 1)
+        missing_wreck = (1, 2)
+        ship = (existing_wreck, missing_wreck)
+        misses = frozenset({(0, 0), (0, 1), (0, 2), (1, 0)})
+        affected = frozenset({*ship, *misses})
+        result = self.main.RedScoutResult(
+            center_cell=(2, 2),
+            affected_cells=affected,
+            hit_cells=frozenset(ship),
+            miss_cells=misses,
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(affected),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in affected},
+            diagnostics={
+                "completed_ship_failure": None,
+                "completed_lengths": (2,),
+                "resolved_ship_placements": (ship,),
+            },
+        )
+        click_points = [
+            (400 + (index % 3) * 100, 300 + (index // 3) * 100)
+            for index in range(9)
+        ]
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(2, 2)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True),
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _ in range(3)],
+                click_points,
+                [2],
+                {existing_wreck},
+                settings,
+            )
+
+        self.assertTrue(completed)
+        online_hit.assert_called_once()
+        self.assertEqual(online_hit.call_args.kwargs["cell"], missing_wreck)
+
+    def test_red_marker_completed_ship_retries_unopened_cell_until_hit(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        unopened = (9, 1)
+        existing_wrecks = {(9, 2), (9, 3), (9, 4)}
+        ship = (unopened, *sorted(existing_wrecks))
+        misses = frozenset({(5, 6), (7, 7)})
+        result = self.main.RedScoutResult(
+            center_cell=(5, 6),
+            affected_cells=frozenset({*ship, *misses}),
+            hit_cells=frozenset(ship),
+            miss_cells=misses,
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(frozenset({*ship, *misses})),
+            valid=True,
+            confidence_by_cell={
+                cell: 0.95 for cell in {*ship, *misses}
+            },
+            diagnostics={
+                "completed_ship_failure": None,
+                "completed_lengths": (4,),
+                "completed_body_candidates": ((9, 2), (9, 3)),
+                "resolved_ship_placements": (ship,),
+            },
+        )
+        click_points = [
+            (300 + (index % 10) * 40, 100 + (index // 10) * 30)
+            for index in range(100)
+        ]
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(5, 6)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                side_effect=[self.main.ProbeResult.MISS, self.main.ProbeResult.HIT],
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                9,
+                [[0] * 10 for _row in range(10)],
+                click_points,
+                [4],
+                set(existing_wrecks),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(online_hit.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["cell"] for call in online_hit.call_args_list],
+            [unopened, unopened],
+        )
+        self.assertTrue(online_hit.call_args_list[0].kwargs["fast_batch"])
+        self.assertFalse(online_hit.call_args_list[1].kwargs["fast_batch"])
+        self.assertEqual(scan.call_args.kwargs["initial_hits"], set(ship))
+        self.assertEqual(scan.call_args.kwargs["initial_scout_hits"], set())
+
+    def test_completed_ship_safety_area_clears_false_hit_and_is_never_targeted(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        existing_wreck = (2, 0)
+        unopened_ship_cell = (2, 1)
+        false_perimeter_hit = (1, 2)
+        ship = (existing_wreck, unopened_ship_cell)
+        misses = frozenset({(0, 0), (0, 1), (0, 2)})
+        affected = frozenset({*ship, false_perimeter_hit, *misses})
+        result = self.main.RedScoutResult(
+            center_cell=(0, 0),
+            affected_cells=affected,
+            hit_cells=frozenset({*ship, false_perimeter_hit}),
+            miss_cells=misses,
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(affected),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in affected},
+            diagnostics={
+                "completed_ship_failure": None,
+                "completed_lengths": (2,),
+                "resolved_ship_placements": (ship,),
+            },
+        )
+        click_points = [
+            (400 + (index % 3) * 100, 250 + (index // 3) * 80)
+            for index in range(9)
+        ]
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(0, 0)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _row in range(3)],
+                click_points,
+                [2],
+                {existing_wreck, false_perimeter_hit},
+                settings,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(
+            [call.kwargs["cell"] for call in online_hit.call_args_list],
+            [unopened_ship_cell],
+        )
+        expected_safety = {
+            (1, 0), (1, 1), (1, 2), (2, 2),
+        }
+        self.assertEqual(scan.call_args.kwargs["initial_hits"], set(ship))
+        self.assertTrue(
+            expected_safety <= scan.call_args.kwargs["initial_misses"]
+        )
+        self.assertNotIn(
+            false_perimeter_hit,
+            scan.call_args.kwargs["initial_scout_hits"],
+        )
+
+    def test_red_scout_clicks_every_pending_scout_hit_in_completed_ship_result(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        ordinary_hit = (0, 0)
+        pending_ship_hit = (2, 1)
+        committed_ship_hit = (2, 2)
+        ship = (pending_ship_hit, committed_ship_hit)
+        misses = frozenset({(0, 1), (0, 2), (1, 2)})
+        affected = frozenset({ordinary_hit, *ship, *misses})
+        result = self.main.RedScoutResult(
+            center_cell=(1, 0),
+            affected_cells=affected,
+            hit_cells=frozenset({ordinary_hit, *ship}),
+            miss_cells=misses,
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(affected),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in affected},
+            diagnostics={
+                "completed_ship_failure": None,
+                "completed_lengths": (2,),
+                "resolved_ship_placements": (ship,),
+            },
+        )
+        click_points = [
+            (400 + (index % 3) * 100, 300 + (index // 3) * 100)
+            for index in range(9)
+        ]
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(1, 0)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(self.main, "ONLINE_SCOUT_BATCH_ENABLED", False),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True),
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _ in range(3)],
+                click_points,
+                [1, 2],
+                {committed_ship_hit},
+                settings,
+            )
+
+        self.assertTrue(completed)
+        self.assertEqual(
+            [call.kwargs["cell"] for call in online_hit.call_args_list],
+            [ordinary_hit, pending_ship_hit],
+        )
+
+    def test_l_shape_clears_initial_upper_hit_before_lower_pair_batch(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        upper = (0, 1)
+        lower_pair = frozenset({(1, 1), (1, 2)})
+        result = self.main.RedScoutResult(
+            center_cell=(0, 0),
+            affected_cells=lower_pair,
+            hit_cells=lower_pair,
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(lower_pair),
+            valid=True,
+            confidence_by_cell={cell: 0.95 for cell in lower_pair},
+        )
+        batch_result = self.main.OnlineScoutBatchResult(
+            results={cell: self.main.ProbeResult.HIT for cell in lower_pair},
+            metadata={cell: {"batch": True, "stable_state": "hit"} for cell in lower_pair},
+        )
+        click_points = [
+            (400 + (index % 3) * 100, 300 + (index // 3) * 100)
+            for index in range(9)
+        ]
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(0, 0)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=result),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit_batch",
+                return_value=batch_result,
+            ) as online_batch,
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                1,
+                [[0] * 3 for _ in range(3)],
+                click_points,
+                [2],
+                {upper},
+                settings,
+            )
+
+        self.assertTrue(completed)
+        online_batch.assert_called_once()
+        self.assertEqual(
+            {target[0] for target in online_batch.call_args.kwargs["targets"]},
+            set(lower_pair),
+        )
+        online_hit.assert_not_called()
+        self.assertNotIn(upper, scan.call_args.kwargs["initial_hits"])
+        self.assertIn(upper, scan.call_args.kwargs["initial_misses"])
 
     def test_completed_ship_geometry_corrects_false_hit_in_l_shape(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
@@ -1716,7 +3410,9 @@ class MainFlowTest(unittest.TestCase):
             )
 
         self.assertTrue(completed)
-        self.assertEqual(online.call_count, 3)
+        blue_cells = {call.kwargs["cell"] for call in online.call_args_list}
+        self.assertNotIn(false_hit, blue_cells)
+        self.assertTrue(blue_cells <= actual_ship)
         scan.assert_called_once()
         self.assertEqual(scan.call_args.kwargs["initial_hits"], actual_ship)
         self.assertEqual(scan.call_args.kwargs["initial_misses"], {false_hit})
@@ -1751,6 +3447,45 @@ class MainFlowTest(unittest.TestCase):
         )
 
         self.assertEqual(false_cell, (0, 5))
+
+    def test_rotated_l_shape_discards_upper_unaligned_cell(self):
+        for l_hits, false_cell in (
+            (((5, 1), (5, 2), (6, 2)), (5, 1)),
+            (((5, 1), (5, 2), (6, 1)), (5, 2)),
+        ):
+            self.assertEqual(
+                self.main._resolve_false_hit_in_l_shape(l_hits, {}),
+                false_cell,
+            )
+
+    def test_three_by_three_l_detection_ignores_unrelated_hits(self):
+        match = self.main._find_flag_overlap_l_shape(
+            {
+                (0, 0),
+                (2, 0),
+                (2, 1),
+                (2, 2),
+                (6, 6),
+            }
+        )
+
+        self.assertEqual(match, ((0, 0), frozenset({(2, 0), (2, 1), (2, 2)})))
+
+    def test_complete_ship_cells_are_not_cleared_by_nearby_l_shape(self):
+        cells = {
+            (6, 7),
+            (6, 8),
+            (6, 9),
+            (8, 7),
+            (8, 8),
+            (8, 9),
+        }
+        resolution = self.main.resolve_completed_ship_cells(
+            cells,
+            (3, 3),
+            grid_size=10,
+        )
+        self.assertEqual(resolution.cells, frozenset(cells))
 
     def test_red_planner_progresses_covered_cells_and_resets_each_level(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
@@ -1888,6 +3623,90 @@ class MainFlowTest(unittest.TestCase):
 
         self.assertTrue(completed)
         self.assertIs(grid_img_result, grid_img)
+        run.assert_called_once()
+
+    def test_handle_game_level_uses_red_marker_as_completion_when_sidebar_is_unavailable(self):
+        submarines = [2, 2, 3, 4, 4, 5]
+        completed_ship = {(4, 1), (4, 2), (4, 3), (4, 4)}
+        sidebar_unavailable = None
+        click_points = [(400 + index, 300 + index) for index in range(100)]
+        grid_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        def run_strategy(*_args, **kwargs):
+            self.assertEqual(kwargs["initial_hits"], completed_ship | {(0, 0)})
+            self.assertEqual(kwargs["initial_completed_visual_hits"], completed_ship)
+            self.assertEqual(
+                kwargs["initial_authoritative_completed_visual_hits"],
+                completed_ship,
+            )
+            self.assertEqual(kwargs["initial_completed_lengths"], (4,))
+            self.assertEqual(
+                {placement.cells for placement in kwargs["initial_authoritative_completed_placements"]},
+                {tuple(sorted(completed_ship))},
+            )
+            return True
+
+        with (
+            patch.object(self.main.adb, "delay"),
+            patch.object(self.main.adb, "read_screenshot", return_value=grid_img),
+            patch.object(
+                self.main,
+                "get_click_points",
+                return_value=(click_points, np.zeros((4, 2), dtype=np.float32)),
+            ),
+            patch.object(self.main, "get_configured_submarines", return_value=submarines),
+            patch.object(self.main, "detect_sidebar_progress", return_value=sidebar_unavailable),
+            patch.object(self.main, "detect_visible_wreck_cells", return_value={(0, 0)}),
+            patch.object(self.main, "detect_partial_wreck_cells", return_value=set()),
+            patch.object(
+                self.main,
+                "detect_completed_submarine_candidate_cells",
+                return_value=completed_ship,
+            ),
+            patch.object(self.main, "_run_red_scout_and_blue_strategy", side_effect=run_strategy) as run,
+        ):
+            _grid_img_result, _quad, completed = self.main.handle_game_level(
+                9,
+                [[0] * 10 for _row in range(10)],
+            )
+
+        self.assertTrue(completed)
+        run.assert_called_once()
+
+    def test_handle_game_level_does_not_promote_contiguous_wrecks_without_completion_evidence(self):
+        submarines = [2, 2, 3, 4, 4, 5]
+        contiguous_hits = {(6, 2), (6, 3), (6, 4), (6, 5)}
+        click_points = [(400 + index, 300 + index) for index in range(100)]
+        grid_img = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        def run_strategy(*_args, **kwargs):
+            self.assertEqual(kwargs["initial_hits"], contiguous_hits)
+            self.assertEqual(kwargs["initial_completed_visual_hits"], set())
+            self.assertEqual(kwargs["initial_authoritative_completed_visual_hits"], set())
+            self.assertEqual(kwargs["initial_completed_lengths"], ())
+            return True
+
+        with (
+            patch.object(self.main.adb, "delay"),
+            patch.object(self.main.adb, "read_screenshot", return_value=grid_img),
+            patch.object(
+                self.main,
+                "get_click_points",
+                return_value=(click_points, np.zeros((4, 2), dtype=np.float32)),
+            ),
+            patch.object(self.main, "get_configured_submarines", return_value=submarines),
+            patch.object(self.main, "detect_sidebar_progress", return_value=None),
+            patch.object(self.main, "detect_visible_wreck_cells", return_value=contiguous_hits),
+            patch.object(self.main, "detect_partial_wreck_cells", return_value=set()),
+            patch.object(self.main, "detect_completed_submarine_candidate_cells", return_value=set()),
+            patch.object(self.main, "_run_red_scout_and_blue_strategy", side_effect=run_strategy) as run,
+        ):
+            _grid_img_result, _quad, completed = self.main.handle_game_level(
+                10,
+                [[0] * 10 for _row in range(10)],
+            )
+
+        self.assertTrue(completed)
         run.assert_called_once()
 
     def test_handle_game_level_discards_suspicious_all_grid_wreck_candidates(self):
@@ -2301,7 +4120,7 @@ class MainFlowTest(unittest.TestCase):
                 return_value=("before", "fingerprint", DummyMatch((10, 20))),
             ),
             patch.object(self.main, "_select_red_bomb", return_value=True),
-            patch.object(self.main, "_exit_activity_after_probe_click"),
+            patch.object(self.main, "_exit_activity_after_probe_click") as exit_activity,
             patch.object(self.main, "_reenter_activity_for_probe_result", return_value=False),
             patch.object(self.main, "_capture_red_result_frames", return_value=["after"]),
             patch.object(
@@ -2568,8 +4387,8 @@ class MainFlowTest(unittest.TestCase):
             ],
         )
 
-    def test_red_result_capture_uses_blue_frame_schedule(self):
-        frames = [object() for _ in self.main.HIT_RESULT_FRAME_DELAYS]
+    def test_red_result_capture_uses_red_frame_schedule(self):
+        frames = [object() for _ in self.main.RED_SCOUT_RESULT_FRAME_DELAYS]
         captured_paths = []
 
         def read_screenshot(path):
@@ -2583,18 +4402,18 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(result, frames)
         self.assertEqual(
             [call for call in self.adb.calls if call[0] == "delay"],
-            [("delay", delay) for delay in self.main.HIT_RESULT_FRAME_DELAYS],
+            [("delay", delay) for delay in self.main.RED_SCOUT_RESULT_FRAME_DELAYS],
         )
         self.assertEqual(
             captured_paths,
             [
                 self.main.RUN_DEBUG_DIR / f"red_result_{index}.png"
-                for index in range(len(self.main.HIT_RESULT_FRAME_DELAYS))
+                for index in range(len(self.main.RED_SCOUT_RESULT_FRAME_DELAYS))
             ],
         )
 
     def test_red_result_capture_writes_each_attempt_to_its_sample_directory(self):
-        frames = [object() for _ in self.main.HIT_RESULT_FRAME_DELAYS]
+        frames = [object() for _ in self.main.RED_SCOUT_RESULT_FRAME_DELAYS]
         captured_paths = []
         sample_dir = self.main.Path(self.runtime_temp.name) / "attempt"
         sample_dir.mkdir()
@@ -2612,7 +4431,7 @@ class MainFlowTest(unittest.TestCase):
             captured_paths,
             [
                 sample_dir / f"after_{index}.png"
-                for index in range(len(self.main.HIT_RESULT_FRAME_DELAYS))
+                for index in range(len(self.main.RED_SCOUT_RESULT_FRAME_DELAYS))
             ],
         )
 
@@ -3153,6 +4972,11 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "LEVEL_ADVANCE_RETRIES", 1),
             patch.object(
                 self.main,
+                "_reconnect_to_base_and_reenter_activity_after_victory",
+                return_value=True,
+            ),
+            patch.object(
+                self.main,
                 "resolve_current_level_from_device",
                 return_value=7,
             ),
@@ -3166,6 +4990,70 @@ class MainFlowTest(unittest.TestCase):
 
         self.assertIsNone(next_level)
         self.assertNotIn(("click", *self.main.SCREEN_CONTINUE_POINT), self.adb.calls)
+
+    def test_victory_transition_reconnects_to_base_then_reopens_activity_list(self):
+        package_name = self.main.GAME_PACKAGE_NAME
+        retry = DummyMatch((320, 240))
+        with (
+            patch.object(
+                self.main,
+                "wait_until_connection_interrupted_dialog",
+                return_value=DummyMatch((500, 300)),
+            ) as dialog,
+            patch.object(self.main, "wait_until_retry_button", return_value=retry) as retry_wait,
+            patch.object(
+                self.main,
+                "wait_until_occur",
+                return_value=DummyMatch((100, 100)),
+            ) as base_wait,
+            patch.object(self.main, "enter_activity", return_value=True) as enter,
+        ):
+            completed = self.main._reconnect_to_base_and_reenter_activity_after_victory()
+
+        self.assertTrue(completed)
+        self.assertIn(("enable_weak_network", package_name), self.adb.calls)
+        self.assertIn(("enable_reject_network", package_name), self.adb.calls)
+        self.assertIn(("disable_weak_network", package_name), self.adb.calls)
+        self.assertIn(("disable_reject_network", package_name), self.adb.calls)
+        self.assertIn(("click", *retry.center), self.adb.calls)
+        dialog.assert_called_once_with(timeout=self.main.MISS_CONNECTION_DIALOG_WAIT_SECONDS)
+        retry_wait.assert_called_once_with(timeout=self.main.MISS_RETRY_BUTTON_WAIT_SECONDS)
+        base_wait.assert_called_once_with(
+            self.main.ACTIVITY_BUTTON_TEMPLATE,
+            timeout=self.main.POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
+            poll_interval=self.main.ACTIVITY_REENTRY_POLL_INTERVAL_SECONDS,
+        )
+        enter.assert_called_once_with(
+            prepare_activity_list=True,
+            activity_button_timeout=self.main.POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
+        )
+
+    def test_victory_transition_treats_normal_activity_entry_as_success(self):
+        with (
+            patch.object(
+                self.main,
+                "wait_until_connection_interrupted_dialog",
+                return_value=DummyMatch((500, 300)),
+            ),
+            patch.object(
+                self.main,
+                "wait_until_retry_button",
+                return_value=DummyMatch((320, 240)),
+            ),
+            patch.object(
+                self.main,
+                "wait_until_occur",
+                return_value=DummyMatch((100, 100)),
+            ),
+            patch.object(self.main, "enter_activity", return_value=False) as enter,
+        ):
+            completed = self.main._reconnect_to_base_and_reenter_activity_after_victory()
+
+        self.assertTrue(completed)
+        enter.assert_called_once_with(
+            prepare_activity_list=True,
+            activity_button_timeout=self.main.POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
+        )
 
     def test_enter_activity_recovers_after_activity_button_missing(self):
         waits = iter(
@@ -3836,6 +5724,28 @@ class MainFlowTest(unittest.TestCase):
         )
         self.assertNotIn((2, 4), trusted)
 
+    def test_probe_metadata_fills_occluded_middle_cell_of_confirmed_three_cell_ship(self):
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        click_points = [(400 + index, 300 + index) for index in range(36)]
+        metadata = {
+            "sidebar_completion_screenshot": screenshot,
+            "sidebar_completed_lengths": (3,),
+        }
+
+        with patch.object(
+            self.main,
+            "detect_completed_submarine_candidate_cells",
+            return_value={(2, 1), (2, 3)},
+        ):
+            trusted = self.main._trusted_completed_cells_from_probe_metadata(
+                metadata,
+                click_points,
+                grid_size=6,
+                anchor=(2, 2),
+            )
+
+        self.assertEqual(trusted, {(2, 1), (2, 2), (2, 3)})
+
     def test_complete_visual_snapshot_replaces_stale_two_cell_ship_assignment(self):
         merge_snapshot = getattr(
             self.main,
@@ -3882,6 +5792,65 @@ class MainFlowTest(unittest.TestCase):
 
         self.assertEqual(merged, previous)
         self.assertNotIn((8, 8), merged)
+
+    def test_online_completed_placement_lock_survives_shorter_followup_geometry(self):
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 1)
+        full_ship = {(7, 3), (7, 4), (7, 5), (7, 6), (7, 7)}
+        second_ship = {(3, 8), (3, 9)}
+        shorter_snapshot = {(7, 3), (7, 4), (7, 5), (7, 6)} | second_ship
+        red_result = self.main.RedScoutResult(
+            center_cell=(5, 5),
+            affected_cells=frozenset({(0, 0), (0, 1)}),
+            hit_cells=frozenset({(0, 0), (0, 1)}),
+            miss_cells=frozenset(),
+            unknown_cells=frozenset(),
+            footprint=self.main.RedFootprint(frozenset({(0, 0), (0, 1)})),
+            valid=True,
+            confidence_by_cell={(0, 0): 0.95, (0, 1): 0.95},
+        )
+        screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
+        snapshots = iter((full_ship | second_ship, shorter_snapshot))
+
+        def online_hit(*_args, **kwargs):
+            metadata = kwargs["probe_metadata"]
+            metadata.update(
+                {
+                    "sidebar_completed_lengths": (5, 2),
+                    "sidebar_completion_screenshot": screenshot,
+                }
+            )
+            return self.main.ProbeResult.HIT
+
+        with (
+            patch.object(self.main.RedScoutPlanner, "choose_center", return_value=(5, 5)),
+            patch.object(self.main, "_execute_red_scout_transaction", return_value=red_result),
+            patch.object(self.main, "_execute_online_scout_hit", side_effect=online_hit),
+            patch.object(
+                self.main,
+                "_trusted_completed_cells_from_probe_metadata",
+                side_effect=lambda *_args, **_kwargs: next(snapshots),
+            ),
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+            patch.object(self.main, "ONLINE_SCOUT_BATCH_ENABLED", False),
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                9,
+                [[0] * 10 for _row in range(10)],
+                [(index % 10, index // 10) for index in range(100)],
+                [2, 2, 3, 4, 4, 5],
+                set(),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        placements = scan.call_args.kwargs["initial_authoritative_completed_placements"]
+        self.assertEqual(
+            {placement.cells for placement in placements},
+            {
+                tuple(sorted(full_ship)),
+                tuple(sorted(second_ship)),
+            },
+        )
 
     def test_consistent_incomplete_sidebar_frames_use_short_victory_wait(self):
         select_timeout = getattr(
@@ -4034,6 +6003,7 @@ class MainFlowTest(unittest.TestCase):
         self.assertIn("initial_sidebar_progress", signature.parameters)
         self.assertIn("initial_visual_hit_count", signature.parameters)
         self.assertIn("initial_completed_visual_hits", signature.parameters)
+        self.assertIn("initial_authoritative_completed_placements", signature.parameters)
 
         progress = SidebarProgress(completed_lengths=(4, 2))
         finished_strategy = SimpleNamespace(
@@ -4071,7 +6041,36 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(update_progress.call_args.args[1], 7)
         self.assertEqual(len(self.main._runtime_status.get("board_states", [])), 9)
 
-    def test_strategy_prioritizes_all_scout_miss_neighbors_before_normal_search(self):
+    def test_strategy_restores_authoritative_completed_placements_before_replay(self):
+        restorer = Mock(return_value=())
+        strategy = SimpleNamespace(
+            shots={},
+            done=True,
+            remaining={},
+            get_confirmed_ships=lambda: [],
+            restore_confirmed_placements=restorer,
+            report_result=Mock(),
+        )
+        placement = ((7, 3), (7, 4), (7, 5), (7, 6), (7, 7))
+        fake_bar = SimpleNamespace(total=1, n=0, set_postfix_str=lambda *_args, **_kwargs: None)
+
+        with (
+            patch.object(self.main, "SubmarineStrategy", return_value=strategy),
+            patch.object(self.main, "fixed_progress_bar", return_value=nullcontext(fake_bar)),
+            patch.object(self.main, "update_fixed_progress"),
+        ):
+            completed = self.main._scan_level_by_strategy(
+                level=9,
+                hit_map=[[0] * 10 for _ in range(10)],
+                click_points=[(400, 300)] * 100,
+                submarines=[2, 2, 3, 4, 4, 5],
+                initial_authoritative_completed_placements=(placement,),
+            )
+
+        self.assertTrue(completed)
+        restorer.assert_called_once_with((placement,))
+
+    def test_strategy_prioritizes_unknown_cells_before_scout_miss_rechecks(self):
         targets = [(0, 1), (2, 1), (1, 0), (1, 2)]
         strategy = SimpleNamespace(
             shots={(1, 1): True},
@@ -4083,7 +6082,7 @@ class MainFlowTest(unittest.TestCase):
             get_priority_scout_miss_recheck_targets=Mock(
                 side_effect=[targets, []]
             ),
-            choose_next_cell=Mock(return_value=(0, 0)),
+            choose_next_cell=Mock(side_effect=[(0, 0), None]),
         )
 
         def report_result(cell, hit):
@@ -4107,6 +6106,7 @@ class MainFlowTest(unittest.TestCase):
                 self.main,
                 "_probe_cell",
                 side_effect=[
+                    self.main.ProbeResult.MISS,
                     self.main.ProbeResult.HIT,
                     self.main.ProbeResult.MISS,
                     self.main.ProbeResult.MISS,
@@ -4126,13 +6126,14 @@ class MainFlowTest(unittest.TestCase):
         self.assertTrue(completed)
         self.assertEqual(
             [call.args[2] for call in probe.call_args_list],
-            targets,
+            [(0, 0), *targets],
         )
-        self.assertEqual(probe.call_count, 4)
-        strategy.choose_next_cell.assert_not_called()
+        self.assertEqual(probe.call_count, 5)
+        self.assertEqual(strategy.choose_next_cell.call_count, 2)
         self.assertEqual(
             [call.args for call in strategy.report_result.call_args_list],
             [
+                ((0, 0), False),
                 ((0, 1), True),
                 ((2, 1), False),
                 ((1, 0), False),
@@ -4198,7 +6199,7 @@ class MainFlowTest(unittest.TestCase):
             [call.args[2] for call in probe.call_args_list],
             targets,
         )
-        strategy.choose_next_cell.assert_not_called()
+        strategy.choose_next_cell.assert_called_once_with()
 
     def test_supplemental_neighbor_recheck_stops_when_victory_appears(self):
         strategy = SimpleNamespace(
@@ -4211,7 +6212,7 @@ class MainFlowTest(unittest.TestCase):
             get_priority_scout_miss_recheck_targets=Mock(
                 return_value=[(0, 1), (2, 1), (1, 0), (1, 2)]
             ),
-            choose_next_cell=Mock(return_value=(0, 0)),
+            choose_next_cell=Mock(return_value=None),
             report_result=Mock(),
         )
         fake_bar = SimpleNamespace(
@@ -4246,7 +6247,7 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(self.main._runtime_status["last_result"], "level_complete")
         self.assertEqual(self.main._runtime_status["board_states"][1][1], "hit")
         strategy.report_result.assert_not_called()
-        strategy.choose_next_cell.assert_not_called()
+        strategy.choose_next_cell.assert_called_once_with()
 
     def test_strategy_records_initial_misses_as_real_results(self):
         strategy = SimpleNamespace(
@@ -4387,6 +6388,141 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual([event[0] for event in events[:2]], ["online", "online"])
         self.assertEqual(events[2][0], "offline")
         self.assertEqual({event[1] for event in events[:2]}, {(1, 1), (1, 2)})
+
+    def test_strategy_uses_one_batch_for_multiple_scout_hits(self):
+        fake_bar = SimpleNamespace(
+            total=3,
+            n=0,
+            set_postfix_str=lambda *_args, **_kwargs: None,
+        )
+        strategy = SimpleNamespace(
+            shots={},
+            blocked_cells=set(),
+            done=False,
+            remaining=SimpleNamespace(elements=lambda: iter((1,))),
+            get_accounted_completed_lengths=lambda: [],
+            get_confirmed_ships=lambda: [],
+            get_scout_hit_cells=lambda: {(1, 1), (1, 2)},
+            report_scout_results=Mock(),
+            choose_next_cell=Mock(return_value=(1, 1)),
+        )
+
+        def report_result(cell, hit):
+            strategy.shots[cell] = hit
+            strategy.done = len(strategy.shots) == 2
+
+        strategy.report_result = Mock(side_effect=report_result)
+        batch_outcome = self.main.OnlineScoutBatchResult(
+            results={
+                (1, 1): self.main.ProbeResult.HIT,
+                (1, 2): self.main.ProbeResult.HIT,
+            },
+            metadata={
+                (1, 1): {
+                    "batch": True,
+                    "stable_state": "hit",
+                    "blue_bomb_ready": True,
+                    "network_ready": True,
+                },
+                (1, 2): {
+                    "batch": True,
+                    "stable_state": "hit",
+                    "blue_bomb_ready": True,
+                    "network_ready": True,
+                },
+            },
+        )
+
+        with (
+            patch.object(self.main, "SubmarineStrategy", return_value=strategy),
+            patch.object(self.main, "load_saved_level_shots", return_value={}),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit_batch",
+                return_value=batch_outcome,
+            ) as batch,
+            patch.object(self.main, "_execute_online_scout_hit") as single,
+            patch.object(self.main, "fixed_progress_bar", return_value=nullcontext(fake_bar)),
+            patch.object(self.main, "update_fixed_progress"),
+            patch.object(self.main, "save_level_shots"),
+            patch.object(self.main, "write_runtime_status"),
+        ):
+            completed = self.main._scan_level_by_strategy(
+                level=1,
+                hit_map=[[0] * 3 for _row in range(3)],
+                click_points=[
+                    (400, 300), (500, 300), (600, 300),
+                    (400, 400), (500, 400), (600, 400),
+                    (400, 500), (500, 500), (600, 500),
+                ],
+                submarines=[3],
+                initial_scout_hits={(1, 1), (1, 2)},
+                commit_scout_hits_online=True,
+                initial_visual_hit_count=0,
+            )
+
+        self.assertTrue(completed)
+        batch.assert_called_once()
+        single.assert_not_called()
+        self.assertEqual(
+            strategy.report_result.call_args_list,
+            [
+                call((1, 1), True),
+                call((1, 2), True),
+            ],
+        )
+        strategy.choose_next_cell.assert_called_once_with()
+
+    def test_strategy_does_not_batch_past_unmapped_visual_capacity(self):
+        fake_bar = SimpleNamespace(
+            total=3,
+            n=0,
+            set_postfix_str=lambda *_args, **_kwargs: None,
+        )
+        strategy = SimpleNamespace(
+            shots={},
+            blocked_cells=set(),
+            done=False,
+            remaining=SimpleNamespace(elements=lambda: iter((1,))),
+            get_accounted_completed_lengths=lambda: [],
+            get_confirmed_ships=lambda: [],
+            get_scout_hit_cells=lambda: {(1, 1), (1, 2)},
+            report_scout_results=Mock(),
+            choose_next_cell=Mock(side_effect=[(1, 1), (1, 2)]),
+        )
+
+        def report_result(cell, hit):
+            strategy.shots[cell] = hit
+            strategy.done = len(strategy.shots) >= 2
+
+        strategy.report_result = Mock(side_effect=report_result)
+        with (
+            patch.object(self.main, "SubmarineStrategy", return_value=strategy),
+            patch.object(self.main, "load_saved_level_shots", return_value={}),
+            patch.object(self.main, "_execute_online_scout_hit", return_value=self.main.ProbeResult.HIT) as single,
+            patch.object(self.main, "_execute_online_scout_hit_batch") as batch,
+            patch.object(self.main, "fixed_progress_bar", return_value=nullcontext(fake_bar)),
+            patch.object(self.main, "update_fixed_progress"),
+            patch.object(self.main, "save_level_shots"),
+            patch.object(self.main, "write_runtime_status"),
+        ):
+            completed = self.main._scan_level_by_strategy(
+                level=1,
+                hit_map=[[0] * 3 for _row in range(3)],
+                click_points=[
+                    (400, 300), (500, 300), (600, 300),
+                    (400, 400), (500, 400), (600, 400),
+                    (400, 500), (500, 500), (600, 500),
+                ],
+                submarines=[3],
+                initial_scout_hits={(1, 1), (1, 2)},
+                commit_scout_hits_online=True,
+                initial_visual_hit_count=2,
+            )
+
+        self.assertTrue(completed)
+        batch.assert_not_called()
+        self.assertEqual(single.call_count, 2)
 
     def test_online_scout_false_positive_does_not_increase_hit_progress(self):
         fake_bar = SimpleNamespace(total=1, n=0, set_postfix_str=lambda *_args, **_kwargs: None)
@@ -4728,7 +6864,7 @@ class MainFlowTest(unittest.TestCase):
         self.adb.click = Mock(side_effect=click)
         with (
             patch.object(self.main, "wait_until_occur", return_value=DummyMatch((1, 1))),
-            patch.object(self.main, "_exit_activity_after_probe_click"),
+            patch.object(self.main, "_exit_activity_after_probe_click") as exit_activity,
             patch.object(self.main, "_reenter_activity_for_probe_result", return_value=False),
             patch.object(self.main, "red_hit_marker_visible", return_value=False),
             patch.object(self.main, "visible_wreck_static_detected", return_value=False),
@@ -4771,6 +6907,10 @@ class MainFlowTest(unittest.TestCase):
         self.assertLess(marker_index, click_index)
         self.assertLess(click_index, clear_index)
         self.assertEqual(events[marker_index][1]["mode"], "blue_probe")
+        exit_activity.assert_called_once_with(
+            self.main.RUN_DEBUG_DIR / "debug_quit1.png",
+            use_system_back=True,
+        )
 
     def test_miss_discard_uses_connection_retry_without_closing_app(self):
         transaction = self.main.ProbeTransaction(level=1, cell=(0, 1), index=1)

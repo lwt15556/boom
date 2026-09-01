@@ -1,6 +1,7 @@
 import unittest
 
 from utils.submarine_strategy import (
+    Placement,
     SubmarineStrategy,
     get_configured_submarines,
     play_with_strategy,
@@ -517,8 +518,73 @@ class SubmarineStrategyTest(unittest.TestCase):
         self.assertEqual(unlocated, (4,))
         self.assertEqual(list(strategy.remaining.elements()), [2])
         self.assertEqual(strategy.get_accounted_completed_lengths(), [4])
-        self.assertIn((1, 1), strategy.blocked_cells)
-        self.assertNotIn((1, 1), strategy._unconfirmed_hit_cells())
+        self.assertNotIn((1, 1), strategy.blocked_cells)
+        self.assertEqual(strategy.get_cell_states()[1][1], "hit")
+        self.assertIn((1, 1), strategy._unconfirmed_hit_cells())
+
+    def test_unlocated_single_hit_is_not_rendered_as_completed_ship(self):
+        strategy = SubmarineStrategy(6, [2, 4])
+        strategy.report_result((1, 1), True)
+
+        located, unlocated = strategy.reconcile_completed_lengths(
+            (4,),
+            observed_completed_cells={(1, 1)},
+        )
+
+        self.assertEqual(located, ())
+        self.assertEqual(unlocated, (4,))
+        self.assertEqual(strategy.get_cell_states()[1][1], "hit")
+        self.assertEqual(strategy.get_confirmed_ships(), [])
+
+    def test_located_straight_ship_remains_rendered_as_completed_ship(self):
+        strategy = SubmarineStrategy(6, [2, 4])
+        for cell in ((2, 1), (2, 2)):
+            strategy.report_result(cell, True)
+
+        located, unlocated = strategy.reconcile_completed_lengths(
+            (2,),
+            observed_completed_cells={(2, 1), (2, 2)},
+        )
+
+        self.assertEqual(located, (2,))
+        self.assertEqual(unlocated, ())
+        self.assertEqual(
+            [strategy.get_cell_states()[2][col] for col in (1, 2)],
+            ["ship", "ship"],
+        )
+
+    def test_authoritative_completed_ship_cannot_be_downgraded_by_shorter_snapshot(self):
+        strategy = SubmarineStrategy(10, [3, 4, 5])
+        full_ship = Placement(
+            length=5,
+            direction="H",
+            cells=((7, 3), (7, 4), (7, 5), (7, 6), (7, 7)),
+        )
+        restored = strategy.restore_confirmed_placements((full_ship,))
+
+        self.assertEqual(len(restored), 1)
+        self.assertEqual(strategy.get_confirmed_ships()[0].cells, full_ship.cells)
+
+        # This is the later frame reported by the bug: the first four cells
+        # are visible, while the fifth one is temporarily occluded.
+        shorter_snapshot = Placement(
+            length=4,
+            direction="H",
+            cells=((7, 3), (7, 4), (7, 5), (7, 6)),
+        )
+        self.assertEqual(strategy.restore_confirmed_placements((shorter_snapshot,)), ())
+        self.assertEqual(
+            [ship.cells for ship in strategy.get_confirmed_ships()],
+            [full_ship.cells],
+        )
+        self.assertEqual(
+            [strategy.get_cell_states()[7][col] for col in range(3, 8)],
+            ["ship"] * 5,
+        )
+
+        strategy.report_result((7, 7), False)
+        self.assertNotIn((7, 7), strategy.shots)
+        self.assertEqual(strategy.get_cell_states()[7][7], "ship")
 
     def test_midgame_visual_state_reconciles_located_and_unlocated_ships(self):
         strategy = SubmarineStrategy(9, [2, 2, 3, 3, 4, 5])
@@ -549,10 +615,10 @@ class SubmarineStrategyTest(unittest.TestCase):
             sorted(strategy.remaining.elements()),
             [2, 3, 3, 5],
         )
-        self.assertIn(
-            strategy.choose_next_cell(),
-            {(0, 3), (2, 3), (1, 2), (1, 4)},
-        )
+        next_cell = strategy.choose_next_cell()
+        self.assertIsNotNone(next_cell)
+        self.assertNotIn(next_cell, visual_hits)
+        self.assertNotEqual(strategy.get_cell_states()[7][4], "ship")
 
     def test_missing_level_config_returns_none_for_fallback(self):
         self.assertEqual(get_configured_submarines(1, {1: [2, 3]}), [2, 3])

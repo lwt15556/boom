@@ -420,7 +420,7 @@ import cv2
 import numpy as np
 
 source = cv2.imread(
-    r"C:\Users\lwt\AppData\Local\Temp\codex-clipboard-d0e48224-6dd8-4d56-b475-19e12ba9829f.png",
+    r"<temporary screenshot path>",
     cv2.IMREAD_COLOR,
 )
 if source is None:
