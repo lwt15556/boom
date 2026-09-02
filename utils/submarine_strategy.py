@@ -395,7 +395,7 @@ class SubmarineStrategy:
                 elif self.shots.get(cell) is False:
                     chars.append(".")
                 elif cell in self.blocked_cells:
-                    chars.append("-")
+                    chars.append(".")
                 else:
                     chars.append("?")
             board.append("".join(chars))
@@ -407,7 +407,11 @@ class SubmarineStrategy:
 
         for row, col in self.blocked_cells:
             if self._inside((row, col)):
-                states[row][col] = "blocked"
+                # A blocked cell is the proven water perimeter of a completed
+                # submarine.  Keep ``blocked_cells`` for target selection, but
+                # expose it as a normal miss so the board shows the same
+                # crossed-water result as every other known empty cell.
+                states[row][col] = "miss"
 
         for (row, col), hit in self.scout_observations.items():
             states[row][col] = "scout_hit" if hit else "scout_miss"
@@ -436,6 +440,13 @@ class SubmarineStrategy:
         for row, col in confirmed_cells:
             if self._inside((row, col)):
                 states[row][col] = "ship"
+
+        # The perimeter of a confirmed ship is proven water.  Apply this last
+        # so stale scout or shot evidence cannot make a safety cell appear as
+        # a hit again in the rendered board.
+        for row, col in self.blocked_cells - confirmed_cells:
+            if self._inside((row, col)):
+                states[row][col] = "miss"
 
         return states
 

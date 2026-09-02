@@ -21,6 +21,50 @@ class SidebarProgressModuleTest(unittest.TestCase):
 class SidebarProgressTest(unittest.TestCase):
     fleet = (2, 2, 3, 3, 4, 5)
 
+    def test_completed_ship_resolution_binds_lengths_to_red_anchors(self):
+        candidates = {
+            (1, 1), (1, 2), (1, 3),
+            (5, 5), (6, 5),
+        }
+        anchors = {(1, 1), (5, 5)}
+
+        resolution = sidebar_progress.resolve_completed_ship_cells_by_anchors(
+            candidates,
+            anchors,
+            completed_lengths=(2, 3),
+            grid_size=7,
+        )
+
+        self.assertEqual(
+            resolution.placements,
+            (
+                ((1, 1), (1, 2), (1, 3)),
+                ((5, 5), (6, 5)),
+            ),
+        )
+        self.assertEqual(resolution.unresolved_lengths, ())
+
+    def test_anchor_resolution_rejects_equal_score_length_swap(self):
+        # Both anchors are close enough to both hulls.  The visual evidence
+        # alone therefore cannot prove which sidebar length belongs to which
+        # red marker; a deterministic tie-break would be unsafe.
+        candidates = {
+            (3, 3), (3, 4),
+            (5, 3), (5, 4), (5, 5),
+        }
+        anchors = {(4, 4), (4, 5)}
+
+        resolution = sidebar_progress.resolve_completed_ship_cells_by_anchors(
+            candidates,
+            anchors,
+            completed_lengths=(2, 3),
+            grid_size=8,
+            fallback_to_global=False,
+        )
+
+        self.assertEqual(resolution.placements, ())
+        self.assertEqual(resolution.unresolved_lengths, (3, 2))
+
     @staticmethod
     def make_sidebar_image(completed_rows=()):
         image = np.zeros((720, 1280, 3), dtype=np.uint8)

@@ -164,6 +164,81 @@ class WreckDetectionTest(unittest.TestCase):
         self.assertFalse(_default_hit_detector(frame, point))
         self.assertFalse(visible_wreck_static_detected(frame, point))
 
+    def test_red_marker_binds_to_adjacent_hull_cell_instead_of_nearest_point(self):
+        """A flag can project into the tile above its surfaced submarine."""
+        grid_size = 7
+        points = [
+            (80 + col * 40, 80 + row * 40)
+            for row in range(grid_size)
+            for col in range(grid_size)
+        ]
+        frame = np.zeros((420, 420, 3), dtype=np.uint8)
+
+        # The red component is centred on the calibrated point (2, 2), while
+        # the visible hull begins one row below it at (3, 2).  A nearest-point
+        # implementation reports (2, 2); the marker-aware binding must use the
+        # stronger adjacent hull evidence instead.
+        for cell in ((3, 2), (4, 2)):
+            x, y = points[cell[0] * grid_size + cell[1]]
+            cv2.ellipse(
+                frame,
+                (x, y),
+                (22, 14),
+                0,
+                0,
+                360,
+                (175, 178, 180),
+                cv2.FILLED,
+            )
+        x, y = points[2 * grid_size + 2]
+        cv2.rectangle(
+            frame,
+            (x - 7, y - 5),
+            (x + 7, y + 5),
+            (0, 0, 255),
+            cv2.FILLED,
+        )
+
+        self.assertEqual(
+            detect_red_submarine_marker_cells(frame, points, grid_size),
+            {(3, 2)},
+        )
+
+        # The same projection can shift a marker one column to the left of a
+        # vertical hull.  The binding should move right to the supported body.
+        frame = np.zeros((520, 520, 3), dtype=np.uint8)
+        grid_size = 10
+        points = [
+            (80 + col * 40, 80 + row * 35)
+            for row in range(grid_size)
+            for col in range(grid_size)
+        ]
+        for cell in ((2, 8), (3, 8)):
+            x, y = points[cell[0] * grid_size + cell[1]]
+            cv2.ellipse(
+                frame,
+                (x, y),
+                (22, 14),
+                0,
+                0,
+                360,
+                (175, 178, 180),
+                cv2.FILLED,
+            )
+        x, y = points[2 * grid_size + 7]
+        cv2.rectangle(
+            frame,
+            (x - 7, y - 5),
+            (x + 7, y + 5),
+            (0, 0, 255),
+            cv2.FILLED,
+        )
+
+        self.assertEqual(
+            detect_red_submarine_marker_cells(frame, points, grid_size),
+            {(2, 8)},
+        )
+
     def test_red_marker_only_suppresses_its_assigned_cell_not_neighbor_wreck(self):
         grid_size = 2
         points = [(60, 60), (100, 60), (60, 100), (100, 100)]

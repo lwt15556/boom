@@ -21,6 +21,9 @@ from tools.control_panel import (
 
 
 class ControlPanelHelperTest(unittest.TestCase):
+    def test_control_panel_version_is_defined(self):
+        self.assertRegex(control_panel.APP_VERSION, r"^\d+\.\d+\.\d+$")
+
     def test_build_main_environment_configures_red_scout(self):
         environment = build_main_environment("red_scout", 3)
         self.assertEqual(environment["BBMA_PROBE_MODE"], "red_scout")
@@ -185,6 +188,11 @@ class ControlPanelHelperTest(unittest.TestCase):
         overlaid = overlay_visual_candidates(states, [(0, 0), (0, 1), (1, 0)])
         self.assertEqual(overlaid, [["visual_candidate", "hit"], ["miss", "ship"]])
         self.assertEqual(states[0][0], "unknown")
+
+    def test_legacy_blocked_safety_area_is_rendered_as_a_miss(self):
+        overlaid = overlay_visual_candidates([["blocked"]], [])
+
+        self.assertEqual(overlaid, [["miss"]])
 
     def test_restore_network_refuses_while_main_is_running(self):
         with (

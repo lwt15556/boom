@@ -361,6 +361,70 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         )
         self.assertEqual(diagnostics["discarded_ship_cells"], tuple(sorted(visual_spill)))
 
+    def test_completed_ship_evidence_binds_two_simultaneous_red_markers(self):
+        before = np.zeros((720, 1280, 3), dtype=np.uint8)
+        after_images = tuple(before.copy() for _ in range(4))
+        fleet = (2, 3)
+        before_progress = SidebarProgress(active_lengths=fleet)
+        after_progress = SidebarProgress(
+            active_lengths=(),
+            completed_lengths=(3, 2),
+        )
+        first_ship = {(1, 1), (1, 2), (1, 3)}
+        second_ship = {(6, 6), (7, 6)}
+        body = first_ship | second_ship
+        anchors = {(1, 0), (6, 5)}
+        points_by_cell = {
+            (row, col): (400 + col * 10, 200 + row * 10)
+            for row in range(8)
+            for col in range(8)
+        }
+        diagnostics = {}
+
+        with (
+            patch.object(
+                red_scout_module,
+                "detect_sidebar_progress",
+                side_effect=[before_progress] + [after_progress] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "detect_completed_submarine_candidate_cells",
+                side_effect=[set()] + [body] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "detect_red_submarine_marker_cells",
+                side_effect=[set()] + [anchors] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "_infer_completed_ship_body_placements",
+                return_value=(set(), ()),
+            ),
+        ):
+            evidence = red_scout_module.RedScoutAnalyzer._completed_ship_evidence(
+                before_image=before,
+                after_images=after_images,
+                submarine_lengths=fleet,
+                before_visible=set(),
+                raw_stable_result_hits=set(),
+                grid_size=8,
+                points_by_cell=points_by_cell,
+                eligible_cells=set(points_by_cell),
+                diagnostics=diagnostics,
+            )
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual(
+            evidence.ship_cells,
+            frozenset(body),
+        )
+        self.assertEqual(
+            diagnostics["completed_resolution_mode"],
+            "red_anchor_length_binding",
+        )
+
     def test_completed_ship_hits_take_priority_over_excess_miss_noise(self):
         footprint = red_scout_module.RedFootprint(frozenset({(0, 0)}))
         ship = {(6, 1), (6, 2), (6, 3)}
@@ -676,6 +740,183 @@ class RedScoutAnalyzerTest(unittest.TestCase):
 
         self.assertIsNone(evidence)
         self.assertEqual(diagnostics["completed_ship_failure"], "missing_red_body_evidence")
+
+    def test_completed_ship_rejects_layout_with_two_inferred_cells(self):
+        """A sidebar update must not fill two unseen cells from hull projection."""
+        before = np.zeros((720, 1280, 3), dtype=np.uint8)
+        after_images = tuple(before.copy() for _ in range(4))
+        points_by_cell = {
+            (row, col): (400 + col * 10, 200 + row * 10)
+            for row in range(10)
+            for col in range(10)
+        }
+        progress_before = SidebarProgress(active_lengths=(4,))
+        progress_after = SidebarProgress(completed_lengths=(4,))
+        body = {(6, 5), (7, 5)}
+        inferred_ship = ((5, 5), (6, 5), (7, 5), (8, 5))
+        diagnostics = {}
+
+        with (
+            patch.object(
+                red_scout_module,
+                "detect_sidebar_progress",
+                side_effect=[progress_before] + [progress_after] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "detect_completed_submarine_candidate_cells",
+                side_effect=[set()] + [body] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "_infer_completed_ship_body_placements",
+                return_value=(set(inferred_ship), (inferred_ship,)),
+            ),
+        ):
+            evidence = red_scout_module.RedScoutAnalyzer._completed_ship_evidence(
+                before_image=before,
+                after_images=after_images,
+                submarine_lengths=(4,),
+                before_visible=set(),
+                raw_stable_result_hits={(8, 5)},
+                grid_size=10,
+                points_by_cell=points_by_cell,
+                eligible_cells=set(points_by_cell),
+                diagnostics=diagnostics,
+            )
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual(
+            diagnostics["completed_ship_failure"],
+            "insufficient_direct_body_support",
+        )
+        self.assertEqual(diagnostics["resolved_ship_placements"], ())
+        self.assertEqual(evidence.new_hit_cells, frozenset(body))
+        self.assertEqual(evidence.ship_cells, frozenset(body))
+
+    def test_completed_ship_accepts_two_body_cells_when_red_anchor_binds_layout(self):
+        """A surfaced 10x10 hull may expose only its middle two cells."""
+        before = np.zeros((720, 1280, 3), dtype=np.uint8)
+        after_images = tuple(before.copy() for _ in range(4))
+        points_by_cell = {
+            (row, col): (400 + col * 10, 200 + row * 10)
+            for row in range(10)
+            for col in range(10)
+        }
+        progress_before = SidebarProgress(active_lengths=(4,))
+        progress_after = SidebarProgress(completed_lengths=(4,))
+        body = {(8, 5), (8, 6)}
+        inferred_ship = ((8, 4), (8, 5), (8, 6), (8, 7))
+        diagnostics = {}
+
+        with (
+            patch.object(
+                red_scout_module,
+                "detect_sidebar_progress",
+                side_effect=[progress_before] + [progress_after] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "detect_completed_submarine_candidate_cells",
+                side_effect=[set()] + [body] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "detect_red_submarine_marker_cells",
+                side_effect=[set()] + [{(8, 6)}] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "_infer_completed_ship_body_placements",
+                return_value=(set(inferred_ship), (inferred_ship,)),
+            ),
+        ):
+            evidence = red_scout_module.RedScoutAnalyzer._completed_ship_evidence(
+                before_image=before,
+                after_images=after_images,
+                submarine_lengths=(4,),
+                before_visible=set(),
+                raw_stable_result_hits=body,
+                grid_size=10,
+                points_by_cell=points_by_cell,
+                eligible_cells=set(points_by_cell),
+                diagnostics=diagnostics,
+            )
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual(
+            diagnostics["completed_resolution_mode"],
+            "red_anchor_partial_body_support",
+        )
+        self.assertEqual(
+            diagnostics["resolved_ship_placements"],
+            (inferred_ship,),
+        )
+
+    def test_ambiguous_multi_completion_stays_failed_after_anchor_retry(self):
+        before = np.zeros((720, 1280, 3), dtype=np.uint8)
+        after_images = tuple(before.copy() for _ in range(4))
+        fleet = (2, 3)
+        before_progress = SidebarProgress(active_lengths=fleet)
+        after_progress = SidebarProgress(
+            active_lengths=(),
+            completed_lengths=(3, 2),
+        )
+        # Two hulls and two red markers, with both markers equally close to
+        # both hulls.  The analyzer must not accept the resolver's old global
+        # tie-break as authoritative.
+        body = {
+            (3, 3), (3, 4),
+            (5, 3), (5, 4), (5, 5),
+        }
+        anchors = {(4, 4), (4, 5)}
+        points_by_cell = {
+            (row, col): (400 + col * 10, 200 + row * 10)
+            for row in range(8)
+            for col in range(8)
+        }
+        diagnostics = {}
+
+        with (
+            patch.object(
+                red_scout_module,
+                "detect_sidebar_progress",
+                side_effect=[before_progress] + [after_progress] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "detect_completed_submarine_candidate_cells",
+                side_effect=[set()] + [body] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "detect_red_submarine_marker_cells",
+                side_effect=[set()] + [anchors] * 4,
+            ),
+            patch.object(
+                red_scout_module,
+                "_infer_completed_ship_body_placements",
+                return_value=(set(), ()),
+            ),
+        ):
+            evidence = red_scout_module.RedScoutAnalyzer._completed_ship_evidence(
+                before_image=before,
+                after_images=after_images,
+                submarine_lengths=fleet,
+                before_visible=set(),
+                raw_stable_result_hits=set(),
+                grid_size=8,
+                points_by_cell=points_by_cell,
+                eligible_cells=set(points_by_cell),
+                diagnostics=diagnostics,
+            )
+
+        self.assertIsNone(evidence)
+        self.assertEqual(
+            diagnostics["completed_ship_failure"],
+            "multi_completion_geometry_ambiguous",
+        )
+        self.assertEqual(diagnostics["completed_red_anchor_cells"], tuple(sorted(anchors)))
 
     GRID_SIZE = 5
     CLICK_POINTS = tuple(
@@ -1155,11 +1396,11 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         )
 
         self.assertFalse(result.valid)
-        self.assertEqual(result.affected_cells, frozenset())
-        self.assertEqual(result.hit_cells, frozenset())
+        self.assertEqual(result.affected_cells, frozenset({stable_hit}))
+        self.assertEqual(result.hit_cells, frozenset({stable_hit}))
         self.assertEqual(result.miss_cells, frozenset())
         self.assertEqual(result.unknown_cells, frozenset())
-        self.assertEqual(result.confidence_by_cell, {})
+        self.assertEqual(result.confidence_by_cell, {stable_hit: 0.20})
         self.assertEqual(result.invalid_reason, "too_many_strong_cells")
         self.assertEqual(result.diagnostics["stage"], "limit_strong_cells")
         self.assertEqual(

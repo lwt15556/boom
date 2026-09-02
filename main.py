@@ -78,6 +78,7 @@ from utils.sidebar_progress import (
     newly_completed_lengths,
     progressive_hit_count,
     resolve_completed_ship_cells,
+    resolve_completed_ship_cells_by_anchors,
 )
 from utils.submarine_strategy import (
     Cell,
@@ -119,6 +120,7 @@ RETRY_TEMPLATE = TEMPLATE_DIR / "retry.png"
 CONNECTION_INTERRUPTED_PANEL_TEMPLATE = TEMPLATE_DIR / "connection_interrupted_panel.png"
 CONNECTION_RETRY_TEMPLATE = TEMPLATE_DIR / "connection_retry.png"
 VICTORY_BANNER_TEMPLATE = TEMPLATE_DIR / "victory_banner.png"
+WIN_TEMPLATE = TEMPLATE_DIR / "win.png"
 BLUE_BOMB_ZERO_TEMPLATE = TEMPLATE_DIR / "blue_bomb_zero.png"
 RETRY_TEMPLATE_SCALES = (0.85, 0.95, 1.0, 1.05, 1.15)
 RETRY_TEMPLATE_LOOSE_THRESHOLD = 0.72
@@ -168,6 +170,11 @@ COMPLETED_SHIP_PENDING_BLUE_RETRIES = 2
 # full result window for every cell only adds latency.  Batch mode keeps one
 # short input window and performs the evidence pass after all taps.
 ONLINE_SCOUT_BATCH_ENABLED = True
+# On 10x10 boards the result animation and grid density make shared batch
+# frames unreliable: a later target can overwrite the evidence for an earlier
+# target and force a fail-closed UNKNOWN stop. Keep batches for smaller boards
+# but confirm 10x10 red-scout hits one cell at a time.
+ONLINE_SCOUT_BATCH_MAX_GRID_SIZE = 9
 ONLINE_SCOUT_BATCH_CLICK_INTERVAL_SECONDS = 0.25
 ONLINE_SCOUT_BATCH_FRAME_DELAYS = (0.55, 0.22, 0.32)
 ADAPTIVE_HIT_FRAMES_ENABLED = True
@@ -194,7 +201,7 @@ REOPEN_GAME_SETTLE_SECONDS = 0.4
 LOGIN_WAIT_AFTER_REOPEN_SECONDS = 14.0
 ACTIVITY_BUTTON_WAIT_SECONDS = 8.0
 POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS = 25.0
-ACTIVITY_DETAIL_WAIT_SECONDS = 8.0
+ACTIVITY_DETAIL_WAIT_SECONDS = 15.0
 ACTIVITY_EXIT_WAIT_SECONDS = 1.0
 ACTIVITY_EXIT_STABLE_FRAMES = 2
 ACTIVITY_EXIT_CLICK_ATTEMPTS = 5
@@ -204,6 +211,11 @@ ACTIVITY_EXIT_CLICK_ATTEMPTS = 5
 VICTORY_REPEAT_GUARD_SECONDS = 3.0
 VICTORY_CLEAR_CONFIRM_TIMEOUT_SECONDS = 0.8
 VICTORY_CLEAR_CONFIRM_POLL_SECONDS = 0.1
+# A level title can become readable before the victory overlay has finished
+# leaving the activity.  Do not let the first probe of the next level race that
+# transition and land on the old continue coordinate.
+NEXT_LEVEL_BOARD_READY_TIMEOUT_SECONDS = 5.0
+NEXT_LEVEL_BOARD_READY_POLL_SECONDS = 0.2
 ONLINE_SCOUT_NETWORK_SETTLE_SECONDS = 0.3
 ONLINE_SCOUT_BLUE_SELECT_SETTLE_SECONDS = 0.25
 ONLINE_SCOUT_BLUE_SELECT_FAST_SETTLE_SECONDS = 0.1
@@ -236,6 +248,42 @@ _network_fail_closed_reason: str | None = None
 _victory_last_fingerprint: str | None = None
 _victory_last_screenshot_id: int | None = None
 _victory_last_click_at: float | None = None
+_blue_victory_level_latched: int | None = None
+
+
+def _reset_victory_prompt_guard() -> None:
+    """Forget the previous victory transition when a new level starts."""
+    global _victory_last_fingerprint, _victory_last_screenshot_id, _victory_last_click_at
+    _victory_last_fingerprint = None
+    _victory_last_screenshot_id = None
+    _victory_last_click_at = None
+
+
+def _reset_blue_victory_latch() -> None:
+    global _blue_victory_level_latched
+    _blue_victory_level_latched = None
+
+
+def _latch_blue_victory(level: int, source: str) -> None:
+    global _blue_victory_level_latched
+    if _blue_victory_level_latched == int(level):
+        return
+    _blue_victory_level_latched = int(level)
+    logger.warning(
+        "blue victory latch set: level=%s source=%s; blocking all later board taps until next level",
+        level,
+        source,
+    )
+
+
+def _assert_blue_board_tap_allowed(level: int, source: str) -> None:
+    latched_level = _blue_victory_level_latched
+    if latched_level is None:
+        return
+    raise ProbeProtocolError(
+        f"blue board tap blocked after victory: level={level} source={source} "
+        f"latched_level={latched_level}; wait for next-level reset"
+    )
 
 
 class RedScoutSafetyError(RuntimeError):
@@ -295,10 +343,16 @@ def build_runtime_board_states(strategy: object, grid_size: int) -> list[list[st
     states = [["unknown" for _col in range(grid_size)] for _row in range(grid_size)]
     for row, col in getattr(strategy, "blocked_cells", set()):
         if 0 <= row < grid_size and 0 <= col < grid_size:
-            states[row][col] = "blocked"
+            # ``blocked_cells`` is a completed-submarine water perimeter.
+            # Preserve the block internally, while showing it as a confirmed
+            # miss in the runtime board just like normal known water.
+            states[row][col] = "miss"
     for (row, col), hit in getattr(strategy, "shots", {}).items():
         if 0 <= row < grid_size and 0 <= col < grid_size:
             states[row][col] = "hit" if hit else "miss"
+    for row, col in getattr(strategy, "blocked_cells", set()):
+        if 0 <= row < grid_size and 0 <= col < grid_size:
+            states[row][col] = "miss"
     return states
 
 
@@ -541,6 +595,7 @@ def write_runtime_status(**updates: object) -> None:
     """Write lightweight machine-readable status for the control panel."""
     global _active_phase_name, _active_phase_started_at
     global _victory_last_fingerprint, _victory_last_screenshot_id, _victory_last_click_at
+    global _blue_victory_level_latched
 
     next_phase = updates.get("phase")
     is_new_run = "started_at" in updates
@@ -551,6 +606,7 @@ def write_runtime_status(**updates: object) -> None:
         _victory_last_fingerprint = None
         _victory_last_screenshot_id = None
         _victory_last_click_at = None
+        _blue_victory_level_latched = None
         updates["phase_history"] = []
 
     if isinstance(next_phase, str) and next_phase:
@@ -1126,6 +1182,102 @@ def _persist_probe_debug_images(
             frame_records[capture_index]["saved"] = True
 
 
+def _save_batch_tap_capture(
+    sample_dir: Path | None,
+    filename: str,
+    capture: object,
+) -> str | None:
+    """Persist a per-target tap frame and return its path for metadata."""
+    if sample_dir is None or capture is None:
+        return None
+    try:
+        path = sample_dir / filename
+        capture.save(path)
+        return str(path)
+    except (AttributeError, OSError) as exc:
+        logger.warning("could not save batch tap frame %s: %s", filename, exc)
+        return None
+
+
+def _save_batch_tap_image(
+    sample_dir: Path | None,
+    filename: str,
+    image: object,
+) -> str | None:
+    """Persist a raw per-target screenshot and return its path for metadata."""
+    if sample_dir is None or not isinstance(image, np.ndarray):
+        return None
+    try:
+        path = sample_dir / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        ok, encoded = cv2.imencode(".png", image)
+        if not ok:
+            raise OSError("PNG encoding failed")
+        path.write_bytes(encoded.tobytes())
+        return str(path)
+    except (OSError, cv2.error, TypeError, ValueError) as exc:
+        logger.warning("could not save batch tap image %s: %s", filename, exc)
+        return None
+
+
+def _batch_level_title_mismatch(image: np.ndarray, level: int) -> bool:
+    """Return true only when a confident title identifies a different level."""
+    try:
+        title = recognize_level_title(image, reference_dir=LEVEL_REFERENCE_DIR)
+    except Exception as exc:
+        logger.warning("batch level-title check failed: %s", exc)
+        # A matcher failure is not evidence that the game moved to another
+        # level.  The activity-template and screen-change guards below still
+        # provide the fail-closed transition check.
+        return False
+    if title is None or not title.confident:
+        return False
+    if int(title.level) == int(level):
+        return False
+    logger.warning(
+        "batch level-title check found a different level: expected=%s detected=%s score=%.3f",
+        level,
+        title.level,
+        title.score,
+    )
+    return True
+
+
+def _batch_screen_changed(before: object, after: object) -> bool:
+    """Return whether two screenshots differ enough to represent a transition."""
+    before_img = getattr(before, "image", before)
+    after_img = getattr(after, "image", after)
+    if not isinstance(before_img, np.ndarray) or not isinstance(after_img, np.ndarray):
+        return True
+    if before_img.shape != after_img.shape:
+        return True
+    return not np.array_equal(before_img, after_img)
+
+
+def _validate_batch_board_frame(
+    image: np.ndarray,
+    *,
+    level: int,
+    baseline: np.ndarray | None,
+    stage: str,
+) -> None:
+    """Fail closed when a batch leaves the current activity detail page."""
+    if not isinstance(image, np.ndarray):
+        raise ProbeProtocolError(f"online scout-hit batch {stage} screenshot is invalid")
+    if find_victory_banner(image) is not None:
+        raise ProbeProtocolError(
+            f"online scout-hit batch {stage} detected victory for level {level}"
+        )
+    if find_connection_interrupted_dialog(image) is not None:
+        raise ProbeProtocolError(
+            f"online scout-hit batch {stage} detected connection dialog"
+        )
+    if find_template(image, QUIT_ACTIVITY_TEMPLATE) is None:
+        raise ProbeProtocolError(
+            f"online scout-hit batch {stage} activity detail disappeared"
+        )
+
+
 def _is_near_hit_frame(result) -> bool:
     if bool(getattr(result, "evidence_vetoed", False)):
         return False
@@ -1277,7 +1429,13 @@ def _visible_wreck_for_hit_state(
     return True
 
 
-def apply_wreck_template_confirmation(after_img: np.ndarray, point: tuple[int, int], result) -> bool:
+def apply_wreck_template_confirmation(
+    after_img: np.ndarray,
+    point: tuple[int, int],
+    result,
+    *,
+    cell_polygon: np.ndarray | None = None,
+) -> bool:
     # This is a post-click result frame.  The broad white explosion animation
     # can resemble the moving water highlight, so the pre-click glare veto is
     # intentionally disabled here.  Template/shape and paired-frame evidence
@@ -1285,6 +1443,7 @@ def apply_wreck_template_confirmation(after_img: np.ndarray, point: tuple[int, i
     if not visible_wreck_static_detected(
         after_img,
         point,
+        cell_polygon=cell_polygon,
         filter_surface_reflection=False,
         filter_activity_title_overlay=False,
     ):
@@ -1377,14 +1536,34 @@ def _trusted_completed_cells_from_probe_metadata(
                 ):
                     candidates.update(placement)
 
-    resolution = resolve_completed_ship_cells(
-        candidates,
-        completed_lengths,
-        grid_size=grid_size,
-        preferred_cells=(
-            preferred
-        ),
+    red_anchor_cells = detect_red_submarine_marker_cells(
+        screenshot,
+        list(click_points),
+        grid_size,
     )
+    if len(red_anchor_cells) == len(completed_lengths) and len(completed_lengths) > 1:
+        resolution = resolve_completed_ship_cells_by_anchors(
+            candidates,
+            red_anchor_cells,
+            completed_lengths,
+            grid_size=grid_size,
+            preferred_cells=preferred,
+            fallback_to_global=False,
+        )
+        if resolution.unresolved_lengths:
+            logger.warning(
+                "completed probe metadata has ambiguous red-anchor geometry; "
+                "keeping cells provisional: anchors=%s lengths=%s",
+                sorted(red_anchor_cells),
+                list(completed_lengths),
+            )
+    else:
+        resolution = resolve_completed_ship_cells(
+            candidates,
+            completed_lengths,
+            grid_size=grid_size,
+            preferred_cells=preferred,
+        )
     trusted = set(resolution.cells)
     logger.info(
         "live completed ship geometry: placements=%s unresolved=%s discarded=%s",
@@ -1440,6 +1619,73 @@ def enforce_positive_hit_evidence(
     result.score = min(float(result.score), SUSPECT_HIT_SCORE_THRESHOLD - 0.01)
     result.confidence = max(float(result.confidence), 1.0 - float(result.score))
     return True
+
+
+def _probe_record_has_positive_hit_evidence(record: Mapping[str, object]) -> bool:
+    """Return whether a result frame contains evidence that a shot hit.
+
+    A classifier score alone is not an acknowledgement from the game.  The
+    clicked cell must produce a new wreck, a newly completed sidebar entry, or
+    a victory frame before a hit can be committed.
+    """
+    return bool(
+        record.get("new_wreck_hit")
+        or (record.get("batch") and record.get("template_hit"))
+        or record.get("sidebar_hit")
+        or record.get("victory_banner")
+    )
+
+
+def _probe_record_has_visual_response(record: Mapping[str, object]) -> bool:
+    """Return whether a result frame shows any response to the pending shot."""
+    if _probe_record_has_positive_hit_evidence(record):
+        return True
+    result = record.get("result")
+    try:
+        changed_ratio = float(
+            result.get("changed_ratio", 0.0)
+            if isinstance(result, Mapping)
+            else getattr(result, "changed_ratio", 0.0)
+        )
+    except (TypeError, ValueError):
+        changed_ratio = 0.0
+    return changed_ratio >= NEAR_HIT_MIN_CHANGED_RATIO
+
+
+def _probe_has_positive_hit_evidence(frame_records: Sequence[Mapping[str, object]]) -> bool:
+    return any(_probe_record_has_positive_hit_evidence(record) for record in frame_records)
+
+
+def _probe_has_visual_response(frame_records: Sequence[Mapping[str, object]]) -> bool:
+    return any(_probe_record_has_visual_response(record) for record in frame_records)
+
+
+def _stable_miss_rejects_transient_static_wreck(
+    hit_results: Sequence[object],
+    stable_analysis: object | None,
+    *,
+    sidebar_completed: bool,
+    victory_detected: bool,
+) -> bool:
+    """Reject a hit that exists only in transient static-template frames.
+
+    A surfaced submarine or its animation can match the white-wreck template
+    briefly.  A real wreck remains visible in the later stable frames.  Sidebar
+    completion and victory are authoritative exceptions because they are game
+    acknowledgements independent of the visual template.
+    """
+    if sidebar_completed or victory_detected or not hit_results:
+        return False
+    stable_result = getattr(stable_analysis, "result", None)
+    if getattr(stable_result, "state", None) != "miss":
+        return False
+    hit_frames = [item for item in hit_results if getattr(item, "state", None) == "hit"]
+    if not hit_frames:
+        return False
+    return all(
+        getattr(item, "evidence_kind", None) == "static_wreck_hit"
+        for item in hit_frames
+    )
 
 
 def enable_weak_network(second: float = 0) -> None:
@@ -1526,6 +1772,11 @@ def _select_red_bomb(
     match: MatchResult,
     output_path: Path | None = None,
 ) -> bool:
+    logger.info(
+        "board tap dispatch: source=red_bomb_select level=%s point=%s",
+        getattr(_active_probe, "level", "--"),
+        match.center,
+    )
     adb.click(*match.center)
     adb.delay(0.25)
     return red_bomb_selected(
@@ -1550,11 +1801,18 @@ def _capture_red_result_frames(sample_dir: Path | None = None):
 def _verify_red_ammo_unchanged(
     before_fingerprint: AmmoFingerprint,
     sample_dir: Path | None = None,
+    *,
+    strict: bool = True,
 ) -> None:
     write_runtime_status(phase="red_scout_verify_ammo")
     after_state = _capture_red_ammo_state(sample_dir=sample_dir, prefix="verify")
     if not ammo_fingerprint_matches(before_fingerprint, after_state[1]):
-        _stop_and_latch_red_safety_failure("red ammo fingerprint mismatch")
+        if strict:
+            _stop_and_latch_red_safety_failure("red ammo fingerprint mismatch")
+        logger.warning(
+            "red ammo fingerprint changed during a local victory transition; "
+            "continuing with blue attack because the red request was discarded"
+        )
     clear_pending_probe()
 
 
@@ -2157,7 +2415,11 @@ def _execute_red_scout_transaction(
                 "attacks because the red request must never be committed"
             )
             _discard_pending_request_and_prepare_next_probe(transaction)
-            _verify_red_ammo_unchanged(before_fingerprint, sample_dir=sample_dir)
+            # Re-entry already confirmed the current-level victory while DROP
+            # is active.  The red request is discarded unconditionally; do not
+            # sample the ammo ROI here because the victory transition itself
+            # can legitimately replace that UI region.
+            clear_pending_probe()
             pending_marker_written = False
             _active_probe = None
             return local_victory_result
@@ -2244,11 +2506,36 @@ def _execute_red_scout_transaction(
             _stop_and_latch_red_safety_failure(
                 f"red discard contract violated: phase={transaction.phase.name}"
             )
-        _verify_red_ammo_unchanged(before_fingerprint, sample_dir=sample_dir)
+        # The red request is now durably discarded.  Clear the marker before
+        # waiting on background analysis so an analysis failure cannot turn a
+        # safely discarded request back into a pending-request safety fault.
         pending_marker_written = False
         if capture_future is not None:
             capture_future.result()
-        analysis = analysis_future.result()
+        try:
+            analysis = analysis_future.result()
+        except Exception:
+            # Without a usable analysis result we cannot prove that the
+            # transition was a local victory, so retain the fail-closed ammo
+            # check before propagating the analysis failure.
+            _verify_red_ammo_unchanged(
+                before_fingerprint,
+                sample_dir=sample_dir,
+                strict=True,
+            )
+            raise
+        # A victory banner can legitimately change the red-ammo ROI while the
+        # result transition is being rendered.  That transition is explicitly
+        # non-committable, so tolerate the fingerprint change only for the
+        # local-victory result; ordinary red results keep strict validation.
+        if analysis.invalid_reason == "local_victory_screen":
+            _verify_red_ammo_unchanged(
+                before_fingerprint,
+                sample_dir=sample_dir,
+                strict=False,
+            )
+        else:
+            _verify_red_ammo_unchanged(before_fingerprint, sample_dir=sample_dir)
         if capture_executor is not None:
             capture_executor.shutdown(wait=True)
             capture_executor = None
@@ -2409,10 +2696,23 @@ def enter_activity(
             logger.info("already in activity detail; fast path")
             return level_completed
         if detail_open:
+            # After a discarded blue request the retry dialog can disappear
+            # while the old activity detail page remains underneath it.  Do
+            # not wait for the base activity button behind that stale page:
+            # leave the detail first, then wait for the normal entry point.
+            if _has_pending_probe_request():
+                raise ProbeProtocolError(
+                    "旧活动详情页仍可见且探测请求尚未确认丢弃，禁止退出详情页恢复"
+                )
             logger.warning(
                 "fresh activity re-entry requested while the old detail view is still visible; "
-                "waiting for the activity button"
+                "leaving stale detail before waiting for the activity button"
             )
+            adb.back()
+            if not _wait_until_activity_detail_closed():
+                raise ProbeProtocolError(
+                    "旧活动详情页未能退出；保持当前网络状态并停止后续探测"
+                )
         if not re_enter:
             if handle_victory_prompt(timeout=0.0, screenshot=screenshot):
                 level_completed = True
@@ -2452,13 +2752,52 @@ def enter_activity(
             adb.delay(0.2).swipe(*ACTIVITY_LIST_SWIPE)
 
         adb.delay(0.35).click(*ACTIVITY_DETAIL_POINT)
-        if wait_until_occur(QUIT_ACTIVITY_TEMPLATE, timeout=ACTIVITY_DETAIL_WAIT_SECONDS) is not None:
+        if re_enter:
+            # A red probe can expose the victory overlay before the activity
+            # detail template becomes visible. Check one fresh frame first so
+            # the normal detail wait does not burn the full 15-second timeout.
+            early_victory_screen = adb.read_screenshot()
+            if find_victory_banner(early_victory_screen) is not None:
+                logger.info(
+                    "victory banner detected immediately after re-entering activity; "
+                    "skipping activity-detail wait"
+                )
+                return True
+        detail_or_victory = wait_until_occur(
+            QUIT_ACTIVITY_TEMPLATE,
+            timeout=ACTIVITY_DETAIL_WAIT_SECONDS,
+            poll_interval=(
+                ACTIVITY_REENTRY_POLL_INTERVAL_SECONDS
+                if re_enter
+                else FAST_POLL_INTERVAL_SECONDS
+            ),
+            alternate_matchers=(
+                (("victory", find_victory_banner),)
+                if re_enter
+                else ()
+            ),
+        )
+        if detail_or_victory is not None:
+            # During probe re-entry a victory match means the pending request
+            # must be discarded before the overlay is ever continued.  The
+            # caller handles that transaction; do not tap the victory page here.
+            matched_template = getattr(detail_or_victory, "template_path", None)
+            if re_enter and matched_template is not None:
+                try:
+                    if Path(matched_template).name in {"win.png", "victory_banner.png"}:
+                        logger.info(
+                            "victory banner detected while waiting for activity detail; "
+                            "skipping the remaining detail wait"
+                        )
+                        return True
+                except (TypeError, ValueError):
+                    pass
             return level_completed
 
         recovery = recover_activity_detail_timeout(re_enter=re_enter)
         if recovery == "ready":
             return level_completed
-        if recovery == "level_complete":
+        if recovery in {"level_complete", "pending_victory"}:
             level_completed = True
             if re_enter:
                 return True
@@ -2486,11 +2825,27 @@ def enter_activity(
 
 
 def recover_activity_detail_timeout(re_enter: bool) -> str:
-    """Return 'ready', 'retry', or 'unhandled' after an activity-detail timeout."""
+    """Return the recovery state after an activity-detail timeout.
+
+    ``pending_victory`` is reserved for probe re-entry: the current-level
+    victory page is detected but deliberately left untouched until the
+    pending request has been discarded.
+    """
     screenshot = adb.read_screenshot()
     if find_template(screenshot, QUIT_ACTIVITY_TEMPLATE) is not None:
         logger.info("activity detail was detected after timeout; continuing")
         return "ready"
+
+    # A pending probe can expose the current level's victory page while the
+    # old activity detail is closing. Leave that page untouched: clicking the
+    # continue point here would load the next board before the pending request
+    # has been discarded, so the following blue tap could hit the wrong level.
+    if re_enter and find_victory_banner(screenshot) is not None:
+        logger.info(
+            "victory banner replaced activity detail during probe re-entry; "
+            "leaving it untouched for the pending transaction"
+        )
+        return "pending_victory"
 
     if handle_victory_prompt(
         timeout=0.0,
@@ -2538,6 +2893,8 @@ def get_level_grid_size(level: int) -> int:
 
 def reset_runtime_level_status(level: int) -> None:
     """Publish a clean board immediately when a new level becomes active."""
+    _reset_victory_prompt_guard()
+    _reset_blue_victory_latch()
     grid_size = get_level_grid_size(level)
     submarines = get_configured_submarines(level, SUBMARINES) or ()
     write_runtime_status(
@@ -2840,11 +3197,27 @@ def handle_game_level(
             for cell in completed_anchor_candidates
             if not is_title_occluded_cell(cell, grid_size)
         }
+        completed_red_anchor_cells = detect_red_submarine_marker_cells(
+            grid_img,
+            click_points,
+            grid_size,
+        )
+        completed_red_anchor_cells = {
+            cell
+            for cell in completed_red_anchor_cells
+            if not is_title_occluded_cell(cell, grid_size)
+        }
         if completed_anchor_candidates:
             logger.info(
                 "level %s completed ship anchor review found %s candidate cells",
                 level,
                 len(completed_anchor_candidates),
+            )
+        if completed_red_anchor_cells:
+            logger.info(
+                "level %s red completion marker review found anchors=%s",
+                level,
+                sorted(completed_red_anchor_cells),
             )
         completed_candidates = (
             completed_anchor_candidates
@@ -2852,17 +3225,44 @@ def handle_game_level(
             else set(visible_hits) - partial_cells
         )
         if sidebar_progress is not None:
-            completed_resolution = resolve_completed_ship_cells(
-                completed_candidates,
-                sidebar_progress.completed_lengths,
-                grid_size=grid_size,
-            )
+            if (
+                completed_anchor_candidates
+                and len(completed_red_anchor_cells)
+                == len(sidebar_progress.completed_lengths)
+            ):
+                completed_resolution = resolve_completed_ship_cells_by_anchors(
+                    completed_candidates,
+                    completed_red_anchor_cells,
+                    sidebar_progress.completed_lengths,
+                    grid_size=grid_size,
+                    preferred_cells=visible_hits,
+                    fallback_to_global=False,
+                )
+                if completed_resolution.unresolved_lengths:
+                    logger.warning(
+                        "level %s completed ship anchors could not be uniquely bound "
+                        "to sidebar lengths; keeping those cells provisional",
+                        level,
+                    )
+                logger.info(
+                    "level %s bound completed ships by red anchors and sidebar lengths: "
+                    "anchors=%s lengths=%s",
+                    level,
+                    sorted(completed_red_anchor_cells),
+                    list(sidebar_progress.completed_lengths),
+                )
+            else:
+                completed_resolution = resolve_completed_ship_cells(
+                    completed_candidates,
+                    sidebar_progress.completed_lengths,
+                    grid_size=grid_size,
+                )
             completed_visual_hits = set(completed_resolution.cells)
-            if completed_anchor_candidates:
+            if completed_red_anchor_cells:
                 red_marker_completed_cells = {
                     cell
                     for placement in completed_resolution.placements
-                    if set(placement) & set(completed_anchor_candidates)
+                    if set(placement) & set(completed_red_anchor_cells)
                     for cell in placement
                 }
             authoritative_completed_placements = tuple(
@@ -3740,6 +4140,7 @@ def _scan_level_by_strategy(
                 )
                 use_scout_batch = bool(
                     ONLINE_SCOUT_BATCH_ENABLED
+                    and grid_size <= ONLINE_SCOUT_BATCH_MAX_GRID_SIZE
                     and len(pending_scout_cells) > 1
                     and len(set(batch_points)) == len(batch_points)
                     and len(pending_scout_cells) <= batch_capacity
@@ -3984,6 +4385,7 @@ def _run_red_scout_and_blue_strategy(
     attempts_completed = 0
     valid_attempts = 0
     complete_six_attempts = 0
+    red_victory_detected = False
     online_sidebar_completed_lengths: tuple[int, ...] = ()
     online_completed_visual_hits = set(
         scan_kwargs.get("initial_completed_visual_hits") or set()
@@ -4159,8 +4561,15 @@ def _run_red_scout_and_blue_strategy(
         enforce_completed_ship_safety_area()
         if not locked_completed_ship_cells:
             return
+        # A raised flag is an explicit, local exception to the normal
+        # completed-ship lock.  Once an upper cell has been classified as the
+        # false part of a 2x2 L, it must stay out of every restoration pass;
+        # otherwise this function immediately puts the L back after the
+        # normalizer removed it.
         confirmed_locked_cells = (
-            locked_completed_ship_cells - pending_completed_ship_cells
+            locked_completed_ship_cells
+            - pending_completed_ship_cells
+            - discarded_flag_cells
         )
         for hit_set in (
             initial_real_hits,
@@ -4172,8 +4581,7 @@ def _run_red_scout_and_blue_strategy(
         ):
             hit_set.update(confirmed_locked_cells)
         for miss_set in (initial_misses, committed_misses, scout_misses):
-            miss_set.difference_update(locked_completed_ship_cells)
-        discarded_flag_cells.difference_update(locked_completed_ship_cells)
+            miss_set.difference_update(confirmed_locked_cells)
         visual_only_completed_cells.difference_update(confirmed_locked_cells)
         visual_only_completed_cells.update(pending_completed_ship_cells)
         scout_hits.update(pending_completed_ship_cells)
@@ -4194,10 +4602,7 @@ def _run_red_scout_and_blue_strategy(
         kept = [
             placement
             for placement in authoritative_completed_placements
-            if (
-                set(placement.cells) <= locked_completed_ship_cells
-                or not (set(placement.cells) & discarded_flag_cells)
-            )
+            if not (set(placement.cells) & discarded_flag_cells)
         ]
         if len(kept) != len(authoritative_completed_placements):
             logger.warning(
@@ -4384,7 +4789,27 @@ def _run_red_scout_and_blue_strategy(
                 upper_is_initial_hit = upper in initial_real_hits
                 upper_is_scout_hit = upper in scout_hits
                 lower_cells = set(block_tuple) - {upper}
-                lower_cells_from_current = lower_cells.issubset(current_cells)
+                # A current red result must contribute the supporting lower
+                # cell.  Cells already present in the red-marker snapshot are
+                # historical visual evidence and must not trigger a new L
+                # correction on their own.
+                lower_cells_from_current = bool(
+                    lower_cells & (current_cells - red_marker_completed_cells)
+                )
+                # A red submarine decoration is attached to the surfaced hull
+                # but can project into the neighbouring diamond.  Its resolved
+                # cell is not enough evidence for the raised-flag L heuristic
+                # to delete that cell on its own.  The L rule has priority when
+                # the current red result contributes one of the lower cells.
+                if (
+                    upper in red_marker_completed_cells
+                    and not (
+                        upper_is_initial_hit
+                        or upper_is_scout_hit
+                        or lower_cells_from_current
+                    )
+                ):
+                    continue
                 if (
                     upper not in current_cells
                     and upper not in current_snapshot
@@ -4436,6 +4861,7 @@ def _run_red_scout_and_blue_strategy(
                         upper in placement.cells
                         for placement in authoritative_completed_placements
                     )
+                    and not lower_cells_from_current
                 ):
                     continue
                 if upper not in current_cells and not (
@@ -4527,6 +4953,13 @@ def _run_red_scout_and_blue_strategy(
         """
         if not candidate_cells or not completed_lengths:
             return
+        # Once a cell has been identified as the raised flag in a supported
+        # 2x2 L, no later visual-completion pass may use it to reconstruct the
+        # discarded placement.  The candidate set can contain stale visual
+        # cells from the same animation, so filter it at this boundary too.
+        candidate_cells = set(candidate_cells) - discarded_flag_cells
+        if not candidate_cells:
+            return
         limits = Counter(
             int(length)
             for length in completed_lengths
@@ -4564,6 +4997,8 @@ def _run_red_scout_and_blue_strategy(
         for cells in resolution.placements:
             normalized_cells = tuple(cells)
             if normalized_cells in existing_keys:
+                continue
+            if set(normalized_cells) & discarded_flag_cells:
                 continue
             length = len(normalized_cells)
             if existing_counts[length] >= limits.get(length, 0):
@@ -4884,6 +5319,7 @@ def _run_red_scout_and_blue_strategy(
                 attempts_completed,
                 settings.count,
             )
+            red_victory_detected = True
             break
         # A result can be unsuitable for learning a reusable footprint while still
         # containing reliable per-cell hit/miss evidence. Keep that evidence on the
@@ -5064,7 +5500,16 @@ def _run_red_scout_and_blue_strategy(
                         click_points,
                         grid_size=grid_size,
                         anchor=cell,
-                        preferred_cells=online_completed_visual_hits,
+                        # Do not use previously inferred completed-ship cells
+                        # to choose the new ship orientation.  Those cells can
+                        # come from a transient visual snapshot and may make
+                        # a horizontal candidate win over the actual red/blue
+                        # hit line (for example, promoting (1, 3) in level 12).
+                        preferred_cells=(
+                            set(committed_hits)
+                            | set(scout_hits)
+                            | {cell}
+                        ),
                     )
                 )
                 # Apply the mandatory red-scout L cleanup before recording
@@ -5171,10 +5616,38 @@ def _run_red_scout_and_blue_strategy(
                 visual_only_completed_cells.discard(cell)
             elif probe_result is ProbeResult.MISS:
                 if pending_completed_confirmation:
-                    raise ProbeProtocolError(
-                        "red-marker-completed submarine cell remained unopened "
-                        f"after verified blue retries: {cell}"
-                    )
+                    # The red completion geometry was only a hypothesis until
+                    # this isolated blue shot.  A miss disproves the pending
+                    # cell; remove the containing provisional placement and
+                    # release its lock so the restoration pass cannot put the
+                    # false cell back into hit_map.  Other cells already
+                    # confirmed by earlier shots remain ordinary hits.
+                    rejected_placements = [
+                        placement
+                        for placement in authoritative_completed_placements
+                        if cell in placement.cells
+                    ]
+                    authoritative_completed_placements[:] = [
+                        placement
+                        for placement in authoritative_completed_placements
+                        if cell not in placement.cells
+                    ]
+                    rejected_cells = {
+                        rejected_cell
+                        for placement in rejected_placements
+                        for rejected_cell in placement.cells
+                    }
+                    locked_completed_ship_cells.difference_update(rejected_cells)
+                    pending_completed_ship_cells.difference_update(rejected_cells)
+                    for hit_set in (
+                        initial_completed_visual_hits,
+                        online_completed_visual_hits,
+                        authoritative_completed_visual_hits,
+                        red_marker_completed_cells,
+                    ):
+                        hit_set.difference_update(rejected_cells)
+                    visual_only_completed_cells.difference_update(rejected_cells)
+                    refresh_completed_ship_safety_area()
                 committed_misses.add(cell)
                 committed_hits.discard(cell)
             else:
@@ -5215,14 +5688,25 @@ def _run_red_scout_and_blue_strategy(
             | authoritative_completed_visual_hits
             | (scout_hits - set(new_scout_hits))
         )
+        # A red-completed placement contains cells that must be verified by
+        # an independent blue request.  Do not put those pending cells into a
+        # shared batch: frames captured after a neighboring target can carry
+        # that target's animation and be incorrectly attributed to the
+        # pending cell (especially at board edges).  They are handled below
+        # through the single-target verified path instead.
+        batch_targets_cells = [
+            cell for cell in new_scout_hits
+            if cell not in pending_completed_ship_cells
+        ]
         batch_enabled_for_result = bool(
             ONLINE_SCOUT_BATCH_ENABLED
-            and len(new_scout_hits) > 1
-            and len({click_points[cell[0] * grid_size + cell[1]] for cell in new_scout_hits})
-            == len(new_scout_hits)
-            and len({cell[0] * grid_size + cell[1] for cell in new_scout_hits})
-            == len(new_scout_hits)
-            and len(new_scout_hits)
+            and grid_size <= ONLINE_SCOUT_BATCH_MAX_GRID_SIZE
+            and len(batch_targets_cells) > 1
+            and len({click_points[cell[0] * grid_size + cell[1]] for cell in batch_targets_cells})
+            == len(batch_targets_cells)
+            and len({cell[0] * grid_size + cell[1] for cell in batch_targets_cells})
+            == len(batch_targets_cells)
+            and len(batch_targets_cells)
             <= max(
                 0,
                 sum(int(length) for length in submarines)
@@ -5233,7 +5717,7 @@ def _run_red_scout_and_blue_strategy(
         if batch_enabled_for_result:
             batch_targets = [
                 (cell, click_points[cell[0] * grid_size + cell[1]], cell[0] * grid_size + cell[1])
-                for cell in new_scout_hits
+                for cell in batch_targets_cells
             ]
             batch_outcome = _execute_online_scout_hit_batch(
                 level=level,
@@ -5281,7 +5765,7 @@ def _run_red_scout_and_blue_strategy(
                 board_size=grid_size,
                 board_states=current_board_states(),
             )
-            if batch_outcome is not None:
+            if batch_outcome is not None and cell in batch_outcome.results:
                 probe_metadata.update(batch_outcome.metadata.get(cell, {}))
                 probe_result = batch_outcome.results.get(cell, ProbeResult.UNKNOWN)
                 blue_bomb_ready = bool(
@@ -5301,9 +5785,21 @@ def _run_red_scout_and_blue_strategy(
                     submarines=submarines,
                     probe_metadata=probe_metadata,
                     activity_ready=True,
-                    blue_bomb_ready=blue_bomb_ready,
+                    # A pending red-completed cell must also reselect the
+                    # projectile.  Passing a previously verified batch
+                    # selection would make the helper choose its shortened
+                    # frame schedule despite the isolated-cell requirement.
+                    blue_bomb_ready=(
+                        False
+                        if cell in pending_completed_ship_cells
+                        else blue_bomb_ready
+                    ),
                     network_ready=online_network_ready,
-                    fast_batch=True,
+                    # Pending cells from a red-completed placement must use
+                    # the isolated path even when other targets were batched.
+                    # This prevents shared animation frames from being
+                    # attributed to this cell.
+                    fast_batch=(cell not in pending_completed_ship_cells),
                     surface_baseline=surface_baseline,
                 )
                 blue_bomb_ready = bool(probe_metadata.get("blue_bomb_ready", False))
@@ -5316,56 +5812,16 @@ def _run_red_scout_and_blue_strategy(
                 and not _probe_result_is_hit(probe_result)
                 and not _probe_result_completed_level(probe_result)
             ):
-                first_probe_result = probe_result
-                for retry_number in range(
-                    1,
-                    COMPLETED_SHIP_PENDING_BLUE_RETRIES + 1,
-                ):
-                    logger.warning(
-                        "red-marker-completed submarine cell %s is still unopened "
-                        "after blue result=%s; retrying with verified single-target "
-                        "path (%s/%s)",
-                        cell,
-                        probe_result.value,
-                        retry_number,
-                        COMPLETED_SHIP_PENDING_BLUE_RETRIES,
-                    )
-                    retry_metadata: dict[str, object] = {}
-                    probe_result = _execute_online_scout_hit(
-                        level=level,
-                        hit_map=hit_map,
-                        cell=cell,
-                        point=click_points[direct_index],
-                        click_points=click_points,
-                        index=direct_index,
-                        submarines=submarines,
-                        probe_metadata=retry_metadata,
-                        activity_ready=True,
-                        # Re-select and verify the blue projectile.  The fast
-                        # batch state is exactly what may have caused the
-                        # original tap to be ignored.
-                        blue_bomb_ready=False,
-                        network_ready=online_network_ready,
-                        fast_batch=False,
-                        surface_baseline=surface_baseline,
-                    )
-                    retry_metadata["completed_pending_retry"] = retry_number
-                    retry_metadata["first_probe_result"] = first_probe_result.value
-                    probe_metadata = retry_metadata
-                    blue_bomb_ready = bool(
-                        retry_metadata.get("blue_bomb_ready", False)
-                    )
-                    online_network_ready = bool(
-                        retry_metadata.get(
-                            "network_ready",
-                            online_network_ready,
-                        )
-                    )
-                    if (
-                        _probe_result_is_hit(probe_result)
-                        or _probe_result_completed_level(probe_result)
-                    ):
-                        break
+                # The isolated blue click has already been sent and committed.
+                # Do not fire a second projectile just because a red-scout hull
+                # hypothesis was not confirmed: a miss is a valid result, and
+                # retrying can turn one visual error into an extra real attack.
+                logger.warning(
+                    "red-marker-completed submarine cell %s was not confirmed by "
+                    "its isolated blue shot (result=%s); keeping that result without retry",
+                    cell,
+                    probe_result.value,
+                )
 
             try:
                 level_completed = commit_online_scout_result(
@@ -5391,6 +5847,12 @@ def _run_red_scout_and_blue_strategy(
         if new_scout_hits:
             _prune_probe_sample_dirs()
             _prune_screenshot_storage()
+
+    if red_victory_detected:
+        # The red request was discarded, so this is still the current-level
+        # transaction.  Clear any remaining local victory overlay and prove
+        # that the same activity detail page is visible before blue clicks.
+        _clear_red_victory_before_blue_attack(expected_level=level)
 
     write_runtime_status(phase="blue_attack", level=level,
                          red_scout_current=attempts_completed,
@@ -5601,18 +6063,17 @@ def _select_blue_bomb_for_online_scout(
     fast: bool,
     check_ammo: bool = True,
 ) -> np.ndarray:
+    """Return the current board frame; blue projectile is the game default.
+
+    The blue-only game mode starts with the blue projectile selected, so an
+    extra tap on ``BLUE_BOMB_POINT`` before every online target is redundant
+    and can become a real board tap during a victory transition.  Keep this
+    helper as a compatibility boundary for callers, but do not click or wait
+    here; callers still perform their independent zero-ammo guard.
+    """
     if check_ammo:
         _raise_if_blue_ammo_depleted(selection_screen)
-    adb.click(*BLUE_BOMB_POINT)
-    settle_seconds = (
-        ONLINE_SCOUT_BLUE_SELECT_FAST_SETTLE_SECONDS
-        if fast
-        else ONLINE_SCOUT_BLUE_SELECT_SETTLE_SECONDS
-    )
-    # The post-click frame is still needed as the before-image for hit
-    # comparison, but projectile selection is trusted after the click. Do not
-    # spend another screenshot/template pass checking the red button state.
-    return adb.delay(settle_seconds).read_screenshot(sample_dir / "before.png")
+    return selection_screen
 
 
 def _execute_online_scout_hit_batch(
@@ -5653,6 +6114,7 @@ def _execute_online_scout_hit_batch(
     if not targets:
         return OnlineScoutBatchResult(results={}, metadata={})
     grid_size = get_level_grid_size(level)
+    _assert_blue_board_tap_allowed(level, "online_scout_hit_batch")
     if _active_probe is not None:
         raise ProbeProtocolError(
             "cannot start online scout-hit batch while another probe is active"
@@ -5748,7 +6210,15 @@ def _execute_online_scout_hit_batch(
             "online scout-hit batch found a connection dialog before taps; refusing to click"
         )
 
-    if handle_victory_prompt(timeout=0.0, screenshot=initial_screen):
+    # ``handle_victory_prompt`` intentionally returns False when its duplicate
+    # click guard is active.  That False must not be interpreted as "the board
+    # is ready": the banner is still on screen and any following coordinate
+    # could be dispatched to the next level.  Inspect the raw frame separately
+    # and stop the batch whenever a victory is visible, regardless of whether
+    # the prompt was already handled by another recovery path.
+    handled_victory = handle_victory_prompt(timeout=0.0, screenshot=initial_screen)
+    if handled_victory or _victory_prompt_guard_matches(initial_screen):
+        _latch_blue_victory(level, "online_scout_hit_batch_initial")
         return mark_level_complete([item[0] for item in normalized_targets], "initial_victory")
 
     initial_sidebar_progress = detect_sidebar_progress(initial_screen, submarines)
@@ -5792,10 +6262,10 @@ def _execute_online_scout_hit_batch(
             index=index,
             point=list(point),
         )
-        polygon = grid_cell_polygon(
-            list(click_points or ()),
-            index,
-            grid_size,
+        polygon = (
+            grid_cell_polygon(list(click_points), index, grid_size)
+            if click_points is not None
+            else None
         )
         relative_position = (
             cell[0] / max(1, grid_size - 1),
@@ -5885,15 +6355,34 @@ def _execute_online_scout_hit_batch(
         return result
 
     clicked_cells: list[Cell] = []
-    for position, (cell, point, _index) in enumerate(to_click):
+    tap_frame_paths: dict[Cell, dict[str, str]] = {}
+    last_tap_after_screen: np.ndarray | None = None
+    current_board_screen = selection_screen
+    victory_detected = False
+    victory_screenshot: np.ndarray | None = None
+    connection_overlay_detected = False
+    activity_page_lost_detected = False
+    for position, (cell, point, target_index) in enumerate(to_click):
+        _assert_blue_board_tap_allowed(level, "online_scout_hit_batch")
         logger.info(
-            "online scout-hit batch tap %s/%s: cell=%s point=%s",
+            "board tap dispatch: source=online_scout_hit_batch tap=%s/%s "
+            "level=%s cell=%s index=%s point=%s",
             position + 1,
             len(to_click),
+            level,
             cell,
+            target_index,
             point,
         )
         clicked_cells.append(cell)
+        tap_frame_paths.setdefault(cell, {})
+        tap_before_path = _save_batch_tap_image(
+            sample_dirs.get(cell),
+            "before_tap.png",
+            current_board_screen,
+        )
+        if tap_before_path is not None:
+            tap_frame_paths[cell]["before"] = tap_before_path
         # Record the cell before issuing the input command.  ADB can raise
         # after dispatching a touch, so the conservative state must survive
         # both command failures and later screenshot failures.
@@ -5905,14 +6394,142 @@ def _execute_online_scout_hit_batch(
                 f"online scout-hit batch click failed after {len(clicked_cells)} taps; "
                 "the committed cells will not be retried"
             ) from exc
-        if position + 1 < len(to_click):
+        try:
+            # Every tap gets an immediate post-tap frame.  This is both the
+            # guard for the next coordinate and the final post-batch frame for
+            # the last coordinate, so no extra screenshot is needed later.
             try:
-                adb.delay(ONLINE_SCOUT_BATCH_CLICK_INTERVAL_SECONDS)
+                delayed_adb = adb.delay(ONLINE_SCOUT_BATCH_CLICK_INTERVAL_SECONDS)
             except Exception as exc:
                 raise ProbeProtocolError(
                     f"online scout-hit batch click interval failed after "
                     f"{len(clicked_cells)} taps; the committed cells will not be retried"
                 ) from exc
+            tap_after_screen = delayed_adb.read_screenshot()
+            if not isinstance(tap_after_screen, np.ndarray):
+                raise ProbeProtocolError(
+                    "online scout-hit batch returned an invalid post-tap screenshot"
+                )
+            last_tap_after_screen = tap_after_screen
+            tap_after_path = _save_batch_tap_image(
+                sample_dirs.get(cell),
+                "after_tap.png",
+                tap_after_screen,
+            )
+            if tap_after_path is not None:
+                tap_frame_paths[cell]["after"] = tap_after_path
+            logger.info(
+                "batch tap confirmed: level=%s cell=%s index=%s changed=%s before=%s after=%s",
+                level,
+                cell,
+                target_index,
+                _batch_screen_changed(current_board_screen, tap_after_screen),
+                tap_frame_paths[cell].get("before", "--"),
+                tap_frame_paths[cell].get("after", "--"),
+            )
+            if _victory_banner_visible(tap_after_screen):
+                victory_detected = True
+                victory_screenshot = tap_after_screen
+                _latch_blue_victory(level, "online_scout_hit_batch_after_tap")
+                result.stopped_reason = "victory_banner_after_tap"
+                logger.info(
+                    "victory banner detected after batch tap; stopping after "
+                    "%s/%s taps (last cell=%s)",
+                    len(clicked_cells),
+                    len(to_click),
+                    cell,
+                )
+                break
+            if find_connection_interrupted_dialog(tap_after_screen) is not None:
+                connection_overlay_detected = True
+                result.stopped_reason = "connection_overlay_after_tap"
+                logger.warning(
+                    "connection dialog detected after batch tap; stopping after "
+                    "%s/%s taps (last cell=%s)",
+                    len(clicked_cells),
+                    len(to_click),
+                    cell,
+                )
+                break
+            if _batch_level_title_mismatch(tap_after_screen, level):
+                activity_page_lost_detected = True
+                result.stopped_reason = "level_changed_after_tap"
+                logger.warning(
+                    "different level detected after batch tap; stopping after %s/%s taps",
+                    len(clicked_cells),
+                    len(to_click),
+                )
+                break
+            activity_detail_visible = find_template(
+                tap_after_screen,
+                QUIT_ACTIVITY_TEMPLATE,
+            ) is not None
+            if not activity_detail_visible and _batch_screen_changed(
+                current_board_screen,
+                tap_after_screen,
+            ):
+                activity_page_lost_detected = True
+                result.stopped_reason = "activity_detail_lost_after_tap"
+                logger.warning(
+                    "activity detail disappeared after batch tap; stopping after %s/%s taps",
+                    len(clicked_cells),
+                    len(to_click),
+                )
+                break
+            current_board_screen = tap_after_screen
+        except ProbeProtocolError:
+            raise
+        except Exception as exc:
+            raise ProbeProtocolError(
+                f"online scout-hit batch post-tap validation failed after "
+                f"{len(clicked_cells)} taps; the committed cells will not be retried"
+            ) from exc
+    # A normal batch has already validated every post-tap frame.  Keep this
+    # fallback for callers that dispatch no tap frame, while the shared result
+    # capture below continues to check every result frame before committing it.
+    try:
+        # Every dispatched tap already has a post-tap guard.  Reusing that
+        # frame avoids a duplicate template pass that could consume a later
+        # animation/result frame and obscure the actual tap evidence.
+        if last_tap_after_screen is None:
+            post_batch_screen = adb.read_screenshot()
+            if not isinstance(post_batch_screen, np.ndarray):
+                raise ProbeProtocolError(
+                    "online scout-hit batch returned an invalid post-batch screenshot"
+                )
+            if find_victory_banner(post_batch_screen) is not None:
+                victory_detected = True
+                victory_screenshot = post_batch_screen
+                result.stopped_reason = "victory_banner_after_batch"
+                logger.info(
+                    "victory banner detected after complete batch (%s taps)",
+                    len(clicked_cells),
+                )
+            elif find_connection_interrupted_dialog(post_batch_screen) is not None:
+                connection_overlay_detected = True
+                result.stopped_reason = "connection_overlay_after_batch"
+                logger.warning(
+                    "connection dialog detected after complete batch (%s taps)",
+                    len(clicked_cells),
+                )
+            else:
+                activity_detail_visible = find_template(
+                    post_batch_screen,
+                    QUIT_ACTIVITY_TEMPLATE,
+                ) is not None
+                if not activity_detail_visible:
+                    activity_page_lost_detected = True
+                    result.stopped_reason = "activity_detail_lost_after_batch"
+                    logger.warning(
+                        "activity detail was not visible after complete batch (%s taps)",
+                        len(clicked_cells),
+                    )
+    except ProbeProtocolError:
+        raise
+    except Exception as exc:
+        raise ProbeProtocolError(
+            "online scout-hit batch post-batch screen validation failed"
+        ) from exc
     result.clicked_cells = tuple(clicked_cells)
     clicked_target_cells = set(clicked_cells)
     clicked_target_items = [
@@ -5930,9 +6547,6 @@ def _execute_online_scout_hit_batch(
     sidebar_completion_screenshot: np.ndarray | None = None
     sidebar_evidence_cell: Cell | None = None
     sidebar_completed_cells: set[Cell] = set()
-    victory_detected = False
-    victory_screenshot: np.ndarray | None = None
-    connection_overlay_detected = False
     victory_cell = clicked_target_items[-1][0] if clicked_target_items else None
 
     for frame_index, frame_delay in enumerate(ONLINE_SCOUT_BATCH_FRAME_DELAYS, start=1):
@@ -5965,13 +6579,20 @@ def _execute_online_scout_hit_batch(
             logger.error("connection dialog appeared during online scout-hit batch")
             break
 
-        try:
-            victory_hit = find_victory_banner(after_img) is not None
-        except Exception:
-            victory_hit = False
+        if victory_detected:
+            # The post-click guard already captured a victory frame and stopped
+            # the tap loop.  Preserve that signal even if the next animation
+            # frame no longer contains the banner.
+            victory_hit = True
+        else:
+            try:
+                victory_hit = find_victory_banner(after_img) is not None
+            except Exception:
+                victory_hit = False
         victory_detected = victory_detected or victory_hit
         if victory_hit:
             victory_screenshot = after_img
+            _latch_blue_victory(level, "online_scout_hit_batch_result")
 
         clean_frame_captures.append((screenshot_path, capture))
 
@@ -6003,7 +6624,17 @@ def _execute_online_scout_hit_batch(
                 classified.state = "hit"
                 classified.score = max(float(classified.score), 1.0)
                 classified.confidence = max(float(classified.confidence), 1.0)
-            template_hit = apply_wreck_template_confirmation(grid_img, point, classified)
+            cell_polygon = (
+                grid_cell_polygon(click_points, _index, grid_size)
+                if click_points is not None
+                else None
+            )
+            template_hit = apply_wreck_template_confirmation(
+                grid_img,
+                point,
+                classified,
+                cell_polygon=cell_polygon,
+            )
             if not template_hit:
                 classified.evidence_kind = (
                     "dynamic_attack_hit" if classified.state == "hit" else "unknown"
@@ -6087,12 +6718,31 @@ def _execute_online_scout_hit_batch(
                     grid_size,
                 )
                 if completion_candidates:
-                    completion_resolution = resolve_completed_ship_cells(
-                        completion_candidates,
-                        frame_sidebar_progress.completed_lengths,
-                        grid_size=grid_size,
-                        preferred_cells=set(clicked_target_cells),
+                    completion_lengths = frame_sidebar_progress.completed_lengths
+                    completion_anchors = detect_red_submarine_marker_cells(
+                        after_img,
+                        completion_points,
+                        grid_size,
                     )
+                    if (
+                        len(completion_lengths) > 1
+                        and len(completion_anchors) == len(completion_lengths)
+                    ):
+                        completion_resolution = resolve_completed_ship_cells_by_anchors(
+                            completion_candidates,
+                            completion_anchors,
+                            completion_lengths,
+                            grid_size=grid_size,
+                            preferred_cells=set(clicked_target_cells),
+                            fallback_to_global=False,
+                        )
+                    else:
+                        completion_resolution = resolve_completed_ship_cells(
+                            completion_candidates,
+                            completion_lengths,
+                            grid_size=grid_size,
+                            preferred_cells=set(clicked_target_cells),
+                        )
                     sidebar_completed_cells.update(
                         set(completion_resolution.cells) & clicked_target_cells
                     )
@@ -6173,6 +6823,37 @@ def _execute_online_scout_hit_batch(
             connection_overlay_detected
             and len(clean_frame_captures) < MIN_HIT_RESULT_VOTES
         )
+        if activity_page_lost_detected:
+            result.results[cell] = ProbeResult.UNKNOWN
+            result.metadata[cell] = {
+                "batch": True,
+                "online_committed": cell in clicked_cells,
+                "blue_bomb_ready": bool(blue_bomb_ready),
+                "network_ready": True,
+                "hit_votes": 0,
+                "frame_count": len(results_for_cell),
+                "stable_state": "unknown",
+                "decision_reason": "activity_detail_lost_after_batch_tap",
+                "activity_page_lost": True,
+                "captured_frame_count": len(frame_captures),
+                "tap_frames": dict(tap_frame_paths.get(cell, {})),
+                "level_completed": False,
+            }
+            unknown_cells.append(cell)
+            safe_status(
+                sample_dirs[cell],
+                "complete",
+                decision=ProbeResult.UNKNOWN.value,
+                reason="activity_detail_lost_after_batch_tap",
+                batch=True,
+            )
+            append_recent_probe_result(
+                level=level,
+                index=index,
+                result=ProbeResult.UNKNOWN,
+                reason="online_scout_batch_activity_detail_lost",
+            )
+            continue
         if not results_for_cell or insufficient_after_connection_dialog:
             result.results[cell] = ProbeResult.UNKNOWN
             result.metadata[cell] = {
@@ -6191,6 +6872,7 @@ def _execute_online_scout_hit_batch(
                 "connection_overlay_detected": connection_overlay_detected,
                 "clean_frame_count": len(clean_frame_captures),
                 "captured_frame_count": len(frame_captures),
+                "tap_frames": dict(tap_frame_paths.get(cell, {})),
                 "level_completed": False,
             }
             unknown_cells.append(cell)
@@ -6223,15 +6905,43 @@ def _execute_online_scout_hit_batch(
             next(item[1] for item in normalized_targets if item[0] == cell),
         )
         stable_suspect = stable_analysis is not None and stable_hit_is_suspect(stable_analysis)
+        positive_hit_evidence = _probe_has_positive_hit_evidence(records_for_cell)
+        visual_response = _probe_has_visual_response(records_for_cell)
         if victory_detected and cell == victory_cell:
             hit, decision_reason = True, "victory_banner_frame"
         else:
             hit, decision_reason = decide_hit_from_frames(results_for_cell)
+        if _stable_miss_rejects_transient_static_wreck(
+            results_for_cell,
+            stable_analysis,
+            sidebar_completed=bool(sidebar_newly_completed),
+            victory_detected=victory_detected and cell == victory_cell,
+        ):
+            hit = False
+            decision_reason = "stable_miss_rejects_transient_static_wreck"
+            logger.warning(
+                "batch blue result for cell %s had transient static-wreck matches but "
+                "the stable frame is a miss; recording miss",
+                cell,
+            )
+        if not visual_response:
+            hit = False
+            decision_reason = "no_probe_response_evidence"
+        elif hit and not positive_hit_evidence:
+            hit = False
+            decision_reason = "hit_without_positive_evidence"
         hit_votes = sum(1 for item in results_for_cell if item.state == "hit")
-        uncertain = not hit and (
-            hit_votes == 1
-            or any(_is_suspect_hit_frame(item) for item in results_for_cell)
-            or stable_suspect
+        uncertain = (
+            not visual_response
+            or (
+                not hit
+                and (
+                    decision_reason == "hit_without_positive_evidence"
+                    or hit_votes == 1
+                    or any(_is_suspect_hit_frame(item) for item in results_for_cell)
+                    or stable_suspect
+                )
+            )
         )
         sample_dir = sample_dirs[cell]
         if sample_dir is not None:
@@ -6295,6 +7005,7 @@ def _execute_online_scout_hit_batch(
             "connection_overlay_detected": connection_overlay_detected,
             "clean_frame_count": len(clean_frame_captures),
             "captured_frame_count": len(frame_captures),
+            "tap_frames": dict(tap_frame_paths.get(cell, {})),
             "sidebar_newly_completed_lengths": (
                 tuple(sidebar_newly_completed)
                 if cell in sidebar_completed_cells or cell == sidebar_evidence_cell
@@ -6323,6 +7034,31 @@ def _execute_online_scout_hit_batch(
             ),
             "level_completed": False,
         }
+        last_record = records_for_cell[-1] if records_for_cell else {}
+        last_frame_result = last_record.get("result", {})
+        logger.info(
+            "batch result: level=%s cell=%s index=%s decision=%s reason=%s "
+            "votes=%s/%s changed=%s template=%s new_wreck=%s sidebar=%s victory=%s "
+            "tap_before=%s tap_after=%s",
+            level,
+            cell,
+            index,
+            result.results[cell].value,
+            decision_reason,
+            hit_votes,
+            len(results_for_cell),
+            (
+                f"{float(last_frame_result.get('changed_ratio', 0.0)):.3f}"
+                if isinstance(last_frame_result, Mapping)
+                else "--"
+            ),
+            bool(last_record.get("template_hit")),
+            bool(last_record.get("new_wreck_hit")),
+            bool(last_record.get("sidebar_hit")),
+            bool(last_record.get("victory_banner")),
+            tap_frame_paths.get(cell, {}).get("before", "--"),
+            tap_frame_paths.get(cell, {}).get("after", "--"),
+        )
         safe_status(
             sample_dir,
             "complete",
@@ -6365,7 +7101,11 @@ def _execute_online_scout_hit_batch(
             victory_banner=True,
         )
         result.level_completed = True
-        result.stopped_reason = "victory_banner"
+        if result.stopped_reason == "victory_banner_after_tap":
+            # Keep the historical aggregate reason for callers while the
+            # per-tap log and metadata retain the exact stopping frame/cell.
+            result.stopped_reason = "victory_banner_after_batch"
+        result.stopped_reason = result.stopped_reason or "victory_banner"
         if victory_screenshot is not None:
             # Match the single-target online path: consume the victory prompt
             # before the caller starts the base/reconnect transition.
@@ -6511,6 +7251,7 @@ def _execute_online_scout_hit(
         raise ProbeProtocolError(
             f"cannot commit online scout hit while probe {getattr(_active_probe, 'cell', None)} is active"
         )
+    _assert_blue_board_tap_allowed(level, "online_scout_hit")
 
     if network_ready:
         logger.info("reusing connected network state for scout-hit cell %s", cell)
@@ -6527,9 +7268,12 @@ def _execute_online_scout_hit(
     )
 
     initial_screen = adb.read_screenshot()
-    if handle_victory_prompt(timeout=0.0, screenshot=initial_screen):
+    handled_victory = handle_victory_prompt(timeout=0.0, screenshot=initial_screen)
+    if handled_victory or _victory_prompt_guard_matches(initial_screen):
+        _latch_blue_victory(level, "online_scout_hit_initial")
         if probe_metadata is not None:
             probe_metadata["level_completed"] = True
+            probe_metadata["blocked_by_victory_before_tap"] = True
         return ProbeResult.LEVEL_COMPLETE
     initial_sidebar_progress = detect_sidebar_progress(initial_screen, submarines)
     if _sidebar_confirms_all_submarines(initial_sidebar_progress, submarines):
@@ -6678,6 +7422,13 @@ def _execute_online_scout_hit(
         index,
     )
     _raise_if_blue_ammo_depleted(before_img)
+    logger.info(
+        "board tap dispatch: source=online_scout_hit level=%s cell=%s index=%s point=%s",
+        level,
+        cell,
+        index,
+        point,
+    )
     adb.click(*point)
 
     hit_results = []
@@ -6709,12 +7460,18 @@ def _execute_online_scout_hit(
             raise
         victory_hit = find_victory_banner(after_img) is not None
         if victory_hit:
+            _latch_blue_victory(level, "online_scout_hit_result")
             victory_screenshot = after_img
             result.state = "hit"
             result.score = max(float(result.score), 1.0)
             result.confidence = max(float(result.confidence), 1.0)
 
-        template_hit = apply_wreck_template_confirmation(aligned_after, point, result)
+        template_hit = apply_wreck_template_confirmation(
+            aligned_after,
+            point,
+            result,
+            cell_polygon=cell_polygon,
+        )
         if not template_hit:
             result.evidence_kind = "dynamic_attack_hit" if result.state == "hit" else "unknown"
         sidebar_hit = False
@@ -6854,6 +7611,19 @@ def _execute_online_scout_hit(
         hit, decision_reason = True, "victory_banner_frame"
     else:
         hit, decision_reason = decide_hit_from_frames(hit_results)
+    if _stable_miss_rejects_transient_static_wreck(
+        hit_results,
+        stable_analysis,
+        sidebar_completed=bool(sidebar_newly_completed),
+        victory_detected=victory_screenshot is not None,
+    ):
+        hit = False
+        decision_reason = "stable_miss_rejects_transient_static_wreck"
+        logger.warning(
+            "online scout-hit cell %s had transient static-wreck matches but "
+            "the stable frame is a miss; recording miss",
+            cell,
+        )
     uncertain = not hit and (
         hit_votes == 1
         or any(_is_suspect_hit_frame(result) for result in hit_results)
@@ -6913,6 +7683,8 @@ def _execute_online_scout_hit(
             latest_sidebar_progress,
             submarines,
         )
+        if level_completed:
+            _latch_blue_victory(level, "online_scout_hit_completion")
         if victory_screenshot is not None:
             handle_victory_prompt(timeout=0.0, screenshot=victory_screenshot)
         elif level_completed:
@@ -7064,11 +7836,13 @@ def _execute_probe_transaction(
     if probe_metadata is not None:
         probe_metadata.clear()
 
+
     if _active_probe is not None:
         raise ProbeProtocolError(
             f"上一轮探测尚未结束，禁止开始格子 {cell}: "
             f"cell={_active_probe.cell} phase={_active_probe.phase.name}"
         )
+    _assert_blue_board_tap_allowed(level, "probe_cell")
 
     if wait_until_occur(QUIT_ACTIVITY_TEMPLATE, timeout=6) is None:
         raise ProbeNotReadyError("当前不在活动详情界面")
@@ -7104,6 +7878,24 @@ def _execute_probe_transaction(
         before_wreck_visible = visible_wreck_static_detected(before_img, (x, y))
         _write_probe_status(sample_dir, "before_captured", phase=transaction.phase.name)
 
+        # The victory duplicate-click guard may have already consumed the
+        # continue tap while this old-level probe was being prepared.  A raw
+        # banner check is required here because the guard deliberately returns
+        # False for the same transition; never issue a board tap while the
+        # victory page is still visible.
+        if _victory_banner_visible(before_img):
+            logger.warning(
+                "board tap blocked: source=probe_cell level=%s cell=%s index=%s "
+                "victory banner visible before dispatch",
+                level,
+                cell,
+                index,
+            )
+            if probe_metadata is not None:
+                probe_metadata["blocked_by_victory_before_tap"] = True
+                probe_metadata["level_completed"] = True
+            return ProbeResult.LEVEL_COMPLETE
+
         # 点击命令一旦发出，就保守地认为客户端可能已经暂存验证请求。
         transaction.advance(ProbePhase.REQUEST_PENDING)
         _write_probe_status(sample_dir, "request_pending", phase=transaction.phase.name)
@@ -7114,6 +7906,13 @@ def _execute_probe_transaction(
             index=index,
             phase=transaction.phase.name,
         )
+        logger.info(
+            "board tap dispatch: source=probe_cell level=%s cell=%s index=%s point=%s",
+            level,
+            cell,
+            index,
+            point,
+        )
         adb.click(x, y)
         _exit_activity_after_probe_click(
             RUN_DEBUG_DIR / "debug_quit1.png",
@@ -7121,6 +7920,7 @@ def _execute_probe_transaction(
         )
         _write_probe_status(sample_dir, "activity_exited", phase=transaction.phase.name)
         if _reenter_activity_for_probe_result():
+            _latch_blue_victory(level, "probe_cell_reentry")
             transaction.advance(ProbePhase.RESULT_VISIBLE)
             update_pending_probe(phase=transaction.phase.name)
             _write_probe_status(
@@ -7306,18 +8106,19 @@ def _execute_probe_transaction(
                 except Exception:
                     aligned_after = after_img
                 result = classify_diamond_hit(before_img, aligned_after, (x, y))
-                victory_hit = find_victory_banner(after_img) is not None
-                if victory_hit:
-                    if not victory_frame_detected:
-                        logger.info(
-                            "victory banner appeared while capturing blue probe cell %s; "
-                            "treating the pending probe as the final hit",
-                            cell,
-                        )
-                    victory_frame_detected = True
-                    result.state = "hit"
-                    result.score = max(float(result.score), 1.0)
-                    result.confidence = max(float(result.confidence), 1.0)
+            victory_hit = find_victory_banner(after_img) is not None
+            if victory_hit:
+                if not victory_frame_detected:
+                    logger.info(
+                        "victory banner appeared while capturing blue probe cell %s; "
+                        "treating the pending probe as the final hit",
+                        cell,
+                    )
+                victory_frame_detected = True
+                _latch_blue_victory(level, "probe_cell_result")
+                result.state = "hit"
+                result.score = max(float(result.score), 1.0)
+                result.confidence = max(float(result.confidence), 1.0)
                 template_hit = apply_wreck_template_confirmation(aligned_after, (x, y), result)
                 if not template_hit:
                     result.evidence_kind = "dynamic_attack_hit" if result.state == "hit" else "unknown"
@@ -7396,12 +8197,34 @@ def _execute_probe_transaction(
             stable_analysis is not None and stable_hit_is_suspect(stable_analysis)
         )
         first_result = hit_results[0]
+        positive_hit_evidence = _probe_has_positive_hit_evidence(frame_records)
+        visual_response = _probe_has_visual_response(frame_records)
         if victory_frame_detected:
             hit, decision_reason = True, "victory_banner_frame"
         else:
             hit, decision_reason = decide_hit_from_frames(hit_results)
+        if not visual_response:
+            hit = False
+            decision_reason = "no_probe_response_evidence"
+            logger.warning(
+                "blue probe cell=%s index=%s produced no visual/sidebar/victory response; "
+                "discarding as UNKNOWN",
+                cell,
+                index,
+            )
+        elif hit and not positive_hit_evidence:
+            hit = False
+            decision_reason = "hit_without_positive_evidence"
+            logger.warning(
+                "blue probe cell=%s index=%s looked like a hit but had no new wreck, "
+                "sidebar completion, or victory evidence; discarding as UNKNOWN",
+                cell,
+                index,
+            )
         result_unknown = not hit and (
-            suspect_extra_checked
+            not visual_response
+            or (decision_reason == "hit_without_positive_evidence")
+            or suspect_extra_checked
             or hit_votes == 1
             or any(_is_near_hit_frame(result) for result in hit_results)
             or stable_suspect
@@ -7597,6 +8420,8 @@ def _commit_hit_request_and_prepare_next_probe(
     logger.info("hit detected; restoring network immediately to submit the pending request")
     transaction.advance(ProbePhase.LOGIN_RECOVERING)
     level_complete = restart_process(victory_wait_timeout=victory_wait_timeout) is True
+    if level_complete:
+        _latch_blue_victory(transaction.level, "commit_recovery")
     transaction.advance(ProbePhase.COMPLETE)
     return level_complete
 
@@ -7682,8 +8507,22 @@ def restart_process(
 
     disable_weak_network()
     level_complete = handle_victory_prompt(timeout=victory_wait_timeout)
+    if level_complete:
+        # A committed final blue hit must leave the old activity instance
+        # completely before the next level is detected.  Re-entering the
+        # activity directly can keep the completed board underneath the
+        # transition, allowing the next coordinate to be consumed by the old
+        # page.  Force the same DROP+REJECT -> retry -> base -> activity path
+        # used by the original victory recovery flow.
+        logger.info(
+            "victory handled after committed blue hit; reconnecting through base "
+            "before detecting the next level"
+        )
+        _reconnect_to_base_and_reenter_activity_after_victory()
+        return True
+
     recovered_level_complete = enter_activity() is True
-    return level_complete or recovered_level_complete
+    return recovered_level_complete
 
 
 def find_victory_banner(
@@ -7717,6 +8556,18 @@ def find_victory_banner(
         scales=VICTORY_TEMPLATE_SCALES,
         threshold=VICTORY_BANNER_THRESHOLD,
     )
+    if victory is None:
+        # ``win.png`` is the compact top-of-screen victory ornament. It can be
+        # present while the larger banner is still animating, so search the
+        # full frame instead of the banner ROI which starts below the ornament.
+        victory = find_template_multi_scale(
+            screenshot,
+            WIN_TEMPLATE,
+            scales=VICTORY_TEMPLATE_SCALES,
+            threshold=VICTORY_BANNER_THRESHOLD,
+        )
+        if victory is not None:
+            return victory
     if victory is None or (offset_x == 0 and offset_y == 0):
         return victory
 
@@ -7730,6 +8581,60 @@ def find_victory_banner(
         center=(victory.center[0] + offset_x, victory.center[1] + offset_y),
         score=victory.score,
     )
+
+
+def _victory_banner_visible(screenshot: np.ndarray | None) -> bool:
+    """Return whether a victory banner is visible without consuming the prompt.
+
+    ``handle_victory_prompt`` has a duplicate-transition guard and may therefore
+    return ``False`` even while the same banner remains on screen.  Board-tap
+    callers need the raw visibility signal so that a suppressed duplicate tap
+    cannot be mistaken for permission to continue firing.
+    """
+    try:
+        return find_victory_banner(screenshot) is not None
+    except Exception as exc:
+        logger.warning("victory banner pre-tap detection failed; blocking board tap: %s", exc)
+        return True
+
+
+def _victory_prompt_guard_matches(screenshot: np.ndarray | None) -> bool:
+    """Tell board callers that the duplicate-victory guard is still active.
+
+    The normal prompt handler returns ``False`` for a repeated frame by design.
+    That result is useful to the caller only when paired with this state check;
+    otherwise an old-level board operation can continue while the banner is
+    still covering the screen.
+    """
+    global _victory_last_fingerprint, _victory_last_screenshot_id, _victory_last_click_at
+    if _victory_last_click_at is None:
+        return False
+    elapsed = max(0.0, monotonic() - _victory_last_click_at)
+    if elapsed >= VICTORY_REPEAT_GUARD_SECONDS:
+        return False
+    try:
+        victory = find_victory_banner(screenshot)
+    except Exception as exc:
+        logger.warning("duplicate-victory guard detection failed; blocking board tap: %s", exc)
+        return True
+    if victory is None:
+        return False
+
+    fingerprint = _victory_frame_fingerprint(screenshot, victory)
+    same_screenshot = (
+        screenshot is not None
+        and _victory_last_screenshot_id is not None
+        and id(screenshot) == _victory_last_screenshot_id
+    )
+    same_transition = fingerprint == _victory_last_fingerprint
+    if same_screenshot or same_transition:
+        logger.warning(
+            "duplicate-victory guard is active; blocking board tap while banner remains visible "
+            "(elapsed=%.2fs)",
+            elapsed,
+        )
+        return True
+    return False
 
 
 def _victory_frame_fingerprint(
@@ -7817,17 +8722,19 @@ def handle_victory_prompt(
         and _victory_last_screenshot_id is not None
         and id(screenshot) == _victory_last_screenshot_id
     )
-    if (
-        same_screenshot
-        or (elapsed is not None and elapsed < VICTORY_REPEAT_GUARD_SECONDS)
-    ):
+    # A guard hit means this is the same observed transition, not a successful
+    # handling of a new victory page.  Returning False keeps callers from
+    # advancing to the next level based solely on a stale frame.
+    same_transition = fingerprint == _victory_last_fingerprint
+    guard_active = elapsed is not None and elapsed < VICTORY_REPEAT_GUARD_SECONDS
+    if guard_active and (same_screenshot or same_transition):
         logger.info(
             "victory banner already handled; suppressing duplicate continue tap "
             "(elapsed=%s fingerprint_same=%s)",
             "unknown" if elapsed is None else f"{elapsed:.2f}s",
-            fingerprint == _victory_last_fingerprint,
+            same_transition,
         )
-        return True
+        return False
 
     if restore_network:
         if _has_pending_probe_request():
@@ -7842,11 +8749,169 @@ def handle_victory_prompt(
     _victory_last_screenshot_id = id(screenshot) if screenshot is not None else None
     _victory_last_click_at = now
     adb.delay(VICTORY_SKIP_SETTLE_SECONDS)
-    if _confirm_victory_banner_cleared():
+    cleared = _confirm_victory_banner_cleared()
+    if cleared:
         logger.info("victory banner disappeared after continue tap")
     else:
-        logger.info("victory banner clear was not confirmed; keeping duplicate-tap guard")
-    return True
+        logger.warning(
+            "victory banner clear was not confirmed; refusing to report victory handled"
+        )
+    return cleared
+
+
+def _clear_red_victory_before_blue_attack(expected_level: int | None = None) -> None:
+    """Recover the authoritative current board before dispatching blue taps.
+
+    The discarded red request can leave a local-only victory overlay behind.
+    Never press that overlay: doing so can expose the next board locally. Use
+    the connection dialog to reload server state, then accept the page only
+    after a clean activity-detail frame is confirmed.
+    """
+    screenshot = adb.read_screenshot()
+    if not isinstance(screenshot, np.ndarray):
+        raise ProbeProtocolError(
+            "红色胜利切换到蓝色前无法读取有效截图；禁止发送蓝色点击"
+        )
+    try:
+        victory = find_victory_banner(screenshot)
+    except Exception as exc:
+        raise ProbeProtocolError(
+            "红色胜利切换到蓝色前胜利页识别失败；禁止发送蓝色点击"
+        ) from exc
+    if _has_pending_probe_request():
+        raise ProbeProtocolError(
+            "红色胜利页仍在且探测请求尚未确认丢弃；禁止进入蓝色攻击"
+        )
+    def verify_expected_level(frame: np.ndarray) -> None:
+        if expected_level is None:
+            return
+        try:
+            detected_level = resolve_current_level(
+                frame,
+                fallback_level=int(expected_level),
+                fallback_is_manual=False,
+            )
+        except Exception as exc:
+            reason = (
+                f"红色胜利切换到蓝色前无法确认当前关卡 {expected_level}；"
+                "保持断网并停止蓝色攻击"
+            )
+            enable_weak_network()
+            adb.enable_reject_network(GAME_PACKAGE_NAME)
+            latch_network_fail_closed(reason)
+            raise ProbeProtocolError(reason) from exc
+        if int(detected_level) != int(expected_level):
+            reason = (
+                f"红色胜利切换后检测到关卡 {detected_level}，"
+                f"预期仍为关卡 {expected_level}；保持断网并停止蓝色攻击"
+            )
+            enable_weak_network()
+            adb.enable_reject_network(GAME_PACKAGE_NAME)
+            latch_network_fail_closed(reason)
+            raise ProbeProtocolError(reason)
+        logger.info(
+            "red-scout victory gate confirmed expected current level=%s",
+            expected_level,
+        )
+
+    if victory is None:
+        # The overlay may have disappeared during the reconnect settle window.
+        # That is not proof that the current-level board is ready: it could be
+        # the base screen or the next level.  Require both a clean frame and
+        # the activity-detail close control before allowing a blue tap.
+        if find_connection_interrupted_dialog(screenshot) is not None:
+            raise ProbeProtocolError(
+                "红色胜利切换到蓝色前仍有连接中断弹窗；禁止发送蓝色点击"
+            )
+        if find_template(screenshot, QUIT_ACTIVITY_TEMPLATE) is None:
+            raise ProbeProtocolError(
+                "红色胜利切换到蓝色前未确认当前活动详情页；禁止发送蓝色点击"
+            )
+        verify_expected_level(screenshot)
+        return
+    if _victory_prompt_guard_matches(screenshot):
+        raise ProbeProtocolError(
+            "胜利页重复点击保护仍生效且页面未清除；禁止进入蓝色攻击"
+        )
+
+    logger.warning(
+        "red-scout victory banner remains before blue attack; reloading the "
+        "server-authoritative current board without tapping the victory page"
+    )
+    enable_weak_network(PROBE_DROP_SETTLE_SECONDS)
+    _verify_network_isolated_or_fail_closed(red_scout=False)
+    adb.enable_reject_network(GAME_PACKAGE_NAME)
+    write_runtime_status(network="DROP+REJECT 断网中", phase="red_victory_recovery")
+
+    dialog = wait_until_connection_interrupted_dialog(
+        timeout=MISS_CONNECTION_DIALOG_WAIT_SECONDS,
+    )
+    if dialog is None:
+        reason = "红色胜利页恢复未检测到连接中断弹窗；保持断网并停止蓝色攻击"
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+    retry = wait_until_retry_button(timeout=MISS_RETRY_BUTTON_WAIT_SECONDS)
+    if retry is None:
+        reason = "红色胜利页恢复未检测到重试按钮；保持断网并停止蓝色攻击"
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+
+    disable_weak_network()
+    adb.disable_reject_network(GAME_PACKAGE_NAME)
+    logger.info(
+        "red-scout victory recovery: clicking retry center=%s without tapping victory",
+        retry.center,
+    )
+    adb.click(*retry.center)
+    try:
+        recovered_complete = enter_activity(
+            re_enter=True,
+            max_retries=1,
+            prepare_activity_list=True,
+            activity_button_timeout=POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
+        )
+    except Exception as exc:
+        reason = "红色胜利页重连后未能确认活动详情页；保持断网并停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason) from exc
+    if recovered_complete:
+        reason = "红色胜利页重连后仍检测到胜利状态；停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+
+    fresh_screen = adb.read_screenshot()
+    if not isinstance(fresh_screen, np.ndarray):
+        reason = "红色胜利页清除后无法读取有效截图；保持断网并停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+    if find_victory_banner(fresh_screen) is not None:
+        reason = "红色胜利页清除后仍可见；保持断网并停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+    if find_connection_interrupted_dialog(fresh_screen) is not None:
+        reason = "红色胜利页清除后出现连接中断弹窗；保持断网并停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+    if find_template(fresh_screen, QUIT_ACTIVITY_TEMPLATE) is None:
+        reason = "红色胜利页清除后未确认仍在本关活动详情页；保持断网并停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+    verify_expected_level(fresh_screen)
+    logger.info(
+        "red-scout victory state reloaded; current activity detail confirmed before blue attack"
+    )
 
 
 def handle_connection_interrupted_prompt(timeout: float = 20.0) -> bool:
@@ -8060,14 +9125,26 @@ def wait_until_occur(
     timeout: float = 30.0,
     *,
     poll_interval: float = FAST_POLL_INTERVAL_SECONDS,
+    alternate_matchers: Sequence[
+        tuple[str, Callable[[object], MatchResult | None]]
+    ] = (),
 ) -> MatchResult | None:
-    """等待直到指定模板出现，返回匹配结果或 None（超时）"""
+    """等待模板或可选的替代状态出现，返回第一个匹配结果。"""
     if poll_interval <= 0:
         raise ValueError(f"poll_interval must be positive: {poll_interval}")
     logger.info("正在等待模板 '%s' 出现，超时时间 %s 秒", template_path, timeout)
     start_time = monotonic()
     while monotonic() - start_time < timeout:
         screenshot = adb.read_screenshot()
+        for name, matcher in alternate_matchers:
+            alternate_result = matcher(screenshot)
+            if alternate_result is not None:
+                logger.info(
+                    "等待模板 '%s' 时检测到替代状态 '%s'",
+                    template_path,
+                    name,
+                )
+                return alternate_result
         match_result = find_template(screenshot, template_path)
         if match_result is not None:
             return match_result
@@ -8206,16 +9283,10 @@ def resolve_next_level_with_retries(
     current_level: int,
     fallback_level: int,
 ) -> int | None:
-    # Always leave the completed level through the base/reconnect flow before
-    # reading the next level. This prevents a stale victory/detail transition
-    # frame from being treated as the next board and avoids opening a cell.
-    if not _reconnect_to_base_and_reenter_activity_after_victory():
-        logger.warning(
-            "victory transition returned without a confirmed activity detail; "
-            "refusing to probe the next level"
-        )
-        return None
-
+    # The final blue probe has already restored the network, submitted the
+    # request, handled the victory page, and completed the explicit
+    # DROP+REJECT -> retry -> base -> activity recovery in restart_process().
+    # Only read the next activity here; do not perform another reconnect.
     for attempt in range(1, LEVEL_ADVANCE_RETRIES + 1):
         logger.info(
             "checking next level after level %s (%s/%s)",
@@ -8285,23 +9356,94 @@ def resolve_next_level_with_retries(
                 sleep(FAST_POLL_INTERVAL_SECONDS)
             logger.info(
                 "next level still not visible after transition settle; "
-                "performing one guarded base reconnect"
+                "continuing direct level detection"
             )
-        try:
-            if not _reconnect_to_base_and_reenter_activity_after_victory():
-                logger.warning(
-                    "retrying next-level transition did not confirm activity detail; "
-                    "refusing to probe the grid"
-                )
-                return None
-        except Exception as exc:
-            logger.warning(
-                "retrying next-level transition failed through base reconnect: %s",
-                exc,
-            )
-            return None
 
     return None
+
+
+def _wait_for_next_level_board_ready(
+    level: int,
+    *,
+    timeout: float = NEXT_LEVEL_BOARD_READY_TIMEOUT_SECONDS,
+) -> bool:
+    """Confirm the newly detected level is a clean activity board before taps.
+
+    Level-title recognition alone is insufficient: the title can update while
+    the previous victory banner is still covering the board.  This barrier is
+    deliberately read-only.  It waits for the banner to disappear and for the
+    activity-detail control to be visible; any dialog, timeout, or malformed
+    frame fails closed so the caller cannot spend a probe on a transition
+    frame.
+    """
+    deadline = monotonic() + max(0.0, float(timeout))
+    while True:
+        screenshot = adb.read_screenshot()
+        if not isinstance(screenshot, np.ndarray):
+            logger.warning(
+                "next level %s board-ready check returned an invalid screenshot",
+                level,
+            )
+        else:
+            try:
+                victory_visible = find_victory_banner(screenshot) is not None
+            except Exception as exc:
+                logger.warning(
+                    "next level %s victory check failed; refusing first board tap: %s",
+                    level,
+                    exc,
+                )
+                victory_visible = True
+            if victory_visible:
+                logger.info(
+                    "next level %s detected but victory banner is still visible; "
+                    "waiting before the first board tap",
+                    level,
+                )
+            else:
+                try:
+                    dialog_visible = find_connection_interrupted_dialog(screenshot) is not None
+                except Exception as exc:
+                    logger.warning(
+                        "next level %s connection-dialog check failed; refusing first board tap: %s",
+                        level,
+                        exc,
+                    )
+                    dialog_visible = True
+                if dialog_visible:
+                    logger.warning(
+                        "next level %s still shows a connection dialog; refusing first board tap",
+                        level,
+                    )
+                    return False
+                try:
+                    detail_visible = find_template(
+                        screenshot,
+                        QUIT_ACTIVITY_TEMPLATE,
+                    ) is not None
+                except Exception as exc:
+                    logger.warning(
+                        "next level %s activity-detail check failed; refusing first board tap: %s",
+                        level,
+                        exc,
+                    )
+                    detail_visible = False
+                if detail_visible:
+                    logger.info(
+                        "next level %s clean activity board confirmed before first tap",
+                        level,
+                    )
+                    return True
+
+        if monotonic() >= deadline:
+            logger.error(
+                "next level %s board was not confirmed clean within %.1f seconds; "
+                "stopping before the first tap",
+                level,
+                max(0.0, float(timeout)),
+            )
+            return False
+        sleep(NEXT_LEVEL_BOARD_READY_POLL_SECONDS)
 
 
 def _process_memory_usage_mb() -> tuple[float | None, float | None]:
@@ -8460,6 +9602,19 @@ def main(level: int | None = None) -> Path | None:
                 logger.warning(
                     "next level detection did not advance beyond %s after retries; stopping progression",
                     current_level,
+                )
+                break
+
+            # Do not start the new level while the previous victory overlay or
+            # a reconnect dialog is still on screen.  The next-level title may
+            # already be readable underneath that overlay; without this
+            # barrier the first blue/red coordinate can be consumed by the
+            # transition instead of the board.
+            if not _wait_for_next_level_board_ready(next_level):
+                logger.warning(
+                    "next level %s was detected but its board was not ready; "
+                    "stopping before any new-level tap",
+                    next_level,
                 )
                 break
 
