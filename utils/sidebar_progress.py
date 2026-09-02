@@ -389,6 +389,183 @@ def resolve_completed_ship_cells(
     )
 
 
+def resolve_completed_ship_cells_by_anchors(
+    candidate_cells: set[tuple[int, int]],
+    anchor_cells: set[tuple[int, int]],
+    completed_lengths: Sequence[int],
+    *,
+    grid_size: int,
+    preferred_cells: set[tuple[int, int]] | frozenset[tuple[int, int]] = frozenset(),
+    fallback_to_global: bool = True,
+) -> CompletedShipResolution:
+    """Resolve completed ships while binding each red marker to one length.
+
+    ``resolve_completed_ship_cells`` intentionally solves one global candidate
+    set.  That is insufficient when two red completion markers are visible at
+    once: a valid line for the longer ship can be assigned to the shorter
+    marker, or vice versa.  This variant treats every marker as an anchor and
+    searches a joint assignment of the sidebar lengths to anchor-supported
+    straight placements.  It falls back to the regular resolver when the
+    marker count is not compatible with the completed-length count or when no
+    complete assignment can be proven.
+    """
+    candidates = {
+        (int(row), int(col))
+        for row, col in candidate_cells
+        if 0 <= int(row) < grid_size and 0 <= int(col) < grid_size
+    }
+    anchors = tuple(sorted({
+        (int(row), int(col))
+        for row, col in anchor_cells
+        if 0 <= int(row) < grid_size and 0 <= int(col) < grid_size
+    }))
+    lengths = tuple(sorted((int(length) for length in completed_lengths), reverse=True))
+    preferred = {
+        (int(row), int(col))
+        for row, col in preferred_cells
+        if 0 <= int(row) < grid_size and 0 <= int(col) < grid_size
+    }
+    def fallback() -> CompletedShipResolution:
+        if fallback_to_global:
+            return resolve_completed_ship_cells(
+                candidates,
+                lengths,
+                grid_size=grid_size,
+                preferred_cells=preferred,
+            )
+        return CompletedShipResolution(
+            cells=frozenset(),
+            placements=(),
+            unresolved_lengths=lengths,
+            discarded_cells=frozenset(candidates),
+        )
+
+    if not anchors or len(anchors) != len(lengths):
+        return fallback()
+
+    def placements_for(anchor: tuple[int, int], length: int) -> tuple[tuple[tuple[int, int], ...], ...]:
+        if length <= 0 or length > grid_size:
+            return ()
+        options: set[tuple[tuple[int, int], ...]] = set()
+        for row in range(grid_size):
+            for start_col in range(grid_size - length + 1):
+                placement = tuple((row, start_col + offset) for offset in range(length))
+                if set(placement) <= candidates and any(
+                    max(abs(cell[0] - anchor[0]), abs(cell[1] - anchor[1])) <= 1
+                    for cell in placement
+                ):
+                    options.add(placement)
+        for col in range(grid_size):
+            for start_row in range(grid_size - length + 1):
+                placement = tuple((start_row + offset, col) for offset in range(length))
+                if set(placement) <= candidates and any(
+                    max(abs(cell[0] - anchor[0]), abs(cell[1] - anchor[1])) <= 1
+                    for cell in placement
+                ):
+                    options.add(placement)
+        return tuple(sorted(options))
+
+    options_by_anchor_length = {
+        (anchor_index, length): placements_for(anchor, length)
+        for anchor_index, anchor in enumerate(anchors)
+        for length in set(lengths)
+    }
+
+    def placement_fits(
+        placement: tuple[tuple[int, int], ...],
+        used: frozenset[tuple[int, int]],
+    ) -> bool:
+        return not any(
+            max(abs(row - used_row), abs(col - used_col)) <= 1
+            for row, col in placement
+            for used_row, used_col in used
+        )
+
+    @lru_cache(maxsize=None)
+    def solve(
+        anchor_index: int,
+        remaining_lengths: tuple[int, ...],
+        used: frozenset[tuple[int, int]],
+    ) -> tuple[
+        tuple[int, int, int],
+        tuple[tuple[tuple[int, int], ...], ...],
+        tuple[tuple[tuple[tuple[int, int], ...], ...], ...],
+    ] | None:
+        if anchor_index >= len(anchors):
+            if remaining_lengths:
+                return None
+            empty = ()
+            return ((0, 0, 0), empty, (empty,))
+
+        anchor = anchors[anchor_index]
+        best_score: tuple[int, int, int] | None = None
+        best_placements: tuple[tuple[tuple[int, int], ...], ...] = ()
+        best_signatures: list[tuple[tuple[tuple[int, int], ...], ...]] = []
+        for length_index, length in enumerate(remaining_lengths):
+            next_lengths = remaining_lengths[:length_index] + remaining_lengths[length_index + 1:]
+            for placement in options_by_anchor_length[(anchor_index, length)]:
+                if not placement_fits(placement, used):
+                    continue
+                remainder = solve(anchor_index + 1, next_lengths, used | frozenset(placement))
+                if remainder is None:
+                    continue
+                remainder_score, _remainder_placements, remainder_signatures = remainder
+                distance = min(
+                    max(abs(row - anchor[0]), abs(col - anchor[1]))
+                    for row, col in placement
+                )
+                candidate = (
+                    length + remainder_score[0],
+                    len(set(placement) & preferred) + remainder_score[1],
+                    -distance + remainder_score[2],
+                )
+                combined_signatures = [
+                    (placement,) + signature
+                    for signature in remainder_signatures
+                ]
+                if best_score is None or candidate > best_score:
+                    best_score = candidate
+                    best_placements = combined_signatures[0]
+                    best_signatures = []
+                    for signature in combined_signatures:
+                        if signature not in best_signatures:
+                            best_signatures.append(signature)
+                        if len(best_signatures) >= 2:
+                            break
+                elif candidate == best_score:
+                    for signature in combined_signatures:
+                        if signature not in best_signatures:
+                            best_signatures.append(signature)
+                        if len(best_signatures) >= 2:
+                            break
+                    if combined_signatures and combined_signatures[0] < best_placements:
+                        best_placements = combined_signatures[0]
+        if best_score is None:
+            return None
+        if not best_signatures:
+            best_signatures = [best_placements]
+        return best_score, best_placements, tuple(best_signatures)
+
+    resolved = solve(0, lengths, frozenset())
+    if resolved is None:
+        return fallback()
+    _score, placements, signatures = resolved
+    if len(signatures) > 1:
+        return fallback() if fallback_to_global else CompletedShipResolution(
+            cells=frozenset(),
+            placements=(),
+            unresolved_lengths=lengths,
+            discarded_cells=frozenset(candidates),
+        )
+    used = {cell for placement in placements for cell in placement}
+    return CompletedShipResolution(
+        cells=frozenset(used),
+        placements=placements,
+        unresolved_lengths=(),
+        discarded_cells=frozenset(candidates - used),
+    )
+
+
 def progressive_hit_count(
     *,
     initial_visual_hit_count: int,
@@ -412,4 +589,5 @@ __all__ = [
     "newly_completed_lengths",
     "progressive_hit_count",
     "resolve_completed_ship_cells",
+    "resolve_completed_ship_cells_by_anchors",
 ]

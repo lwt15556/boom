@@ -430,7 +430,7 @@ class SubmarineStrategyTest(unittest.TestCase):
             self.assertNotIn(cell, blocked_ring)
             strategy.report_result(cell, False)
 
-    def test_structured_board_states_distinguish_probe_results(self):
+    def test_structured_board_states_render_completed_ship_safety_area_as_misses(self):
         strategy = SubmarineStrategy(5, [2])
         strategy.report_result((2, 1), True)
         strategy.report_result((2, 2), True)
@@ -441,7 +441,7 @@ class SubmarineStrategyTest(unittest.TestCase):
 
         self.assertEqual(states[2][1], "ship")
         self.assertEqual(states[2][2], "ship")
-        self.assertEqual(states[1][1], "blocked")
+        self.assertEqual(states[1][1], "miss")
         self.assertEqual(states[0][4], "miss")
         self.assertEqual(states[4][4], "unknown")
 

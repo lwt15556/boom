@@ -70,6 +70,7 @@ RUN_STDOUT = PROJECT_ROOT / "run_stdout.log"
 RUN_STDERR = PROJECT_ROOT / "run_stderr.log"
 STATUS_FILE = PROJECT_ROOT / "_debug" / "runtime" / "status.json"
 PANEL_LOCK_FILE = PROJECT_ROOT / "_debug" / "runtime" / "control_panel.lock"
+APP_VERSION = "1.0.0"
 
 NETWORK_BLOCK_SETTLE_SECONDS = 0.2
 APP_STOP_TIMEOUT_SECONDS = 5.0
@@ -191,7 +192,13 @@ def overlay_visual_candidates(
     if not all(isinstance(row, list) and len(row) == size for row in board_states):
         return board_states
 
-    normalized = [list(row) for row in board_states]
+    # Older running main processes can still publish the legacy ``blocked``
+    # state.  It is a known completed-submarine water perimeter, not an
+    # unknown safe hint, so render it as a normal miss for compatibility.
+    normalized = [
+        ["miss" if state == "blocked" else state for state in row]
+        for row in board_states
+    ]
     if not isinstance(visual_candidates, (list, tuple, set)):
         return normalized
     for raw_cell in visual_candidates:
@@ -761,6 +768,10 @@ class ControlPanel(QMainWindow):
         self.status_badge.setMinimumWidth(92)
         self.status_badge.setFixedHeight(30)
 
+        self.version_label = QLabel(f"v{APP_VERSION}")
+        self.version_label.setObjectName("versionLabel")
+        self.version_label.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
         self.last_update_label = QLabel("状态更新时间：--")
         self.last_update_label.setObjectName("mutedText")
 
@@ -887,11 +898,17 @@ class ControlPanel(QMainWindow):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(18, 13, 18, 13)
         title_column = QVBoxLayout()
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
         title = QLabel("BBMA 运行控制台")
         title.setObjectName("appTitle")
+        title_row.addWidget(title)
+        title_row.addWidget(self.version_label)
+        title_row.addStretch()
         subtitle = QLabel("潜艇探测自动化 · 模拟器控制与实时监控")
         subtitle.setObjectName("mutedText")
-        title_column.addWidget(title)
+        title_column.addLayout(title_row)
         title_column.addWidget(subtitle)
         header_layout.addLayout(title_column)
         header_layout.addStretch()
@@ -1021,7 +1038,6 @@ class ControlPanel(QMainWindow):
             ("未命中", "#718793", False),
             ("已命中", "#d34f4f", False),
             ("完整潜艇", "#17845c", False),
-            ("安全区", "#eef1f3", False),
             ("侦察未命中", "#aab7be", False),
             ("侦察命中", "#d9822b", False),
             ("当前目标", "#ffffff", True),
@@ -1094,6 +1110,15 @@ class ControlPanel(QMainWindow):
                 font-size: 17pt;
                 font-weight: 700;
                 color: #182129;
+            }
+            QLabel#versionLabel {
+                color: #697782;
+                font-size: 9pt;
+                font-weight: 600;
+                padding: 2px 7px;
+                border: 1px solid #cbd4da;
+                border-radius: 3px;
+                background: #f3f6f8;
             }
             QLabel#mutedText, QLabel#fieldCaption {
                 color: #697782;
@@ -1503,7 +1528,7 @@ class ControlPanel(QMainWindow):
             f"{current_text}\n"
             f"未探测 {counts['unknown']}  ·  视觉候选 {counts['visual_candidate']}\n"
             f"未命中 {counts['miss']}  ·  已命中 {counts['hit']}\n"
-            f"完整潜艇 {counts['ship']}  ·  安全区 {counts['blocked']}\n"
+            f"完整潜艇 {counts['ship']}\n"
             f"侦察未命中 {counts['scout_miss']}  ·  侦察命中 {counts['scout_hit']}"
         )
 

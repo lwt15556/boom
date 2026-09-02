@@ -84,6 +84,7 @@ class LatestLShapeRuleTest(unittest.TestCase):
         submarines,
         initial_completed_visual_hits=None,
         initial_authoritative_completed_visual_hits=None,
+        initial_authoritative_completed_placements=None,
         affected_cells=None,
         center=(2, 2),
         level=1,
@@ -136,6 +137,11 @@ class LatestLShapeRuleTest(unittest.TestCase):
                 initial_authoritative_completed_visual_hits=(
                     set(initial_authoritative_completed_visual_hits)
                     if initial_authoritative_completed_visual_hits is not None
+                    else None
+                ),
+                initial_authoritative_completed_placements=(
+                    initial_authoritative_completed_placements
+                    if initial_authoritative_completed_placements is not None
                     else None
                 ),
             )
@@ -250,6 +256,34 @@ class LatestLShapeRuleTest(unittest.TestCase):
             )
 
         self.assertTrue(completed)
+        self.assertNotIn(upper, scan.call_args.kwargs["initial_hits"])
+        self.assertIn(upper, scan.call_args.kwargs["initial_misses"])
+
+    def test_2x2_l_does_not_restore_upper_from_locked_placement(self):
+        """L cleanup must survive the completed-ship restoration pass."""
+        upper = (0, 1)
+        upper_pair = {(0, 1), (0, 2)}
+        lower = (1, 2)
+        result = self._red_result(
+            {lower},
+            affected_cells=upper_pair | {lower},
+            center=(2, 2),
+        )
+        placement = self.main.Placement(
+            length=2,
+            direction="H",
+            cells=tuple(sorted(upper_pair)),
+        )
+
+        _online_hit, scan, _write_status = self._run_red_case(
+            initial_hits=upper_pair,
+            result_hits={lower},
+            affected_cells=upper_pair | {lower},
+            submarines=(2,),
+            initial_authoritative_completed_visual_hits=upper_pair,
+            initial_authoritative_completed_placements=(placement,),
+        )
+
         self.assertNotIn(upper, scan.call_args.kwargs["initial_hits"])
         self.assertIn(upper, scan.call_args.kwargs["initial_misses"])
 

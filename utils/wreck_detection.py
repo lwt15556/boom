@@ -1194,8 +1194,64 @@ def _detect_completed_ship_anchor_cells(
             (float(nearest_point[0]) - center_x) ** 2
             + (float(nearest_point[1]) - center_y) ** 2
         )
-        if distance_sq <= max_point_distance_sq:
-            anchors.add((nearest_index // grid_size, nearest_index % grid_size))
+        if distance_sq > max_point_distance_sq:
+            continue
+
+        # The flag is a decoration above/beside the surfaced hull.  On the
+        # isometric board its nearest calibrated point can therefore be one
+        # tile away from the actual submarine (for example, (2,2) versus the
+        # hull at (3,2)).  Treat the nearest point as a seed and compare the
+        # surrounding cells by hull evidence before binding the marker.  A
+        # red component without any usable hull evidence still falls back to
+        # the nearest point so marker-only compatibility tests remain stable;
+        # callers will keep that anchor provisional until a real layout is
+        # found.
+        nearest_row, nearest_col = divmod(nearest_index, grid_size)
+        candidate_indices: list[int] = []
+        for index, point in enumerate(click_points):
+            row, col = divmod(index, grid_size)
+            if max(abs(row - nearest_row), abs(col - nearest_col)) > 1:
+                continue
+            candidate_distance_sq = (
+                (float(point[0]) - center_x) ** 2
+                + (float(point[1]) - center_y) ** 2
+            )
+            if candidate_distance_sq <= max_point_distance_sq:
+                candidate_indices.append(index)
+
+        best_index = nearest_index
+        best_key: tuple[float, float, float, int] | None = None
+        for index in candidate_indices:
+            point = click_points[index]
+            candidate_row, candidate_col = divmod(index, grid_size)
+            candidate_distance_sq = (
+                (float(point[0]) - center_x) ** 2
+                + (float(point[1]) - center_y) ** 2
+            )
+            body_score = completed_ship_body_score(
+                image,
+                point,
+                cell_polygon=grid_cell_polygon(click_points, index, grid_size),
+            )
+            # Prefer strong hull evidence first, then proximity.  The small
+            # proximity tie-break keeps a flag centred on its own hull from
+            # jumping to a similarly bright neighbouring cell.
+            key = (
+                float(body_score),
+                -float(candidate_distance_sq),
+                -float(
+                    abs(candidate_row - nearest_row)
+                    + abs(candidate_col - nearest_col)
+                ),
+                -index,
+            )
+            if best_key is None or key > best_key:
+                best_key = key
+                best_index = index
+
+        if best_key is not None and best_key[0] < COMPLETED_SHIP_BODY_MIN_SCORE:
+            best_index = nearest_index
+        anchors.add((best_index // grid_size, best_index % grid_size))
 
     return anchors
 

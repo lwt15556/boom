@@ -20,6 +20,7 @@ from utils.sidebar_progress import (
     detect_sidebar_progress,
     newly_completed_lengths,
     resolve_completed_ship_cells,
+    resolve_completed_ship_cells_by_anchors,
 )
 from utils.wreck_detection import (
     COMPLETED_SHIP_BODY_MIN_SCORE,
@@ -987,9 +988,34 @@ class RedScoutAnalyzer:
         if len(affected) > RED_SCOUT_RESULT_CELL_COUNT:
             if completed_ship is None:
                 diagnostics["stage"] = "limit_strong_cells"
-                return self._invalid_result(
-                    result_center,
-                    reason="too_many_strong_cells",
+                # A noisy red result must not erase a stable hit.  The six
+                # cell cap limits miss/perimeter evidence only; every hit
+                # supported by all result frames remains available for the
+                # blue confirmation path.  Returning a non-valid result is
+                # intentional: the footprint is rejected, while its hit
+                # cells are still merged into the board transaction.
+                retained_hits = frozenset(stable_result_hits)
+                retained_confidence = {
+                    cell: median_change_by_cell[cell]
+                    for cell in retained_hits
+                    if cell in median_change_by_cell
+                }
+                diagnostics["retained_hits_after_limit"] = tuple(
+                    sorted(retained_hits)
+                )
+                diagnostics["final_hits"] = tuple(sorted(retained_hits))
+                diagnostics["final_misses"] = ()
+                diagnostics["final_unknown"] = ()
+                return RedScoutResult(
+                    center_cell=result_center,
+                    affected_cells=retained_hits,
+                    hit_cells=retained_hits,
+                    miss_cells=frozenset(),
+                    unknown_cells=frozenset(),
+                    footprint=None,
+                    valid=False,
+                    confidence_by_cell=retained_confidence,
+                    invalid_reason="too_many_strong_cells",
                     diagnostics=diagnostics,
                 )
             # Surfacing a completed ship changes its entire body, so authoritative
@@ -1354,6 +1380,7 @@ class RedScoutAnalyzer:
             for col in range(grid_size)
         ]
         stable_body_candidates: set[Cell] = set()
+        stable_red_anchor_cells: set[Cell] = set()
         try:
             before_body_candidates = detect_completed_submarine_candidate_cells(
                 before_image,
@@ -1375,10 +1402,33 @@ class RedScoutAnalyzer:
                 if candidate_votes >= MINIMUM_FRAME_VOTES
                 and cell not in before_body_candidates
             }
+            before_red_anchors = detect_red_submarine_marker_cells(
+                before_image,
+                click_points,
+                grid_size,
+            )
+            anchor_votes: Counter[Cell] = Counter()
+            for after_image in after_images:
+                anchor_votes.update(
+                    detect_red_submarine_marker_cells(
+                        after_image,
+                        click_points,
+                        grid_size,
+                    )
+                )
+            stable_red_anchor_cells = {
+                cell
+                for cell, candidate_votes in anchor_votes.items()
+                if candidate_votes >= MINIMUM_FRAME_VOTES
+                and cell not in before_red_anchors
+            }
         except Exception:
             details["completed_body_detection_failed"] = True
         details["completed_body_candidates"] = tuple(
             sorted(stable_body_candidates)
+        )
+        details["completed_red_anchor_cells"] = tuple(
+            sorted(stable_red_anchor_cells)
         )
         details["inferred_ship_body_placements"] = ()
         details["completed_body_overrides"] = tuple(
@@ -1401,6 +1451,45 @@ class RedScoutAnalyzer:
         # consume a hit cell that belongs to a longer ship and make the longer
         # placement impossible to recover.
         geometry_candidates = set(stable_body_candidates)
+        anchor_binding_expected = (
+            len(completed_lengths) > 1
+            and len(stable_red_anchor_cells) == len(completed_lengths)
+        )
+        anchor_resolution = None
+
+        def try_anchor_resolution(candidates: set[Cell]):
+            if not anchor_binding_expected:
+                return None
+            candidate_resolution = resolve_completed_ship_cells_by_anchors(
+                candidates,
+                stable_red_anchor_cells,
+                completed_lengths,
+                grid_size=grid_size,
+                preferred_cells=raw_stable_result_hits - before_visible,
+                # Do not silently replace a tied/failed anchor assignment with
+                # a global geometry guess; that can swap two completed lengths.
+                fallback_to_global=False,
+            )
+            if (
+                candidate_resolution.unresolved_lengths
+                or len(candidate_resolution.placements) != len(completed_lengths)
+            ):
+                return None
+            sorted_anchors = tuple(sorted(stable_red_anchor_cells))
+            if not all(
+                any(
+                    max(abs(row - anchor[0]), abs(col - anchor[1])) <= 1
+                    for row, col in placement
+                )
+                for anchor, placement in zip(
+                    sorted_anchors,
+                    candidate_resolution.placements,
+                    strict=True,
+                )
+            ):
+                return None
+            return candidate_resolution
+
         if geometry_candidates:
             inferred_geometry_cells, inferred_geometry_placements = (
                 _infer_completed_ship_body_placements(
@@ -1418,12 +1507,17 @@ class RedScoutAnalyzer:
                 )
                 geometry_candidates.update(inferred_geometry_cells)
 
-            resolution = resolve_completed_ship_cells(
-                geometry_candidates,
-                completed_lengths,
-                grid_size=grid_size,
-                preferred_cells=raw_stable_result_hits - before_visible,
-            )
+            anchor_resolution = try_anchor_resolution(geometry_candidates)
+            if anchor_resolution is not None:
+                resolution = anchor_resolution
+                details["completed_resolution_mode"] = "red_anchor_length_binding"
+            else:
+                resolution = resolve_completed_ship_cells(
+                    geometry_candidates,
+                    completed_lengths,
+                    grid_size=grid_size,
+                    preferred_cells=raw_stable_result_hits - before_visible,
+                )
         else:
             # Preserve the legacy perimeter/spill filtering when the marker
             # detector misses a frame.  The caller still requires an exact
@@ -1467,17 +1561,22 @@ class RedScoutAnalyzer:
                 minimum_score=COMPLETED_SHIP_ENDPOINT_MIN_SCORE,
             )
             if inferred_endpoints:
-                resolution = resolve_completed_ship_cells(
-                    geometry_candidates
-                    | inferred_endpoints,
-                    completed_lengths,
-                    grid_size=grid_size,
-                    preferred_cells=(
-                        raw_stable_result_hits
-                        - before_visible
-                        | inferred_endpoints
-                    ),
-                )
+                geometry_candidates.update(inferred_endpoints)
+                anchor_resolution = try_anchor_resolution(geometry_candidates)
+                if anchor_resolution is not None:
+                    resolution = anchor_resolution
+                    details["completed_resolution_mode"] = "red_anchor_length_binding"
+                else:
+                    resolution = resolve_completed_ship_cells(
+                        geometry_candidates,
+                        completed_lengths,
+                        grid_size=grid_size,
+                        preferred_cells=(
+                            raw_stable_result_hits
+                            - before_visible
+                            | inferred_endpoints
+                        ),
+                    )
         if resolution.unresolved_lengths:
             inferred_body_cells, inferred_body_placements = (
                 _infer_completed_ship_body_placements(
@@ -1494,24 +1593,137 @@ class RedScoutAnalyzer:
                     tuple(sorted(placement))
                     for placement in inferred_body_placements
                 )
-                resolution = resolve_completed_ship_cells(
-                    geometry_candidates | inferred_body_cells,
-                    completed_lengths,
-                    grid_size=grid_size,
-                    preferred_cells=(
-                        raw_stable_result_hits
-                        - before_visible
-                        | inferred_body_cells
-                    ),
-                )
+                geometry_candidates.update(inferred_body_cells)
+                anchor_resolution = try_anchor_resolution(geometry_candidates)
+                if anchor_resolution is not None:
+                    resolution = anchor_resolution
+                    details["completed_resolution_mode"] = "red_anchor_length_binding"
+                else:
+                    resolution = resolve_completed_ship_cells(
+                        geometry_candidates,
+                        completed_lengths,
+                        grid_size=grid_size,
+                        preferred_cells=(
+                            raw_stable_result_hits
+                            - before_visible
+                            | inferred_body_cells
+                        ),
+                    )
         details["inferred_ship_endpoints"] = tuple(sorted(inferred_endpoints))
         details["resolved_ship_placements"] = resolution.placements
         details["unresolved_ship_lengths"] = resolution.unresolved_lengths
         details["discarded_ship_cells"] = tuple(sorted(resolution.discarded_cells))
+        if anchor_binding_expected and anchor_resolution is None:
+            details["completed_ship_failure"] = (
+                "multi_completion_geometry_ambiguous"
+            )
+            details["ambiguous_completed_cells"] = tuple(
+                sorted(resolution.cells or geometry_candidates)
+            )
+            # Do not leave the rejected global guess in diagnostics.  Keeping
+            # it visible makes downstream recovery code look as if a valid
+            # placement exists even though this result is deliberately failed.
+            details["resolved_ship_placements"] = ()
+            details["unresolved_ship_lengths"] = completed_lengths
+            details["discarded_ship_cells"] = tuple(sorted(geometry_candidates))
+            return None
         if resolution.unresolved_lengths:
             if details.get("completed_ship_failure") is None:
                 details["completed_ship_failure"] = "ship_geometry_unresolved"
             return None
+
+        # A completed sidebar entry proves that a submarine was finished, but
+        # it does not make every visually plausible hull extension a confirmed
+        # board cell.  The isometric model can span neighbouring diamonds.
+        # Require all but at most one cell of every placement to be directly
+        # present in the stable body mask from this red request.  A surfaced
+        # 10x10 submarine can legitimately expose only its middle two cells,
+        # though: the remaining hull is covered by the isometric projection
+        # while the sidebar and red flag still identify the completed ship.
+        # Permit that specific case only when a stable red anchor is adjacent
+        # to the inferred straight placement and at least two body cells are
+        # directly supported.  Without an anchor, keep the strict rule so a
+        # transient two-cell wreck cannot manufacture a full ship.
+        under_supported: list[tuple[Cell, ...]] = []
+        relaxed_partial_support = False
+        for placement in resolution.placements:
+            support_count = len(set(placement) & stable_body_candidates)
+            if support_count >= len(placement) - 1:
+                continue
+            anchor_bound = any(
+                max(abs(row - anchor_row), abs(col - anchor_col)) <= 1
+                for anchor_row, anchor_col in stable_red_anchor_cells
+                for row, col in placement
+            )
+            minimum_partial_support = max(2, len(placement) - 2)
+            if anchor_bound and support_count >= minimum_partial_support:
+                relaxed_partial_support = True
+                continue
+            under_supported.append(placement)
+        under_supported_placements = tuple(under_supported)
+        if relaxed_partial_support and not under_supported_placements:
+            details["completed_resolution_mode"] = (
+                "red_anchor_partial_body_support"
+            )
+        if under_supported_placements:
+            details["completed_ship_failure"] = "insufficient_direct_body_support"
+            details["ambiguous_completed_cells"] = tuple(
+                sorted({cell for placement in under_supported_placements for cell in placement})
+            )
+            details["resolved_ship_placements"] = ()
+            details["unresolved_ship_lengths"] = completed_lengths
+            details["discarded_ship_cells"] = tuple(sorted(geometry_candidates))
+            # Do not infer the missing hull cells, but keep the body pixels
+            # that were independently stable in every frame.  The sidebar
+            # completion and red marker prove this is a surfaced submarine;
+            # these direct cells must be offered to the isolated blue
+            # confirmation path instead of being reclassified as misses by
+            # the generic pixel classifier below.
+            supported_cells = {
+                cell
+                for placement in under_supported_placements
+                for cell in placement
+                if cell in stable_body_candidates
+            }
+            direct_body_hits = supported_cells - before_visible
+            if not direct_body_hits:
+                return None
+            direct_perimeter: set[Cell] = set()
+            for row, col in direct_body_hits:
+                for row_offset in (-1, 0, 1):
+                    for col_offset in (-1, 0, 1):
+                        neighbor = (row + row_offset, col + col_offset)
+                        if (
+                            neighbor not in direct_body_hits
+                            and _inside_grid(neighbor, grid_size)
+                        ):
+                            direct_perimeter.add(neighbor)
+            details["partial_completed_body_hits"] = tuple(
+                sorted(direct_body_hits)
+            )
+            return _CompletedShipEvidence(
+                new_hit_cells=frozenset(direct_body_hits),
+                ship_cells=frozenset(direct_body_hits),
+                perimeter_cells=frozenset(direct_perimeter),
+            )
+
+        # When more than one submarine completes in the same red-scout frame,
+        # a global candidate set can legally contain a short run from one
+        # hull and a spill/occlusion fragment from the other.  If any resolved
+        # placement relies on cells that were not stable body evidence, its
+        # length-to-hull association is ambiguous.  Do not promote that
+        # assignment to authoritative completed cells; the caller will retain
+        # the real red-hit evidence and let blue attacks confirm the cells.
+        if len(completed_lengths) > 1:
+            inferred_only_cells = set(resolution.cells) - stable_body_candidates
+            if inferred_only_cells and details.get("completed_resolution_mode") != "red_anchor_length_binding":
+                details["completed_ship_failure"] = (
+                    "multi_completion_geometry_ambiguous"
+                )
+                details["ambiguous_completed_cells"] = tuple(
+                    sorted(inferred_only_cells)
+                )
+                return None
 
         new_hit_cells = set(resolution.cells) - before_visible
         if not new_hit_cells:
