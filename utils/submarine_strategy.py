@@ -247,6 +247,16 @@ class SubmarineStrategy:
                 anchor=anchor_available,
                 trusted_completed_cells=trusted_completed_cells,
             )
+            if placement is None:
+                # The sidebar can confirm a ship while the visual hull
+                # resolver misses its cells (for example, after an explosion
+                # animation or when another wreck touches the hit cluster).
+                # Fall back to a uniquely identifiable, already blue-hit line
+                # anchored at the probe that triggered this completion.
+                placement = self._find_anchor_hit_line_for_completed_length(
+                    length,
+                    anchor=anchor_available,
+                )
             if placement is not None:
                 self._confirm_placement(placement)
                 located.append(length)
@@ -758,6 +768,54 @@ class SubmarineStrategy:
                     return candidate
 
         return None
+
+    def _find_anchor_hit_line_for_completed_length(
+        self,
+        length: int,
+        *,
+        anchor: Cell | None,
+    ) -> Optional[Placement]:
+        """Find one exact hit line when sidebar geometry is unavailable.
+
+        This is deliberately fail-closed.  A completion length from the
+        sidebar is required by the caller, every cell must have a real blue
+        hit, the line must contain the triggering anchor, and there must be
+        exactly one viable placement.  The sidebar's completion length is the
+        authority for the ship length here; this fallback merely recovers its
+        coordinates from real blue-hit evidence when visual geometry is lost.
+        The external completion signal resolves the otherwise possible
+        longer-ship ambiguity; coordinate selection still fails closed unless
+        there is exactly one anchored real-hit line.
+        """
+        if anchor is None or length <= 0 or self.remaining.get(length, 0) <= 0:
+            return None
+
+        candidates: list[Placement] = []
+        for placement in self._all_placements(length):
+            if anchor not in placement.cells:
+                continue
+            if not all(self.shots.get(cell) is True for cell in placement.cells):
+                continue
+            if self._placement_touches_confirmed_ship(placement):
+                continue
+            candidates.append(placement)
+
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
+
+    def _placement_touches_confirmed_ship(self, placement: Placement) -> bool:
+        """Return whether a candidate overlaps or touches a locked ship."""
+        candidate = set(placement.cells)
+        for ship in self.confirmed_ships:
+            for row, col in ship.cells:
+                if any(
+                    abs(row - candidate_row) <= 1
+                    and abs(col - candidate_col) <= 1
+                    for candidate_row, candidate_col in candidate
+                ):
+                    return True
+        return False
 
     def _can_extend_placement_into_longer_ship(self, placement: Placement) -> bool:
         placement_cells = frozenset(placement.cells)

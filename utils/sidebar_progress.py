@@ -49,6 +49,44 @@ class CompletedShipResolution:
     discarded_cells: frozenset[tuple[int, int]]
 
 
+def resolution_has_unique_anchor_support(
+    placements: Sequence[Sequence[tuple[int, int]]],
+    anchors: Sequence[tuple[int, int]],
+    *,
+    max_distance: int = 1,
+) -> bool:
+    """Return whether every resolved ship is backed by a distinct red marker."""
+    normalized_placements = [tuple((int(row), int(col)) for row, col in placement) for placement in placements]
+    normalized_anchors = tuple((int(row), int(col)) for row, col in anchors)
+    if not normalized_placements or not normalized_anchors:
+        return False
+
+    options: list[tuple[int, ...]] = []
+    for placement in normalized_placements:
+        nearby = tuple(
+            index
+            for index, anchor in enumerate(normalized_anchors)
+            if any(
+                max(abs(row - anchor[0]), abs(col - anchor[1])) <= max_distance
+                for row, col in placement
+            )
+        )
+        if not nearby:
+            return False
+        options.append(nearby)
+
+    def match(index: int, used: frozenset[int]) -> bool:
+        if index >= len(options):
+            return True
+        return any(
+            anchor_index not in used
+            and match(index + 1, used | {anchor_index})
+            for anchor_index in options[index]
+        )
+
+    return match(0, frozenset())
+
+
 def detect_sidebar_progress(
     image: np.ndarray,
     submarine_lengths: Sequence[int],
@@ -302,6 +340,31 @@ def resolve_completed_ship_cells(
         for length in set(lengths)
     }
 
+    # When the caller supplies cells from the current visual/blue result,
+    # those cells are the positional anchor for the completed submarine.  A
+    # broad screenshot can contain several legal straight lines of the same
+    # length; allowing an unrelated line to win the global solver is what
+    # causes completed cells to appear shifted on the control panel.  Keep
+    # anchored candidates when they exist, while retaining the old fallback
+    # for snapshots that contain no matching geometry yet.
+    if preferred:
+        anchored_by_length = {
+            length: tuple(
+                placement
+                for placement in placements
+                if set(placement) & preferred
+            )
+            for length, placements in placements_by_length.items()
+        }
+        placements_by_length = {
+            length: (
+                anchored_by_length[length]
+                if anchored_by_length[length]
+                else placements
+            )
+            for length, placements in placements_by_length.items()
+        }
+
     def placement_fits(
         placement: tuple[tuple[int, int], ...],
         used: frozenset[tuple[int, int]],
@@ -397,6 +460,8 @@ def resolve_completed_ship_cells_by_anchors(
     grid_size: int,
     preferred_cells: set[tuple[int, int]] | frozenset[tuple[int, int]] = frozenset(),
     fallback_to_global: bool = True,
+    anchor_distance: int = 1,
+    allow_ambiguous: bool = False,
 ) -> CompletedShipResolution:
     """Resolve completed ships while binding each red marker to one length.
 
@@ -405,9 +470,12 @@ def resolve_completed_ship_cells_by_anchors(
     once: a valid line for the longer ship can be assigned to the shorter
     marker, or vice versa.  This variant treats every marker as an anchor and
     searches a joint assignment of the sidebar lengths to anchor-supported
-    straight placements.  It falls back to the regular resolver when the
-    marker count is not compatible with the completed-length count or when no
-    complete assignment can be proven.
+    straight placements.  ``anchor_distance`` covers a projected marker that
+    lands near, but not on, its hull.  ``allow_ambiguous`` keeps the best
+    evidence-ranked assignment when several geometries remain tied; callers
+    should pair it with ``resolution_has_unique_anchor_support``.  It falls
+    back to the regular resolver when the marker count is not compatible with
+    the completed-length count or when no complete assignment can be proven.
     """
     candidates = {
         (int(row), int(col))
@@ -425,6 +493,47 @@ def resolve_completed_ship_cells_by_anchors(
         for row, col in preferred_cells
         if 0 <= int(row) < grid_size and 0 <= int(col) < grid_size
     }
+    anchor_distance = max(1, int(anchor_distance))
+
+    # The red completion marker is often drawn over the middle of the hull,
+    # so the per-cell body detector may omit exactly the marker's projected
+    # grid cell. Recover that cell only when the remaining visual candidates
+    # already support a complete straight placement of one reported length.
+    # A marker by itself is never enough to create ship geometry.
+    for anchor in anchors:
+        for length in set(lengths):
+            if length <= 0 or length > grid_size:
+                continue
+            supported: list[tuple[tuple[int, int], ...]] = []
+            for row in range(grid_size):
+                for start_col in range(grid_size - length + 1):
+                    placement = tuple(
+                        (row, start_col + offset) for offset in range(length)
+                    )
+                    if anchor not in placement:
+                        continue
+                    anchor_index = placement.index(anchor)
+                    if (
+                        0 < anchor_index < length - 1
+                        and set(placement) - {anchor} <= candidates
+                    ):
+                        supported.append(placement)
+            for col in range(grid_size):
+                for start_row in range(grid_size - length + 1):
+                    placement = tuple(
+                        (start_row + offset, col) for offset in range(length)
+                    )
+                    if anchor not in placement:
+                        continue
+                    anchor_index = placement.index(anchor)
+                    if (
+                        0 < anchor_index < length - 1
+                        and set(placement) - {anchor} <= candidates
+                    ):
+                        supported.append(placement)
+            if len(supported) == 1:
+                candidates.add(anchor)
+
     def fallback() -> CompletedShipResolution:
         if fallback_to_global:
             return resolve_completed_ship_cells(
@@ -446,23 +555,58 @@ def resolve_completed_ship_cells_by_anchors(
     def placements_for(anchor: tuple[int, int], length: int) -> tuple[tuple[tuple[int, int], ...], ...]:
         if length <= 0 or length > grid_size:
             return ()
-        options: set[tuple[tuple[int, int], ...]] = set()
+        direct_options: set[tuple[tuple[int, int], ...]] = set()
+        nearby_options: set[tuple[tuple[int, int], ...]] = set()
+
+        def add_option(
+            placement: tuple[tuple[int, int], ...],
+            *,
+            direct: bool,
+        ) -> None:
+            placement_set = set(placement)
+            missing = placement_set - candidates
+            if not missing:
+                (direct_options if direct else nearby_options).add(placement)
+                return
+            if not preferred:
+                return
+            # A dim animation or a red flag can hide one endpoint. Infer only
+            # that endpoint when every other cell in the straight run is a
+            # visual candidate; never bridge an interior gap or manufacture a
+            # line from a marker alone.
+            if len(missing) != 1:
+                return
+            missing_cell = next(iter(missing))
+            if missing_cell not in {placement[0], placement[-1]}:
+                return
+            if len(placement_set & candidates) < max(2, length - 1):
+                return
+            (direct_options if direct else nearby_options).add(placement)
+
         for row in range(grid_size):
             for start_col in range(grid_size - length + 1):
                 placement = tuple((row, start_col + offset) for offset in range(length))
-                if set(placement) <= candidates and any(
-                    max(abs(cell[0] - anchor[0]), abs(cell[1] - anchor[1])) <= 1
+                if anchor in placement:
+                    add_option(placement, direct=True)
+                elif any(
+                    max(abs(cell[0] - anchor[0]), abs(cell[1] - anchor[1])) <= anchor_distance
                     for cell in placement
                 ):
-                    options.add(placement)
+                    add_option(placement, direct=False)
         for col in range(grid_size):
             for start_row in range(grid_size - length + 1):
                 placement = tuple((start_row + offset, col) for offset in range(length))
-                if set(placement) <= candidates and any(
-                    max(abs(cell[0] - anchor[0]), abs(cell[1] - anchor[1])) <= 1
+                if anchor in placement:
+                    add_option(placement, direct=True)
+                elif any(
+                    max(abs(cell[0] - anchor[0]), abs(cell[1] - anchor[1])) <= anchor_distance
                     for cell in placement
                 ):
-                    options.add(placement)
+                    add_option(placement, direct=False)
+        # A marker normally sits on the surfaced hull.  Neighboring-cell
+        # binding remains available for the known projection offset, while
+        # the score prefers candidates that directly contain the marker.
+        options = direct_options | nearby_options
         return tuple(sorted(options))
 
     options_by_anchor_length = {
@@ -487,7 +631,7 @@ def resolve_completed_ship_cells_by_anchors(
         remaining_lengths: tuple[int, ...],
         used: frozenset[tuple[int, int]],
     ) -> tuple[
-        tuple[int, int, int],
+        tuple[int, int, int, int, int],
         tuple[tuple[tuple[int, int], ...], ...],
         tuple[tuple[tuple[tuple[int, int], ...], ...], ...],
     ] | None:
@@ -495,10 +639,10 @@ def resolve_completed_ship_cells_by_anchors(
             if remaining_lengths:
                 return None
             empty = ()
-            return ((0, 0, 0), empty, (empty,))
+            return ((0, 0, 0, 0, 0), empty, (empty,))
 
         anchor = anchors[anchor_index]
-        best_score: tuple[int, int, int] | None = None
+        best_score: tuple[int, int, int, int, int] | None = None
         best_placements: tuple[tuple[tuple[int, int], ...], ...] = ()
         best_signatures: list[tuple[tuple[tuple[int, int], ...], ...]] = []
         for length_index, length in enumerate(remaining_lengths):
@@ -516,8 +660,16 @@ def resolve_completed_ship_cells_by_anchors(
                 )
                 candidate = (
                     length + remainder_score[0],
-                    len(set(placement) & preferred) + remainder_score[1],
-                    -distance + remainder_score[2],
+                    # A red completion marker is rendered on its surfaced
+                    # hull in the usual case.  Prefer assignments that keep
+                    # every marker on its own line before comparing raw
+                    # detector coverage.  Otherwise noisy extra cells can
+                    # make a marker-neighboring, but wrong, length swap win.
+                    int(anchor in placement) + remainder_score[1],
+                    len(set(placement) & preferred) + remainder_score[2],
+                    int(round(1000.0 * len(set(placement) & preferred) / max(1, length)))
+                    + remainder_score[3],
+                    -distance + remainder_score[4],
                 )
                 combined_signatures = [
                     (placement,) + signature
@@ -550,7 +702,7 @@ def resolve_completed_ship_cells_by_anchors(
     if resolved is None:
         return fallback()
     _score, placements, signatures = resolved
-    if len(signatures) > 1:
+    if len(signatures) > 1 and not allow_ambiguous:
         return fallback() if fallback_to_global else CompletedShipResolution(
             cells=frozenset(),
             placements=(),
@@ -590,4 +742,5 @@ __all__ = [
     "progressive_hit_count",
     "resolve_completed_ship_cells",
     "resolve_completed_ship_cells_by_anchors",
+    "resolution_has_unique_anchor_support",
 ]

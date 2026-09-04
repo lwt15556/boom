@@ -70,7 +70,7 @@ RUN_STDOUT = PROJECT_ROOT / "run_stdout.log"
 RUN_STDERR = PROJECT_ROOT / "run_stderr.log"
 STATUS_FILE = PROJECT_ROOT / "_debug" / "runtime" / "status.json"
 PANEL_LOCK_FILE = PROJECT_ROOT / "_debug" / "runtime" / "control_panel.lock"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 NETWORK_BLOCK_SETTLE_SECONDS = 0.2
 APP_STOP_TIMEOUT_SECONDS = 5.0

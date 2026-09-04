@@ -18,9 +18,18 @@ RED_SUBMARINE_COMPONENT_TEMPLATES = tuple(
     TEMPLATE_DIR / f"red_submarine_component_{index}.png"
     for index in range(1, 6)
 )
+# Keep only the hand-curated templates in the runtime path.  Generated crops
+# are written to an isolated review directory by ``train_wreck_images.py``;
+# they must not affect gameplay until they have been checked against negative
+# cells, otherwise a tight crop can match ordinary water.
 VISIBLE_WRECK_TEMPLATES = tuple(
     TEMPLATE_DIR / f"visible_wreck_{index}.png"
     for index in range(1, 4)
+)
+GENERATED_WRECK_TEMPLATE_DIR = TEMPLATE_DIR / "generated_wreck"
+PARTIAL_WRECK_TEMPLATES = tuple(
+    VISIBLE_WRECK_TEMPLATES
+    + tuple(sorted(GENERATED_WRECK_TEMPLATE_DIR.glob("partial_*.png")))
 )
 WRECK_TEMPLATE_THRESHOLD = 0.965
 WRECK_TEMPLATE_SCALES = (0.75, 0.9, 1.0, 1.1, 1.25)
@@ -39,11 +48,16 @@ RED_HIT_MARKER_MIN_HEIGHT = 8
 # nearest calibrated point, so use a radius that covers that offset while
 # remaining local to the same tile neighbourhood.
 RED_SUBMARINE_MARKER_MAX_POINT_DISTANCE = 56
-COMPLETED_SHIP_BODY_MIN_SCORE = 0.25
+COMPLETED_SHIP_BODY_MIN_SCORE = 0.30
 # Diagonal cells next to a red marker are commonly water or a neighbouring
 # wreck.  Only admit such a cell when its hull evidence is substantially
 # stronger than the normal body threshold.
 COMPLETED_SHIP_DIAGONAL_BODY_MIN_SCORE = 0.48
+# In an isometric screenshot the red flag can sit one row/column above the
+# hull and up to two tiles along its axis.  Accept that offset only when the
+# local body evidence is strong; the straight-run selector below still has to
+# prove a coherent submarine line before the cells are used.
+COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE = 0.35
 # A red component can sit on an endpoint while the hull extends up to two
 # tiles away along its orientation.
 COMPLETED_SHIP_ANCHOR_MAX_CELL_DISTANCE = 2
@@ -982,6 +996,8 @@ def detect_completed_submarine_candidate_cells(
     screenshot: np.ndarray,
     click_points: list[tuple[int, int]],
     grid_size: int,
+    *,
+    preserve_alternatives: bool = False,
 ) -> set[Cell]:
     """Return hull-cell candidates for submarines marked complete in red."""
     if not isinstance(screenshot, np.ndarray) or screenshot.ndim != 3:
@@ -1012,6 +1028,11 @@ def detect_completed_submarine_candidate_cells(
         def _near_anchor(anchor: Cell) -> bool:
             row_delta = abs(cell[0] - anchor[0])
             col_delta = abs(cell[1] - anchor[1])
+            if preserve_alternatives:
+                return (
+                    max(row_delta, col_delta) <= COMPLETED_SHIP_ANCHOR_MAX_CELL_DISTANCE + 1
+                    and body_score >= COMPLETED_SHIP_BODY_MIN_SCORE
+                )
             # Keep the endpoint allowance along a ship axis.  A diagonal cell
             # is accepted only with much stronger body evidence, preventing a
             # nearby wreck or bright water tile from becoming ship geometry.
@@ -1020,6 +1041,16 @@ def detect_completed_submarine_candidate_cells(
                 or (
                     col_delta == 0
                     and row_delta <= COMPLETED_SHIP_ANCHOR_MAX_CELL_DISTANCE
+                )
+                or (
+                    row_delta == 1
+                    and col_delta <= COMPLETED_SHIP_ANCHOR_MAX_CELL_DISTANCE
+                    and body_score >= COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE
+                )
+                or (
+                    col_delta == 1
+                    and row_delta <= COMPLETED_SHIP_ANCHOR_MAX_CELL_DISTANCE
+                    and body_score >= COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE
                 )
                 or (
                     row_delta == 1
@@ -1036,6 +1067,12 @@ def detect_completed_submarine_candidate_cells(
 
     if not candidates:
         return set()
+
+    if preserve_alternatives:
+        # The caller is about to run the strict global fleet resolver. Keep
+        # all nearby body candidates so a local red-marker run cannot hide the
+        # perpendicular orientation of another complete submarine.
+        return candidates
 
     # The red component often bleeds into an adjacent diamond.  Keeping every
     # nearby gray patch lets the later fleet resolver choose a wrong
@@ -1108,6 +1145,48 @@ def detect_completed_submarine_candidate_cells(
                                 best_key = key
         if best_key is not None:
             selected.update(best_key[4])
+            # Keep a strong contiguous endpoint that was excluded by the
+            # average-score ranking.  This is common when a red flag overlaps
+            # one middle tile: the four clearer cells win the score, while the
+            # dimmer fifth hull tile is still needed to match the sidebar
+            # length.  Only extend along the selected line and only through
+            # already-qualified candidates, so isolated reflections are not
+            # promoted.
+            placement = tuple(best_key[4])
+            if len(placement) >= 2:
+                same_row = len({row for row, _ in placement}) == 1
+                if same_row:
+                    row = placement[0][0]
+                    start_col = min(col for _, col in placement)
+                    end_col = max(col for _, col in placement)
+                    while start_col > 0:
+                        cell = (row, start_col - 1)
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
+                            break
+                        selected.add(cell)
+                        start_col -= 1
+                    while end_col + 1 < grid_size:
+                        cell = (row, end_col + 1)
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
+                            break
+                        selected.add(cell)
+                        end_col += 1
+                else:
+                    col = placement[0][1]
+                    start_row = min(row for row, _ in placement)
+                    end_row = max(row for row, _ in placement)
+                    while start_row > 0:
+                        cell = (start_row - 1, col)
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
+                            break
+                        selected.add(cell)
+                        start_row -= 1
+                    while end_row + 1 < grid_size:
+                        cell = (end_row + 1, col)
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
+                            break
+                        selected.add(cell)
+                        end_row += 1
 
     # Keep the conservative raw set when no complete straight run can be
     # formed.  The caller may still use it for fail-closed diagnostics, but a
@@ -1346,7 +1425,52 @@ def completed_ship_body_score(
     gray_ratio = float(
         np.count_nonzero(gray)
     ) / denominator
-    return max(white_ratio, gray_ratio)
+
+    # Complete submarines sometimes expose only a small illuminated porthole
+    # in a cell.  It is blue/teal rather than neutral gray, so the historical
+    # score treated that cell as water.  Count compact, bright cyan evidence as
+    # a secondary hull signal.  This is deliberately conservative: broad cyan
+    # water reflections have high saturation but are not compact enough to
+    # resemble a porthole.
+    porthole = (
+        (saturation >= 35)
+        & (saturation <= 190)
+        & (value >= 145)
+        & (value <= 255)
+        & (hsv[:, :, 0] >= 70)
+        & (hsv[:, :, 0] <= 115)
+    )
+    porthole &= mask > 0
+    porthole_count = int(np.count_nonzero(porthole))
+    porthole_ratio = porthole_count / denominator
+    if porthole_count:
+        # Require a connected compact component.  A few scattered cyan pixels
+        # from animated water should not manufacture a completed ship cell.
+        porthole_u8 = porthole.astype(np.uint8) * 255
+        labels, _label_map, stats, _centroids = cv2.connectedComponentsWithStats(
+            porthole_u8,
+            connectivity=8,
+        )
+        largest = 0
+        largest_bbox = 0
+        for label_index in range(1, labels):
+            area = int(stats[label_index, cv2.CC_STAT_AREA])
+            if area > largest:
+                largest = area
+                largest_bbox = int(
+                    stats[label_index, cv2.CC_STAT_WIDTH]
+                    * stats[label_index, cv2.CC_STAT_HEIGHT]
+                )
+        compact_ratio = largest / float(max(1, largest_bbox))
+        # A porthole occupies roughly 8-25% of the visible diamond.  Cap its
+        # contribution so a bright cyan reflection remains weaker than a real
+        # gray hull while still rescuing a porthole-only cell.
+        porthole_signal = min(1.0, porthole_ratio / 0.04) * compact_ratio
+    else:
+        porthole_signal = 0.0
+
+    neutral_score = max(white_ratio, gray_ratio)
+    return max(neutral_score, 0.75 * porthole_signal)
 
 
 def _estimate_grid_step(click_points: list[tuple[int, int]], grid_size: int) -> float:
