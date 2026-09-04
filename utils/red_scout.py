@@ -27,6 +27,7 @@ from utils.wreck_detection import (
     completed_ship_body_score,
     detect_completed_submarine_candidate_cells,
     detect_red_submarine_marker_cells,
+    detect_visible_wreck_cells,
     red_hit_marker_visible,
     red_submarine_marker_visible,
     grid_cell_polygon,
@@ -1944,7 +1945,34 @@ class RedScoutAnalyzer:
         candidates: set[Cell],
     ) -> set[Cell] | None:
         visible: set[Cell] = set()
+
+        # The dynamic diamond classifier is deliberately strict and can miss
+        # a stationary gray wreck when the water animation changes its local
+        # contrast.  If that same wreck becomes clearer in the result frames,
+        # treating it as a new red-scout hit incorrectly attaches an old board
+        # fact to the current six-cell footprint.  Reuse the static wreck
+        # detector on the pre-click frame and union both sources.  Keep custom
+        # test/integration detectors isolated from this production-only path.
+        if (
+            self._hit_detector is _default_hit_detector
+            and self._marker_grid_size > 0
+            and len(self._marker_points)
+            == self._marker_grid_size * self._marker_grid_size
+        ):
+            try:
+                visible.update(
+                    detect_visible_wreck_cells(
+                        before_image,
+                        list(self._marker_points),
+                        self._marker_grid_size,
+                    )
+                    & candidates
+                )
+            except Exception:
+                return None
         for cell in sorted(candidates):
+            if cell in visible:
+                continue
             try:
                 if self._detect_hit(before_image, points_by_cell[cell]):
                     visible.add(cell)

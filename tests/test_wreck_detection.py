@@ -355,6 +355,40 @@ class WreckDetectionTest(unittest.TestCase):
 
         self.assertNotIn(marker_only, candidates)
 
+    def test_porthole_is_accepted_as_optional_completed_hull_evidence(self):
+        """A bright blue porthole can identify a red-marked ship cell."""
+        grid_size = 5
+        points = [
+            (60 + col * 40, 60 + row * 40)
+            for row in range(grid_size)
+            for col in range(grid_size)
+        ]
+        frame = np.zeros((280, 280, 3), dtype=np.uint8)
+        cell = (2, 2)
+        adjacent_hull = (1, 2)
+        x, y = points[cell[0] * grid_size + cell[1]]
+        # Red submarine decoration above the calibrated point.
+        cv2.rectangle(frame, (x - 8, y - 34), (x + 7, y - 26), (0, 0, 255), cv2.FILLED)
+        # The supplied screenshots show a small luminous cyan/blue porthole;
+        # no neutral-gray hull pixels are present in this cell.
+        cv2.ellipse(frame, (x, y), (8, 6), 0, 0, 360, (235, 220, 190), cv2.FILLED)
+        hull_x, hull_y = points[adjacent_hull[0] * grid_size + adjacent_hull[1]]
+        cv2.ellipse(
+            frame,
+            (hull_x, hull_y),
+            (15, 9),
+            0,
+            0,
+            360,
+            (185, 185, 185),
+            cv2.FILLED,
+        )
+
+        candidates = detect_completed_submarine_candidate_cells(frame, points, grid_size)
+
+        self.assertIn(cell, candidates)
+        self.assertIn(adjacent_hull, candidates)
+
     def test_completed_ship_anchor_does_not_pull_two_cell_water_neighbor(self):
         grid_size = 7
         points = [

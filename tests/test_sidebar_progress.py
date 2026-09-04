@@ -5,6 +5,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from utils.submarine_strategy import SubmarineStrategy
+
 
 try:
     sidebar_progress = importlib.import_module("utils.sidebar_progress")
@@ -64,6 +66,104 @@ class SidebarProgressTest(unittest.TestCase):
 
         self.assertEqual(resolution.placements, ())
         self.assertEqual(resolution.unresolved_lengths, (3, 2))
+
+    def test_anchor_resolution_prioritizes_marker_on_own_hull_over_noisy_coverage(self):
+        # Level 4 startup replay: the body detector found a dense false line
+        # beside the upper marker and omitted one lower-hull cell.  Selecting
+        # the most detector-covered combination swaps the 4-cell and 2-cell
+        # ships.  Both red markers are directly on the real hulls, which is
+        # stronger evidence than the extra body pixels.
+        broad_candidates = {
+            (0, 0), (0, 2), (0, 3),
+            (1, 0), (1, 2), (1, 3), (1, 4), (1, 5),
+            (2, 2), (2, 3), (2, 5), (3, 4),
+            (4, 1), (4, 2), (4, 3), (4, 4),
+        }
+        strict_candidates = {
+            (0, 0),
+            (1, 0), (1, 1), (1, 2), (1, 3), (1, 4),
+            (4, 1), (4, 3), (4, 4),
+        }
+
+        resolution = sidebar_progress.resolve_completed_ship_cells_by_anchors(
+            broad_candidates,
+            {(1, 0), (4, 2)},
+            completed_lengths=(4, 2),
+            grid_size=6,
+            preferred_cells=strict_candidates,
+            fallback_to_global=False,
+        )
+
+        self.assertEqual(
+            resolution.placements,
+            (
+                ((0, 0), (1, 0)),
+                ((4, 1), (4, 2), (4, 3), (4, 4)),
+            ),
+        )
+        self.assertEqual(resolution.unresolved_lengths, ())
+
+    def test_anchor_resolution_recovers_marker_cell_when_body_support_is_exact(self):
+        candidates = {
+            (5, 5), (5, 7), (5, 8), (5, 9),
+            (8, 3), (8, 5),
+        }
+        anchors = {(5, 6), (8, 4)}
+
+        resolution = sidebar_progress.resolve_completed_ship_cells_by_anchors(
+            candidates,
+            anchors,
+            completed_lengths=(5, 3),
+            grid_size=10,
+            fallback_to_global=False,
+        )
+
+        self.assertEqual(
+            resolution.placements,
+            (
+                ((5, 5), (5, 6), (5, 7), (5, 8), (5, 9)),
+                ((8, 3), (8, 4), (8, 5)),
+            ),
+        )
+
+    def test_level_22_midgame_log_geometry_matches_runtime_board_states(self):
+        # Extracted from the level_22 startup vision evidence captured in the
+        # debug log on 2026-09-03.  The red marker cells are omitted by the
+        # body detector, while three neighboring cells are visual spillover.
+        wreck_candidates = {
+            (4, 6), (4, 7), (4, 8),
+            (5, 5), (5, 7), (5, 8), (5, 9),
+            (8, 3), (8, 5),
+        }
+        anchors = {(5, 6), (8, 4)}
+        expected_ships = {
+            (5, 5), (5, 6), (5, 7), (5, 8), (5, 9),
+            (8, 3), (8, 4), (8, 5),
+        }
+
+        resolution = sidebar_progress.resolve_completed_ship_cells_by_anchors(
+            wreck_candidates,
+            anchors,
+            completed_lengths=(5, 3),
+            grid_size=10,
+            fallback_to_global=False,
+        )
+        self.assertEqual(
+            {cell for placement in resolution.placements for cell in placement},
+            expected_ships,
+        )
+
+        strategy = SubmarineStrategy(10, (2, 2, 3, 4, 5))
+        strategy.restore_confirmed_placements(resolution.placements)
+        states = strategy.get_cell_states()
+        self.assertEqual(
+            {cell for cell in expected_ships if states[cell[0]][cell[1]] == "ship"},
+            expected_ships,
+        )
+        self.assertEqual(
+            [states[row][col] for row, col in sorted(wreck_candidates - expected_ships)],
+            ["miss"] * 3,
+        )
 
     @staticmethod
     def make_sidebar_image(completed_rows=()):

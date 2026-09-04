@@ -998,6 +998,57 @@ class RedScoutAnalyzerTest(unittest.TestCase):
             self.assertTrue(analyzer._detect_hit(image, (140, 100)))
             self.assertTrue(detector.call_args.kwargs["ignore_submarine_marker"])
 
+    def test_before_visible_unions_static_wrecks_missed_by_dynamic_detector(self):
+        analyzer = red_scout_module.RedScoutAnalyzer()
+        analyzer._marker_points = ((100, 100), (140, 100), (100, 140), (140, 140))
+        analyzer._marker_grid_size = 2
+        analyzer._hit_detector = red_scout_module._default_hit_detector
+        before = np.zeros((180, 180, 3), dtype=np.uint8)
+        candidates = {(0, 0), (0, 1)}
+
+        with (
+            patch.object(
+                red_scout_module,
+                "detect_visible_wreck_cells",
+                return_value={(0, 1), (1, 1)},
+            ) as static_detector,
+            patch.object(analyzer, "_detect_hit", return_value=False) as dynamic_detector,
+        ):
+            visible = analyzer._before_visible_hit_cells(
+                before_image=before,
+                points_by_cell={(0, 0): (100, 100), (0, 1): (140, 100)},
+                candidates=candidates,
+            )
+
+        self.assertEqual(visible, {(0, 1)})
+        static_detector.assert_called_once_with(
+            before,
+            list(analyzer._marker_points),
+            2,
+        )
+        dynamic_detector.assert_called_once_with(before, (100, 100))
+
+    def test_custom_hit_detector_does_not_invoke_static_wreck_detector(self):
+        analyzer = self._analyzer(
+            classifier=lambda *_args: None,
+            hit_detector=lambda _image, point: point == (1, 1),
+        )
+        analyzer._marker_points = ((0, 0), (1, 1), (2, 2), (3, 3))
+        analyzer._marker_grid_size = 2
+
+        with patch.object(
+            red_scout_module,
+            "detect_visible_wreck_cells",
+        ) as static_detector:
+            visible = analyzer._before_visible_hit_cells(
+                before_image=np.zeros((8, 8, 3), dtype=np.uint8),
+                points_by_cell={(0, 0): (0, 0), (0, 1): (1, 1)},
+                candidates={(0, 0), (0, 1)},
+            )
+
+        self.assertEqual(visible, {(0, 1)})
+        static_detector.assert_not_called()
+
     def test_change_prefilter_keeps_shifted_candidate_and_rejects_clean_cell(self):
         before = np.zeros((200, 240, 3), dtype=np.uint8)
         after = before.copy()

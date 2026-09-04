@@ -299,6 +299,16 @@ Remove-Item Env:BBMA_RED_SCOUT_COUNT -ErrorAction SilentlyContinue
 
 完整潜艇会立即屏蔽周围安全区。无法从当前画面恢复的历史未命中格会保留为“未探测”，因此中途启动时仍可能再次检查这些位置。默认控制台不会跨账号读取历史投弹记录。
 
+#### 残骸样本回放
+
+`残骸识图` 目录中的完整棋盘截图可以用下面的命令批量回放并生成候选残骸模板：
+
+```powershell
+.venv\Scripts\python.exe tools\train_wreck_images.py --root "残骸识图"
+```
+
+该工具会读取每张图的关卡和校准点，只使用静态识别与局部模板识别同时确认的格子生成样本，并把模板写入 `template/generated_wreck/`，用于局部残骸候选识别；报告保存在 `outputs/wreck_template_training.json`。完整截图没有逐格真值时，工具不能证明每个空格都不是残骸，新增样本仍应人工核对后再调整阈值。
+
 ### 目标优先级
 
 普通策略选择下一格的优先级大致为：
