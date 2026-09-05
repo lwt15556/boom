@@ -85,6 +85,7 @@ class LatestLShapeRuleTest(unittest.TestCase):
         initial_completed_visual_hits=None,
         initial_authoritative_completed_visual_hits=None,
         initial_authoritative_completed_placements=None,
+        initial_lock_completed_placements=False,
         affected_cells=None,
         center=(2, 2),
         level=1,
@@ -144,6 +145,7 @@ class LatestLShapeRuleTest(unittest.TestCase):
                     if initial_authoritative_completed_placements is not None
                     else None
                 ),
+                initial_lock_completed_placements=initial_lock_completed_placements,
             )
         self.assertTrue(completed)
         return online_hit, scan, write_status
@@ -286,6 +288,32 @@ class LatestLShapeRuleTest(unittest.TestCase):
 
         self.assertNotIn(upper, scan.call_args.kwargs["initial_hits"])
         self.assertIn(upper, scan.call_args.kwargs["initial_misses"])
+
+    def test_startup_locked_placement_survives_neighbor_noise(self):
+        """A startup-confirmed hull must survive a noisy perimeter hit."""
+        ship = tuple((row, 8) for row in range(5))
+        noise = (1, 7)
+        placement = self.main.Placement(length=5, direction="V", cells=ship)
+
+        _online_hit, scan, _write_status = self._run_red_case(
+            initial_hits=set(ship) | {noise},
+            result_hits=set(),
+            affected_cells=set(),
+            submarines=(5,),
+            initial_completed_visual_hits=set(ship),
+            initial_authoritative_completed_visual_hits=set(ship),
+            initial_authoritative_completed_placements=(placement,),
+            initial_lock_completed_placements=True,
+            level=13,
+            grid_size=10,
+        )
+
+        self.assertEqual(scan.call_args.kwargs["initial_hits"], set(ship))
+        self.assertIn(noise, scan.call_args.kwargs["initial_misses"])
+        self.assertEqual(
+            scan.call_args.kwargs["initial_authoritative_completed_placements"],
+            (placement,),
+        )
 
     def test_2x2_l_clears_visual_upper_when_lower_cell_is_already_hit(self):
         """Both upper-pair orientations must clear a visual flag cell.

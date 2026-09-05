@@ -10,6 +10,7 @@ import numpy as np
 
 from config import ADB_EXE, ADB_SERIAL, DEFAULT_SCREENSHOT_NAME, SCREENSHOT_DIR
 from utils.logger import get_logger
+from utils.image_io import read_image_compat
 
 
 logger = get_logger(__name__)
@@ -247,7 +248,7 @@ class AdbController:
         remote_path = "/sdcard/_bbma_screen.png"
         self._run(["shell", "screencap", "-p", remote_path])
         self._run(["pull", remote_path, str(path)])
-        screen = cv2.imread(str(path))
+        screen = read_image_compat(path)
         if screen is None:
             logger.error("截图读取失败: %s", path)
             raise RuntimeError(f"failed to read screenshot: {path}")

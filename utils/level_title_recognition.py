@@ -7,6 +7,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from utils.image_io import read_image_compat
+
 
 @dataclass(frozen=True)
 class LevelTitleRecognitionResult:
@@ -97,7 +99,7 @@ def _load_single_digit_templates(reference_dir_text: str) -> tuple[tuple[str, np
     reference_dir = Path(reference_dir_text)
     for number in range(1, 11):
         reference_path = reference_dir / f"{number}.png"
-        reference = cv2.imread(str(reference_path), cv2.IMREAD_COLOR)
+        reference = read_image_compat(reference_path, cv2.IMREAD_COLOR)
         if reference is None:
             continue
         components = _extract_leading_digit_masks(_prepare_title_roi(reference))

@@ -9,6 +9,8 @@ from typing import Sequence
 import cv2
 import numpy as np
 
+from utils.image_io import read_image_compat
+
 
 REFERENCE_WIDTH = 1280
 REFERENCE_HEIGHT = 720
@@ -183,7 +185,7 @@ def detect_partial_wreck_cells(
 
     prepared_templates: list[np.ndarray] = []
     for template_path in template_paths:
-        template = cv2.imread(str(template_path))
+        template = read_image_compat(template_path)
         if template is None:
             continue
         for scale in PARTIAL_WRECK_SCALES:

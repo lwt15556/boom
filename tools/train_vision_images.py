@@ -26,6 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from config import LEVEL_GRID_SIZES, SPECIAL_SUBMARINES, SUBMARINES
 from save_points.points import read_saved_points
 from utils.level_title_recognition import recognize_level_title
+from utils.image_io import read_image_compat
 from utils.sidebar_progress import (
     detect_partial_wreck_cells,
     detect_sidebar_progress,
@@ -151,7 +152,7 @@ def _recognize_level(image: Any, path: Path, fallback_level: int | None) -> tupl
 
 
 def _analyse(path: Path, fallback_level: int | None = None) -> dict[str, Any]:
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    image = read_image_compat(path, cv2.IMREAD_COLOR)
     if image is None:
         return {"file": path.name, "error": "invalid_image"}
 
@@ -302,10 +303,11 @@ def main() -> int:
         "after_1.png": 22,
         "debug_quit1_retry_1.png": 10,
     }
-    samples = [
-        _analyse(path, fallback_levels.get(path.name))
-        for path in sorted(root.glob("*.png"))
-    ]
+    paths = sorted(root.glob("*.png"))
+    samples = []
+    for index, path in enumerate(paths, start=1):
+        print(f"[vision-training] {index}/{len(paths)} {path.name}", file=sys.stderr, flush=True)
+        samples.append(_analyse(path, fallback_levels.get(path.name)))
     resolved_samples = [
         sample
         for sample in samples

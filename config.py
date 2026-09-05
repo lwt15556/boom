@@ -4,6 +4,7 @@ from typing import Final
 # Base 路径，指向项目根目录
 BASE_DIR = Path(__file__).resolve().parent
 RED_SCOUT_MAX_COUNT = 50
+RED_SCOUT_DEFAULT_COUNT: Final[int] = 20
 
 # ADB 连接的默认设备 IP 地址
 ADB_SERIAL = "127.0.0.1:5555"

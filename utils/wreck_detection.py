@@ -10,6 +10,7 @@ import numpy as np
 from config import TEMPLATE_DIR
 from utils.diamond_hit import DiamondHitConfig, classify_diamond_hit, make_diamond_mask
 from utils.image_match import find_template_multi_scale
+from utils.image_io import read_image_compat
 from utils.submarine_strategy import Cell
 
 SUBMARINE_HIT_WRECK_TEMPLATE = TEMPLATE_DIR / "submarine_hit_wreck.png"
@@ -590,7 +591,7 @@ def _red_submarine_component_bounds() -> tuple[int, int, int]:
     widths: list[int] = []
     heights: list[int] = []
     for path in RED_SUBMARINE_COMPONENT_TEMPLATES:
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        image = read_image_compat(path, cv2.IMREAD_COLOR)
         if image is None:
             continue
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -622,7 +623,7 @@ def _red_submarine_component_bounds() -> tuple[int, int, int]:
 def _load_masked_wreck_templates() -> tuple[tuple[np.ndarray, np.ndarray], ...]:
     prepared: list[tuple[np.ndarray, np.ndarray]] = []
     for path in (SUBMARINE_HIT_WRECK_TEMPLATE, *VISIBLE_WRECK_TEMPLATES):
-        template = cv2.imread(str(path))
+        template = read_image_compat(path)
         if template is None:
             continue
 
@@ -992,6 +993,46 @@ def detect_red_submarine_marker_cells(
     )
 
 
+def _title_flag_l_hull_pairs(
+    body_scores: dict[Cell, float],
+    anchors: set[Cell],
+    grid_size: int,
+) -> dict[Cell, frozenset[Cell]]:
+    """Resolve a title-overlapping flag corner before straight-run ranking."""
+    pairs: dict[Cell, frozenset[Cell]] = {}
+    for anchor in anchors:
+        if not is_title_occluded_cell(anchor, grid_size) or anchor not in body_scores:
+            continue
+        row, col = anchor
+        options: set[frozenset[Cell]] = set()
+        for offset in (-1, 1):
+            for pair, empty_corner in (
+                (((row, col + offset), (row + 1, col + offset)), (row + 1, col)),
+                (((row + 1, col), (row + 1, col + offset)), (row, col + offset)),
+            ):
+                if empty_corner in body_scores:
+                    continue
+                if all(
+                    body_scores.get(cell, 0.0) >= COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE
+                    for cell in pair
+                ):
+                    first, last = sorted(pair)
+                    dr, dc = last[0] - first[0], last[1] - first[1]
+                    extensions = (
+                        (first[0] - dr, first[1] - dc),
+                        (last[0] + dr, last[1] + dc),
+                    )
+                    if any(
+                        body_scores.get(cell, 0.0) >= COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE
+                        for cell in extensions
+                    ):
+                        continue
+                    options.add(frozenset(pair))
+        if len(options) == 1:
+            pairs[anchor] = next(iter(options))
+    return pairs
+
+
 def detect_completed_submarine_candidate_cells(
     screenshot: np.ndarray,
     click_points: list[tuple[int, int]],
@@ -1068,6 +1109,19 @@ def detect_completed_submarine_candidate_cells(
     if not candidates:
         return set()
 
+    # The title clips the upper flag tile to a small, bright fragment. Its
+    # score can beat the actual lower hull, so correct the raw three-cell L
+    # before either the local run selector or global resolver drops a corner.
+    flag_pairs = _title_flag_l_hull_pairs(body_scores, anchors, grid_size)
+    corrected_hull = {cell for pair in flag_pairs.values() for cell in pair}
+    flag_perimeter = {
+        (row + dr, col + dc)
+        for row, col in corrected_hull
+        for dr in (-1, 0, 1)
+        for dc in (-1, 0, 1)
+    } - corrected_hull
+    candidates.difference_update(flag_perimeter)
+
     if preserve_alternatives:
         # The caller is about to run the strict global fleet resolver. Keep
         # all nearby body candidates so a local red-marker run cannot hide the
@@ -1082,8 +1136,12 @@ def detect_completed_submarine_candidate_cells(
     # contiguous straight run supported by the body scores.  The marker is
     # allowed to sit beside the hull, so the run only needs to pass within one
     # cell of the marker rather than include the marker cell itself.
-    selected: set[Cell] = set()
+    selected: set[Cell] = set(corrected_hull)
+    # Keep another marker's longer run from absorbing this corrected pair.
+    candidates.difference_update(corrected_hull)
     for anchor in anchors:
+        if anchor in flag_pairs:
+            continue
         best_key: tuple[float, float, int, int, tuple[Cell, ...]] | None = None
         for orientation in ("H", "V"):
             for length in range(2, grid_size + 1):

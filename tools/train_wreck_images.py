@@ -33,6 +33,7 @@ from save_points.points import read_saved_points
 from utils.level_title_recognition import recognize_level_title
 from utils.sidebar_progress import detect_partial_wreck_cells
 from utils.wreck_detection import PARTIAL_WRECK_TEMPLATES, VISIBLE_WRECK_TEMPLATES, detect_visible_wreck_cells
+from utils.image_io import write_image_compat
 
 
 def _recognize_level(image: np.ndarray) -> int | None:
@@ -134,7 +135,8 @@ def build(root: Path, output_dir: Path, max_templates: int = 24) -> dict[str, An
     # directory when launched through PowerShell's legacy code page.  Glob
     # resolves the same directory through the Windows file API reliably.
     paths = sorted(root.glob("*.png")) + sorted(root.glob("*.jpg")) + sorted(root.glob("*.jpeg"))
-    for path in paths:
+    for index, path in enumerate(paths, start=1):
+        print(f"[wreck-training] {index}/{len(paths)} {path.name}", file=sys.stderr, flush=True)
         if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
             continue
         image = _read_image(path)
@@ -163,7 +165,7 @@ def build(root: Path, output_dir: Path, max_templates: int = 24) -> dict[str, An
     generated = []
     for index, (_signature_value, crop) in enumerate(selected, start=1):
         path = output_dir / f"visible_wreck_generated_{index:02d}.png"
-        cv2.imwrite(str(path), crop)
+        write_image_compat(path, crop)
         generated.append(path.name)
     report = {
         "root": str(root),

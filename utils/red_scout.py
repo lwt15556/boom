@@ -13,7 +13,7 @@ from types import MappingProxyType
 import cv2
 import numpy as np
 
-from config import RED_SCOUT_MAX_COUNT, TEMPLATE_DIR
+from config import RED_SCOUT_DEFAULT_COUNT, RED_SCOUT_MAX_COUNT, TEMPLATE_DIR
 from utils.diamond_hit import DiamondHitConfig, classify_diamond_hit, make_diamond_mask
 from utils.image_match import MatchResult, find_template_multi_scale
 from utils.sidebar_progress import (
@@ -289,7 +289,7 @@ class ProbeMode(str, Enum):
 @dataclass(frozen=True)
 class RedScoutSettings:
     mode: ProbeMode = ProbeMode.BLUE_ONLY
-    count: int = 2
+    count: int = RED_SCOUT_DEFAULT_COUNT
 
 
 @dataclass(frozen=True)
@@ -348,13 +348,15 @@ def load_red_scout_settings(
     except ValueError:
         return RedScoutSettings()
 
-    raw_count = str(values.get("BBMA_RED_SCOUT_COUNT", "2")).strip()
+    raw_count = str(
+        values.get("BBMA_RED_SCOUT_COUNT", str(RED_SCOUT_DEFAULT_COUNT))
+    ).strip()
     try:
         count = int(raw_count)
     except ValueError:
-        count = 2
+        count = RED_SCOUT_DEFAULT_COUNT
     if not 1 <= count <= RED_SCOUT_MAX_COUNT:
-        count = 2
+        count = RED_SCOUT_DEFAULT_COUNT
     return RedScoutSettings(mode=mode, count=count)
 
 

@@ -23,6 +23,7 @@ from tools.control_panel import (
 class ControlPanelHelperTest(unittest.TestCase):
     def test_control_panel_version_is_defined(self):
         self.assertRegex(control_panel.APP_VERSION, r"^\d+\.\d+\.\d+$")
+        self.assertEqual(control_panel.APP_VERSION, "1.0.2")
 
     def test_build_main_environment_configures_red_scout(self):
         environment = build_main_environment("red_scout", 3)
@@ -33,6 +34,11 @@ class ControlPanelHelperTest(unittest.TestCase):
         environment = build_main_environment("red_scout", 80)
 
         self.assertEqual(environment["BBMA_RED_SCOUT_COUNT"], "50")
+
+    def test_build_main_environment_defaults_invalid_count_to_twenty(self):
+        environment = build_main_environment("red_scout", "invalid")
+
+        self.assertEqual(environment["BBMA_RED_SCOUT_COUNT"], "20")
 
     def test_probe_mode_formatter_has_fallback(self):
         self.assertEqual(format_probe_mode("blue_only"), "仅蓝色炮弹")

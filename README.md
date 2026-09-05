@@ -252,7 +252,7 @@ powershell -ExecutionPolicy Bypass -File .\run_control_panel.ps1
 
 ```powershell
 $env:BBMA_PROBE_MODE = "red_scout"
-$env:BBMA_RED_SCOUT_COUNT = "2"
+$env:BBMA_RED_SCOUT_COUNT = "20"
 .\.venv\Scripts\python.exe main.py
 ```
 
