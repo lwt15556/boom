@@ -57,7 +57,14 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from config import ADB_EXE, ADB_SERIAL, GAME_PACKAGE_NAME, LOG_FILE, RED_SCOUT_MAX_COUNT
+from config import (
+    ADB_EXE,
+    ADB_SERIAL,
+    GAME_PACKAGE_NAME,
+    LOG_FILE,
+    RED_SCOUT_DEFAULT_COUNT,
+    RED_SCOUT_MAX_COUNT,
+)
 from utils.adb_control import AdbController
 from utils.pending_probe import clear_pending_probe, has_pending_probe
 from utils.progress import format_elapsed
@@ -70,7 +77,7 @@ RUN_STDOUT = PROJECT_ROOT / "run_stdout.log"
 RUN_STDERR = PROJECT_ROOT / "run_stderr.log"
 STATUS_FILE = PROJECT_ROOT / "_debug" / "runtime" / "status.json"
 PANEL_LOCK_FILE = PROJECT_ROOT / "_debug" / "runtime" / "control_panel.lock"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 NETWORK_BLOCK_SETTLE_SECONDS = 0.2
 APP_STOP_TIMEOUT_SECONDS = 5.0
@@ -221,7 +228,7 @@ def build_main_environment(mode: object, red_count: object) -> dict[str, str]:
     try:
         count = int(red_count)
     except (TypeError, ValueError):
-        count = 2
+        count = RED_SCOUT_DEFAULT_COUNT
     return {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "BBMA_PROBE_MODE": normalized, "BBMA_RED_SCOUT_COUNT": str(max(1, min(RED_SCOUT_MAX_COUNT, count)))}
 
 
@@ -793,7 +800,7 @@ class ControlPanel(QMainWindow):
             self.probe_mode_combo.addItem(label, value)
         self.red_scout_count = QSpinBox()
         self.red_scout_count.setRange(1, RED_SCOUT_MAX_COUNT)
-        self.red_scout_count.setValue(2)
+        self.red_scout_count.setValue(RED_SCOUT_DEFAULT_COUNT)
         self.red_scout_count.setSuffix(" 次/关")
         self.probe_mode_value = QLabel("--")
         self.red_scout_progress_value = QLabel("--")

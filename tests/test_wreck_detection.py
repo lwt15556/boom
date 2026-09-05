@@ -9,6 +9,7 @@ from config import LEVEL_GRID_SIZES
 from save_points.points import read_saved_points
 from utils.wreck_detection import (
     COMPLETED_SHIP_BODY_MIN_SCORE,
+    _title_flag_l_hull_pairs,
     completed_ship_body_score,
     detect_completed_submarine_candidate_cells,
     detect_red_submarine_marker_cells,
@@ -24,6 +25,35 @@ from utils.red_scout import _default_hit_detector
 
 
 class WreckDetectionTest(unittest.TestCase):
+    def test_title_flag_l_is_corrected_before_selecting_a_straight_hull(self):
+        crop = cv2.imread(str(Path(__file__).parent / "fixtures" / "level15_top_submarine.png"))
+        self.assertIsNotNone(crop)
+        frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+        frame[82:162, 655:775] = crop
+        points = read_saved_points(15, expected_n=10)
+
+        # Preserve the raw L until its raised corner has been removed.
+        for preserve_alternatives in (False, True):
+            with self.subTest(preserve_alternatives=preserve_alternatives):
+                cells = detect_completed_submarine_candidate_cells(
+                    frame, points, 10,
+                    preserve_alternatives=preserve_alternatives,
+                )
+                self.assertEqual(cells, {(0, 2), (1, 2)})
+
+    def test_title_flag_l_requires_an_unambiguous_marked_two_cell_hull(self):
+        scores = {(0, 1): 0.68, (0, 2): 0.49, (1, 2): 0.45}
+        for candidate_scores, anchors in (
+            (scores, set()),
+            (scores, {(0, 2)}),
+            (scores | {(1, 1): 0.4}, {(0, 1)}),
+            (scores | {(1, 2): 0.31}, {(0, 1)}),
+            (scores | {(2, 2): 0.5}, {(0, 1)}),
+            (scores | {(0, 0): 0.5, (1, 0): 0.5}, {(0, 1)}),
+        ):
+            with self.subTest(scores=candidate_scores, anchors=anchors):
+                self.assertEqual(_title_flag_l_hull_pairs(candidate_scores, anchors, 10), {})
+
     def test_title_occlusion_is_limited_to_fixed_cells_on_10x10_board(self):
         self.assertTrue(is_title_occluded_cell((0, 0), 10))
         self.assertTrue(is_title_occluded_cell((1, 1), 10))

@@ -246,7 +246,7 @@ class RedScoutSettingsTest(unittest.TestCase):
         settings = load_red_scout_settings({})
 
         self.assertEqual(settings.mode, ProbeMode.BLUE_ONLY)
-        self.assertEqual(settings.count, 2)
+        self.assertEqual(settings.count, 20)
 
     def test_reads_red_mode_and_configurable_count(self):
         settings = load_red_scout_settings(
@@ -264,10 +264,10 @@ class RedScoutSettingsTest(unittest.TestCase):
             ("1", 1),
             ("10", 10),
             ("50", 50),
-            ("0", 2),
-            ("51", 2),
-            ("", 2),
-            ("invalid", 2),
+            ("0", 20),
+            ("51", 20),
+            ("", 20),
+            ("invalid", 20),
         )
 
         for raw_count, expected_count in cases:
@@ -305,7 +305,7 @@ class RedScoutSettingsTest(unittest.TestCase):
         )
 
         self.assertEqual(settings.mode, ProbeMode.BLUE_ONLY)
-        self.assertEqual(settings.count, 2)
+        self.assertEqual(settings.count, 20)
 
 
 class RedScoutAnalyzerTest(unittest.TestCase):

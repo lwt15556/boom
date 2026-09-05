@@ -5,6 +5,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from utils.image_io import read_image_compat, write_image_compat
+
 
 @dataclass
 class GridDetection:
@@ -86,8 +88,7 @@ def detect_diamond_centers(
 
 def read_image(path: str | Path) -> np.ndarray:
     """读取图片文件，兼容中文路径。"""
-    data = np.fromfile(str(path), dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    img = read_image_compat(path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"无法读取图片：{path}")
     return img
@@ -95,12 +96,8 @@ def read_image(path: str | Path) -> np.ndarray:
 
 def write_image(path: str | Path, img: np.ndarray) -> None:
     """保存图片文件，兼容中文路径。"""
-    path = Path(path)
-    suffix = path.suffix or ".png"
-    ok, buf = cv2.imencode(suffix, img)
-    if not ok:
+    if not write_image_compat(path, img):
         raise RuntimeError(f"无法保存图片：{path}")
-    buf.tofile(str(path))
 
 
 def parse_roi(text: str | None) -> tuple[int, int, int, int] | None:

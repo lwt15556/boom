@@ -11,6 +11,7 @@ from config import (
     DEFAULT_TEMPLATE_SHAPE_POWER,
     DEFAULT_TEMPLATE_SHAPE_WEIGHT,
 )
+from utils.image_io import read_image_compat
 
 
 @dataclass(frozen=True)
@@ -123,7 +124,11 @@ def _match_prepared_template(
 
 @lru_cache(maxsize=64)
 def _read_template(path: Path):
-    raw_template = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    raw_template = read_image_compat(
+        path,
+        cv2.IMREAD_UNCHANGED,
+        cv2_module=cv2,
+    )
     if raw_template is None:
         raise FileNotFoundError(f"unable to read template: {path}")
 

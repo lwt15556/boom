@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 import cv2
 import numpy as np
 
+from utils.image_io import write_image_compat
+
 
 Point = tuple[int, int]
 
@@ -30,6 +32,8 @@ class DiamondHitConfig:
     min_component_ratio: float = 0.026
     min_s_drop: float = 8.0
     min_edge_density: float = 0.014
+    lab_delta_threshold: float = 24.0
+    min_lab_color_change_excess: float = 0.035
     hit_score_threshold: float = 0.58
     wreck_marker_changed_ratio: float = 0.10
     wreck_marker_center_gray_ratio: float = 0.10
@@ -62,6 +66,8 @@ class DiamondHitResult:
     s_ring: float
     s_drop: float
     edge_density: float
+    lab_color_change_ratio: float
+    lab_color_change_excess: float
 
 
 def is_diamond_hit(
@@ -164,6 +170,17 @@ def classify_diamond_hit(
     s_ring = mean_in_mask(s_after, ring_mask)
     s_drop = s_ring - s_center
 
+    # Lab distance keeps chromatic changes that grayscale comparison suppresses.
+    # Comparing the target center with its immediate ring rejects board-wide
+    # color shifts such as water animation or exposure changes.
+    before_lab = cv2.cvtColor(before_crop, cv2.COLOR_BGR2LAB).astype(np.int16)
+    after_lab = cv2.cvtColor(after_crop, cv2.COLOR_BGR2LAB).astype(np.int16)
+    lab_delta = np.linalg.norm(after_lab - before_lab, axis=2)
+    lab_changed_mask = (lab_delta >= config.lab_delta_threshold).astype(np.uint8) * 255
+    lab_color_change_ratio = ratio_in_mask(lab_changed_mask, center_mask)
+    lab_ring_change_ratio = ratio_in_mask(lab_changed_mask, ring_mask)
+    lab_color_change_excess = lab_color_change_ratio - lab_ring_change_ratio
+
     blur = cv2.GaussianBlur(after_gray, (3, 3), 0)
     edges = cv2.Canny(blur, 35, 90)
     center_edges = cv2.bitwise_and(edges, edges, mask=center_mask)
@@ -175,6 +192,11 @@ def classify_diamond_hit(
     score += score_piece(component_ratio, config.min_component_ratio, 0.25)
     score += score_piece(max(0.0, s_drop), config.min_s_drop, 0.15)
     score += score_piece(edge_density, config.min_edge_density, 0.10)
+    score += score_piece(
+        max(0.0, lab_color_change_excess),
+        config.min_lab_color_change_excess,
+        0.12,
+    )
     score = max(0.0, min(1.0, score))
 
     wreck_marker_visible = passes_wreck_marker_gates(
@@ -228,7 +250,9 @@ def classify_diamond_hit(
                 f"ex={gray_excess:.3f} "
                 f"comp={component_ratio:.3f} "
                 f"sdrop={s_drop:.1f} "
-                f"edge={edge_density:.3f}"
+                f"edge={edge_density:.3f} "
+                f"lab={lab_color_change_ratio:.3f} "
+                f"labex={lab_color_change_excess:.3f}"
             ),
             config=config,
             index=index,
@@ -249,6 +273,8 @@ def classify_diamond_hit(
         s_ring=s_ring,
         s_drop=s_drop,
         edge_density=edge_density,
+        lab_color_change_ratio=lab_color_change_ratio,
+        lab_color_change_excess=lab_color_change_excess,
     )
 
 
@@ -559,12 +585,12 @@ def save_debug_images(
     diff_norm = cv2.normalize(diff_gray, None, 0, 255, cv2.NORM_MINMAX)
     diff_color = cv2.applyColorMap(diff_norm.astype(np.uint8), cv2.COLORMAP_JET)
 
-    cv2.imwrite(os.path.join(config.debug_dir, f"{index:02d}_before_crop.png"), before_crop)
-    cv2.imwrite(os.path.join(config.debug_dir, f"{index:02d}_after_overlay.png"), vis)
-    cv2.imwrite(os.path.join(config.debug_dir, f"{index:02d}_diff.png"), diff_color)
-    cv2.imwrite(os.path.join(config.debug_dir, f"{index:02d}_gray_candidate.png"), gray_candidate)
-    cv2.imwrite(os.path.join(config.debug_dir, f"{index:02d}_center_mask.png"), center_mask)
-    cv2.imwrite(os.path.join(config.debug_dir, f"{index:02d}_ring_mask.png"), ring_mask)
+    write_image_compat(os.path.join(config.debug_dir, f"{index:02d}_before_crop.png"), before_crop)
+    write_image_compat(os.path.join(config.debug_dir, f"{index:02d}_after_overlay.png"), vis)
+    write_image_compat(os.path.join(config.debug_dir, f"{index:02d}_diff.png"), diff_color)
+    write_image_compat(os.path.join(config.debug_dir, f"{index:02d}_gray_candidate.png"), gray_candidate)
+    write_image_compat(os.path.join(config.debug_dir, f"{index:02d}_center_mask.png"), center_mask)
+    write_image_compat(os.path.join(config.debug_dir, f"{index:02d}_ring_mask.png"), ring_mask)
 
 
 def classify_diamond_pair(
