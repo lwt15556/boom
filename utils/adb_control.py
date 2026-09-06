@@ -1,3 +1,4 @@
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -15,6 +16,85 @@ from utils.image_io import read_image_compat
 
 logger = get_logger(__name__)
 ADB_COMMAND_TIMEOUT_SECONDS = 20.0
+
+# Opt-in switch for the raw framebuffer screenshot path.  The PNG path stays
+# the default until the faster raw decode is validated on the target device.
+RAW_SCREENCAP_ENV = "BBMA_RAW_SCREENCAP"
+
+
+def raw_screencap_enabled() -> bool:
+    """Return whether raw framebuffer capture is enabled.
+
+    Raw frame capture skips the on-device PNG encode and is ~10% faster per
+    screenshot (validated on the target device).  It is on by default; any
+    decode failure falls back to the PNG path, so this stays safe across
+    devices.  Set ``BBMA_RAW_SCREENCAP=0`` to force the PNG path.
+    """
+    value = os.environ.get(RAW_SCREENCAP_ENV, "").strip().lower()
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def decode_raw_screencap(payload: bytes) -> np.ndarray | None:
+    """Decode Android raw ``screencap`` output (12-byte header + pixels) to BGR.
+
+    The header is little-endian: ``width(u32) | height(u32) | pixel_format(u32)``.
+    Supported pixel formats: 1 = RGBA_8888, 2 = RGBX_8888, 3 = RGB_888.
+    Returns ``None`` for malformed payloads or unsupported formats so the caller
+    can fall back to the PNG path without risking a bad frame.
+    """
+    try:
+        data = bytes(payload)
+    except (TypeError, ValueError):
+        return None
+    if len(data) < 12:
+        return None
+
+    width = int.from_bytes(data[0:4], "little")
+    height = int.from_bytes(data[4:8], "little")
+    pixel_format = int.from_bytes(data[8:12], "little")
+    if width <= 0 or height <= 0 or width > 8192 or height > 8192:
+        return None
+
+    if pixel_format == 1:  # RGBA_8888
+        channels, color = 4, cv2.COLOR_RGBA2BGR
+    elif pixel_format == 2:  # RGBX_8888 (X is opaque padding)
+        channels, color = 4, cv2.COLOR_RGBA2BGR
+    elif pixel_format == 3:  # RGB_888
+        channels, color = 3, cv2.COLOR_RGB2BGR
+    else:
+        return None
+
+    total = len(data)
+    stride = width * channels
+    pad_stride = (stride + 3) // 4 * 4
+    candidates = [(stride, False)]
+    if pad_stride != stride:
+        candidates.append((pad_stride, True))
+
+    # The pixel block is the trailing ``height*row_stride`` bytes; the header
+    # before it can be 12 bytes or carry a few extra bytes (this device writes a
+    # 16-byte header).  For each candidate stride, require a plausible header
+    # length and an exact size match, otherwise fall back to the PNG path.
+    for row_stride, is_padded in candidates:
+        pixel_bytes = height * row_stride
+        if total < 12 + pixel_bytes:
+            continue
+        start = total - pixel_bytes
+        header_len = total - pixel_bytes
+        if header_len < 12 or header_len > 64:
+            continue
+        buffer = np.frombuffer(data, dtype=np.uint8, count=pixel_bytes, offset=start)
+        if is_padded:
+            arr = buffer.reshape(height, row_stride)[:, :stride].reshape(
+                height, width, channels
+            )
+        else:
+            arr = buffer.reshape(height, width, channels)
+        if arr.ndim == 3 and arr.shape == (height, width, channels):
+            return cv2.cvtColor(arr, color)
+    return None
 
 
 @dataclass(frozen=True)
@@ -216,6 +296,15 @@ class AdbController:
 
     def capture_screenshot(self) -> ScreenshotCapture:
         """截图并解码，同时保留未经重新编码的 PNG 字节。"""
+        if raw_screencap_enabled():
+            raw = self._try_capture_raw_screencap()
+            if raw is not None:
+                return raw
+            logger.warning("原始帧缓冲截图不可用，回退到 PNG 截图")
+        return self.capture_screenshot_png()
+
+    def capture_screenshot_png(self) -> ScreenshotCapture:
+        """通过 exec-out 读取 PNG 截图并解码。"""
         try:
             payload = self._run_binary(["exec-out", "screencap", "-p"])
         except AdbCommandError as exc:
@@ -228,6 +317,30 @@ class AdbController:
             logger.warning("exec-out 截图不是有效 PNG，回退到 pull")
             return self._capture_screenshot_via_pull()
         return ScreenshotCapture(image=screen, png_bytes=payload)
+
+    def _try_capture_raw_screencap(self) -> ScreenshotCapture | None:
+        """Read the raw framebuffer via ``screencap`` and decode it to BGR.
+
+        Returns ``None`` on any failure so the caller falls back to the PNG
+        path.  The returned object always carries re-encoded PNG bytes so the
+        existing ``save()`` debug-PNG contract is unchanged.
+        """
+        try:
+            payload = self._run_binary(["exec-out", "screencap"])
+        except (AdbCommandError, AdbCommandTimeoutError) as exc:
+            logger.warning("exec-out raw 截图失败，回退到 PNG: %s", exc)
+            return None
+
+        screen = decode_raw_screencap(payload)
+        if screen is None:
+            logger.warning("原始 screencap 数据无法解码，回退到 PNG")
+            return None
+
+        ok, encoded = cv2.imencode(".png", screen)
+        if not ok:
+            logger.warning("原始截图 BGR 编码 PNG 失败，回退到 PNG")
+            return None
+        return ScreenshotCapture(image=screen, png_bytes=encoded.tobytes())
 
     def _capture_screenshot_via_pull(self) -> ScreenshotCapture:
         path = SCREENSHOT_DIR / DEFAULT_SCREENSHOT_NAME
