@@ -186,14 +186,14 @@ VICTORY_WAIT_AFTER_CONFIRMED_INCOMPLETE_SECONDS = 2.0
 VICTORY_WAIT_BEFORE_LEVEL_SECONDS = 3.0
 VICTORY_SKIP_SETTLE_SECONDS = 2.0
 LEVEL_ADVANCE_RETRIES = 3
-HIT_RESULT_FRAME_DELAYS = (1.0, 0.35, 0.45)
+HIT_RESULT_FRAME_DELAYS = (0.8, 0.2, 0.25)
 # A white wreck can exist throughout the short explosion animation even when
 # the request did not open the cell. Delay one extra frame before committing a
 # static-template hit so transient animation cannot become a durable hit.
 STATIC_WRECK_PERSISTENCE_DELAY_SECONDS = 2.0
 # Red scout results only need three frames: misses require three consistent
 # votes, while hits still require at least two votes in the analyzer.
-RED_SCOUT_RESULT_FRAME_DELAYS = (0.55, 0.15, 0.20)
+RED_SCOUT_RESULT_FRAME_DELAYS = (0.50, 0.10, 0.10)
 # A red result is analysed only when at least two result frames survive the
 # transition-frame filter.  Keeping this threshold aligned with the analyzer's
 # vote requirement prevents a single potentially stale frame from becoming a
@@ -206,7 +206,7 @@ INITIAL_SURFACE_BASELINE_FRAME_DELAYS = (0.12, 0.16)
 # Online blue shots already have a confirmed target from the red scout. Keep
 # the same number of evidence frames, but sample the result sooner so the next
 # confirmed target is not delayed by the generic offline-probe timing.
-ONLINE_SCOUT_HIT_FRAME_DELAYS = (0.55, 0.20, 0.28, 0.40)
+ONLINE_SCOUT_HIT_FRAME_DELAYS = (0.50, 0.15, 0.20)
 ONLINE_SCOUT_STABLE_HIT_MIN_FRAMES = 3
 # Once a red-scout batch has established and verified blue mode, subsequent
 # confirmed targets can use a shorter two-frame evidence window. Unstable
@@ -228,14 +228,17 @@ ONLINE_SCOUT_BATCH_ENABLED = True
 # but confirm 10x10 red-scout hits one cell at a time.
 ONLINE_SCOUT_BATCH_MAX_GRID_SIZE = 9
 ONLINE_SCOUT_BATCH_CLICK_INTERVAL_SECONDS = 0.25
-ONLINE_SCOUT_BATCH_FRAME_DELAYS = (0.55, 0.22, 0.32)
+ONLINE_SCOUT_BATCH_FRAME_DELAYS = (0.50, 0.15, 0.20)
 ADAPTIVE_HIT_FRAMES_ENABLED = True
 # Misses are the common case in blue-only strategy scanning.  Once two
 # post-click frames both show a low-score miss with no completion evidence,
 # waiting for the remaining animation frames adds latency without improving
 # the decision.  Hits continue to use the existing multi-frame gate.
 ADAPTIVE_MISS_MIN_FRAMES = 2
-SUSPECT_HIT_EXTRA_FRAME_DELAYS = (0.45, 0.55, 0.65)
+# Suspect-hit extra frames are disabled: the decision now uses only the
+# regular result frames (plus adaptive early stop) to keep capture count and
+# latency low.
+SUSPECT_HIT_EXTRA_FRAME_DELAYS = ()
 MIN_HIT_RESULT_VOTES = 2
 SUSPECT_HIT_SCORE_THRESHOLD = 0.78
 STRONG_SINGLE_HIT_SCORE = 0.90
@@ -280,6 +283,20 @@ ONLINE_SCOUT_BLUE_SELECT_FAST_SETTLE_SECONDS = 0.1
 ONLINE_SCOUT_BLUE_SELECT_RETRY_SECONDS = 0.15
 STATUS_REPLACE_RETRIES = 5
 STATUS_REPLACE_RETRY_SECONDS = 0.05
+# Server-commit confirmation: after a hit restores the network, the committed
+# request must reach the server before the next probe can cut the network again.
+# A blind settle (BLUE_REQUEST_UPLOAD_SETTLE_SECONDS) is not enough, because the
+# upload can be slower.  Instead we wait for a flash of small orange markers in
+# the title/upper-submarine region -- that flash only occurs once the server has
+# accepted the upload.  ROI is measured on the 1280x720 screen.
+SERVER_CONFIRM_ROI = (585, 45, 705, 175)  # x0, y0, x1, y1
+SERVER_CONFIRM_MIN_NEW_MARKERS = 3
+SERVER_CONFIRM_MIN_AREA = 8
+SERVER_CONFIRM_HUE = (10, 35)
+SERVER_CONFIRM_SAT_MIN = 90
+SERVER_CONFIRM_VAL_MIN = 120
+SERVER_CONFIRM_POLL_SECONDS = 0.15
+SERVER_CONFIRM_TIMEOUT_SECONDS = 8.0
 
 ACTIVITY_DETAIL_POINT = (1205, 644)
 ACTIVITY_LIST_SWIPE = (1000, 660, 1000, 180)
@@ -1613,6 +1630,15 @@ def apply_wreck_template_confirmation(
     ):
         return False
 
+    # A real wreck opens toward gray: the local saturation drops (s_drop > 0).
+    # A template match on a cell that did not actually open (non-positive s_drop)
+    # is a nearby marker/submarine, not a hit -- refuse to promote it.
+    try:
+        if float(getattr(result, "s_drop", 0.0)) <= 0.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+
     result.state = "hit"
     result.score = max(float(result.score), 0.94)
     result.confidence = max(float(result.confidence), 0.95)
@@ -1644,6 +1670,20 @@ def apply_completed_submarine_confirmation(
         )
         < COMPLETED_SHIP_BODY_MIN_SCORE
     ):
+        return False
+
+    # The red marker alone is not enough: a surfaced submarine right next to the
+    # probed cell can spill a red marker/hull into this cell's detection region
+    # even on a miss.  Require genuine centre evidence (a coherent gray/white
+    # hull component at the cell centre) before promoting to hit.  This is
+    # deliberately NOT gated on s_drop: a real surfaced-submarine marker is red
+    # and can raise saturation (s_drop <= 0), so centre-evidence is the gate.
+    try:
+        center_gray_ratio = float(getattr(result, "center_gray_ratio", 0.0))
+        component_ratio = float(getattr(result, "component_ratio", 0.0))
+    except (TypeError, ValueError):
+        center_gray_ratio, component_ratio = 0.0, 0.0
+    if not (center_gray_ratio >= 0.10 or component_ratio >= 0.10):
         return False
 
     result.state = "hit"
@@ -1826,11 +1866,33 @@ def enforce_positive_hit_evidence(
     if changed_ratio <= 0.0:
         return False
 
+    # A real hit opens the cell toward a gray wreck: the local saturation drops
+    # (s_drop > 0).  A large changed_ratio with a non-positive s_drop is a moving
+    # flag/marker (e.g. a surfaced-submarine flag crossing the cell), not a cell
+    # opened by a hit.  Never accept that as a hit.
+    try:
+        s_drop = float(getattr(result, "s_drop", 0.0))
+    except (TypeError, ValueError):
+        s_drop = 0.0
+
     if result.state != "hit":
+        if s_drop <= 0.0:
+            result.state = "miss"
+            result.evidence_vetoed = True
+            logger.info(
+                "rejecting visual-change hit with no hit pattern: "
+                "changed_ratio=%.3f s_drop=%.2f wreck=%s sidebar=%s",
+                changed_ratio,
+                s_drop,
+                wreck_hit,
+                sidebar_hit,
+            )
+            return False
         logger.info(
             "accepting blue result as hit from post-click visual change: "
-            "changed_ratio=%.3f wreck=%s sidebar=%s",
+            "changed_ratio=%.3f s_drop=%.2f wreck=%s sidebar=%s",
             changed_ratio,
+            s_drop,
             wreck_hit,
             sidebar_hit,
         )
@@ -6146,9 +6208,16 @@ def _run_red_scout_and_blue_strategy(
         for cell in initial_misses - real_hits - committed_misses:
             state_strategy.report_result(cell, False)
         if scout_hits or scout_misses:
+            # Keep the two sets disjoint (hit evidence wins) so the strategy's
+            # strict no-overlap invariant is never violated by a cell that the
+            # red-scout accumulator recorded as both a hit and a miss.
+            disjoint_hits = scout_hits - real_hits
+            disjoint_misses = (
+                scout_misses - real_hits - committed_misses - disjoint_hits
+            )
             state_strategy.report_scout_results(
-                hits=scout_hits - real_hits,
-                misses=scout_misses - real_hits - committed_misses,
+                hits=disjoint_hits,
+                misses=disjoint_misses,
             )
         completed_lengths = (
             online_sidebar_completed_lengths
@@ -9637,6 +9706,65 @@ def _discard_pending_request_and_prepare_next_probe(
     return level_complete
 
 
+def _server_confirm_marker_count(image: np.ndarray) -> int:
+    """Count small orange marker components inside the server-confirm ROI.
+
+    The commit-confirmation markers are tiny gold/orange blobs that flash in the
+    title/upper-submarine region only once the server has accepted the upload.
+    Returns 0 for invalid frames or empty ROIs.
+    """
+    if not isinstance(image, np.ndarray) or image.ndim < 2:
+        return 0
+    height, width = image.shape[:2]
+    x0, y0, x1, y1 = SERVER_CONFIRM_ROI
+    left = max(0, min(width, int(x0)))
+    top = max(0, min(height, int(y0)))
+    right = min(width, max(left, int(x1)))
+    bottom = min(height, max(top, int(y1)))
+    if right <= left or bottom <= top:
+        return 0
+    roi = image[top:bottom, left:right]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hue_lo, hue_hi = SERVER_CONFIRM_HUE
+    mask = (
+        (hsv[..., 0] >= hue_lo)
+        & (hsv[..., 0] <= hue_hi)
+        & (hsv[..., 1] >= SERVER_CONFIRM_SAT_MIN)
+        & (hsv[..., 2] >= SERVER_CONFIRM_VAL_MIN)
+    ).astype(np.uint8)
+    num, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    count = 0
+    for index in range(1, num):
+        if stats[index, cv2.CC_STAT_AREA] >= SERVER_CONFIRM_MIN_AREA:
+            count += 1
+    return count
+
+
+def wait_until_server_commit_confirmed(
+    baseline_count: int,
+    *,
+    timeout: float = SERVER_CONFIRM_TIMEOUT_SECONDS,
+) -> tuple[bool, int]:
+    """Wait until a flash of commit-confirmation markers appears in the ROI.
+
+    A few baseline markers may already be present from earlier uploads, so
+    confirmation requires the observed count to rise by
+    ``SERVER_CONFIRM_MIN_NEW_MARKERS`` above ``baseline_count``.  Returns
+    ``(confirmed, peak_count)``; ``confirmed`` is False on timeout.
+    """
+    deadline = monotonic() + max(0.0, float(timeout))
+    peak_count = baseline_count
+    while monotonic() < deadline:
+        image = adb.read_screenshot()
+        count = _server_confirm_marker_count(image)
+        if count > peak_count:
+            peak_count = count
+        if count >= baseline_count + SERVER_CONFIRM_MIN_NEW_MARKERS:
+            return True, peak_count
+        sleep(SERVER_CONFIRM_POLL_SECONDS)
+    return False, peak_count
+
+
 def restart_process(
     reopen_game: bool = False,
     app_already_closed: bool = False,
@@ -9663,11 +9791,33 @@ def restart_process(
 
     disable_weak_network()
     if blue_request_upload_settle_seconds > 0:
-        logger.info(
-            "waiting %.1fs for committed blue request upload before recovery",
-            blue_request_upload_settle_seconds,
+        # Do not treat a fixed settle as proof the request reached the server.
+        # Wait for the commit-confirmation marker flash; only then is it safe
+        # to cut the network again for the next probe.  Keep the settle value as
+        # the minimum wait so we do not race an upload that lands within it.
+        baseline_count = _server_confirm_marker_count(adb.read_screenshot())
+        confirmed, peak_count = wait_until_server_commit_confirmed(
+            baseline_count,
+            timeout=max(
+                blue_request_upload_settle_seconds,
+                SERVER_CONFIRM_TIMEOUT_SECONDS,
+            ),
         )
-        adb.delay(blue_request_upload_settle_seconds)
+        if confirmed:
+            logger.info(
+                "committed blue request upload confirmed by server markers "
+                "(baseline=%s peak=%s)",
+                baseline_count,
+                peak_count,
+            )
+        else:
+            logger.warning(
+                "committed blue request upload was NOT visually confirmed after "
+                "%.1fs (baseline=%s peak=%s); proceeding conservatively",
+                max(blue_request_upload_settle_seconds, SERVER_CONFIRM_TIMEOUT_SECONDS),
+                baseline_count,
+                peak_count,
+            )
     level_complete = handle_victory_prompt(timeout=victory_wait_timeout)
     if level_complete:
         # A committed final blue hit must leave the old activity instance
@@ -10403,15 +10553,22 @@ def resolve_current_level(
 def resolve_current_level_from_device(
     fallback_level: int = DEFAULT_LEVEL,
     fallback_is_manual: bool = False,
-    attempts: int = 8,
+    attempts: int = 4,
 ) -> int:
     """Take several screenshots until the level title is stable enough to read."""
     if attempts <= 0:
         raise ValueError(f"attempts must be positive: {attempts}")
 
     last_error: Exception | None = None
+    # 预热关卡标题的数字模板（懒加载缓存），把首次加载参考图模板的冷启动
+    # 移到识别开始之前，避免识别时再触发一次 ~190ms 的模板提取卡顿。
+    try:
+        from utils.level_title_recognition import _load_single_digit_templates
+        _load_single_digit_templates(str(Path(LEVEL_REFERENCE_DIR).resolve()))
+    except Exception:
+        pass
     for attempt in range(1, attempts + 1):
-        adb.delay(1.0)
+        adb.delay(0.4)
         screenshot = adb.read_screenshot()
         if handle_victory_prompt(
             timeout=VICTORY_WAIT_BEFORE_LEVEL_SECONDS,

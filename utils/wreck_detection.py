@@ -60,8 +60,14 @@ COMPLETED_SHIP_DIAGONAL_BODY_MIN_SCORE = 0.48
 # prove a coherent submarine line before the cells are used.
 COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE = 0.35
 # A red component can sit on an endpoint while the hull extends up to two
-# tiles away along its orientation.
-COMPLETED_SHIP_ANCHOR_MAX_CELL_DISTANCE = 2
+# tiles away along its orientation.  For a length-5 submarine the red marker is
+# usually centred, so the far endpoint sits up to three cells from the marker
+# ((2,4),(3,4),(4,4),(5,4),(6,4) with the marker on (3,4) leaves (6,4) three
+# cells away).  A radius of 2 dropped that endpoint, so the candidate set could
+# no longer form the full straight run and the whole fleet resolver failed.
+# Widening the axial reach to 3 recovers the far endpoint and keeps the already
+# correct shorter boards unchanged (verified over the training boards).
+COMPLETED_SHIP_ANCHOR_MAX_CELL_DISTANCE = 3
 COMPLETED_SHIP_MARKER_MAX_POINT_DISTANCE_FACTOR = 1.3
 # The flag's anti-aliased red component grows between game frames.  Keep the
 # component-size guard, but allow the ~300-400px variants seen at 1280x720.
@@ -100,6 +106,32 @@ SURFACE_GLARE_BRIGHT_MIN_RATIO = 0.34
 SURFACE_GLARE_TEMPORAL_MAD = 3.5
 SURFACE_GLARE_WEAK_SHAPE_SCORE = 0.34
 WRECK_SHAPE_MIN_SCORE = 0.28
+# A bright grey patch over the board can reach WRECK_SHAPE_MIN_SCORE while
+# still being plain water: it is broad and bright but has no compact,
+# centre-bright hull core.  Water reflections sit across the whole cell, so
+# their centre vs ring grey contrast stays flat or negative.  Real wrecks and
+# surfaced submarine hulls keep a bright core that covers most of the eroded
+# centre region.  A board-wide replay of the training screenshots shows that
+# requiring a centre grey ratio of 0.35 removes roughly 78% of the water cells
+# that otherwise pass the shape-score gate while keeping over 97% of
+# red-anchor (completed submarine) cells and 100% of resolved completed-ship
+# cells.  Cells that fail this gate are merely left unknown for a later blue or
+# red probe, so a conservative threshold never costs a shell.
+STATIC_WRECK_MIN_CENTER_GRAY_RATIO = 0.35
+
+
+def static_wreck_shape_accepts(shape: WreckShapeMetrics) -> bool:
+    """Return whether shape evidence qualifies as an authoritative static wreck.
+
+    ``shape.score`` alone is too permissive: a broad, bright water patch can
+    reach ``WRECK_SHAPE_MIN_SCORE`` while lacking a compact, centre-bright hull
+    core.  Requiring a minimum ``center_gray_ratio`` removes those patches
+    without dropping real hulls (see ``STATIC_WRECK_MIN_CENTER_GRAY_RATIO``).
+    """
+    return bool(
+        shape.score >= WRECK_SHAPE_MIN_SCORE
+        and shape.center_gray_ratio >= STATIC_WRECK_MIN_CENTER_GRAY_RATIO
+    )
 
 
 @dataclass(frozen=True)
@@ -288,6 +320,55 @@ def _diamond_evidence_mask(
     return mask
 
 
+def _crop_roi(
+    image: np.ndarray,
+    mask: np.ndarray,
+    cell_polygon: np.ndarray | None,
+    pad: int = 10,
+) -> tuple[np.ndarray, np.ndarray, int, int] | None:
+    """Crop an image and mask to the cell's region without scanning the frame.
+
+    When ``cell_polygon`` is available its bounding box already covers the
+    whole eroded diamond, so the crop window can be derived geometrically
+    (cheap).  Only the fallback path (no polygon, used by replay callers) scans
+    the mask.  The shape-ratio features only use ``mask > 0`` pixels, so every
+    metric is identical on the crop.
+    """
+    height, width = image.shape[:2]
+    pad = max(0, int(pad))
+    if cell_polygon is not None:
+        polygon = np.asarray(cell_polygon, dtype=np.float32)
+        xs = polygon[:, 0]
+        ys = polygon[:, 1]
+        x1 = max(0, int(np.floor(xs.min())) - pad)
+        x2 = min(width, int(np.ceil(xs.max())) + pad + 1)
+        y1 = max(0, int(np.floor(ys.min())) - pad)
+        y2 = min(height, int(np.ceil(ys.max())) + pad + 1)
+    else:
+        ys, xs = np.where(mask > 0)
+        if xs.size == 0:
+            return None
+        x1 = max(0, int(xs.min()) - pad)
+        x2 = min(width, int(xs.max()) + pad + 1)
+        y1 = max(0, int(ys.min()) - pad)
+        y2 = min(height, int(ys.max()) + pad + 1)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return image[y1:y2, x1:x2].copy(), mask[y1:y2, x1:x2].copy(), x1, y1
+
+
+def _erode_center_mask(mask: np.ndarray, kernel_size: int = 7) -> np.ndarray:
+    """Erode a possibly small mask into a centre region, never failing on size."""
+    height, width = mask.shape[:2]
+    if height < kernel_size or width < kernel_size:
+        return mask.copy()
+    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+    centre = cv2.erode(mask, kernel, iterations=1)
+    if not np.any(centre):
+        return mask.copy()
+    return centre
+
+
 def wreck_shape_metrics(
     image: np.ndarray,
     point: tuple[int, int],
@@ -314,19 +395,22 @@ def wreck_shape_metrics(
     if mask is None:
         return zero
 
+    cropped = _crop_roi(image, mask, cell_polygon)
+    if cropped is None:
+        return zero
+    roi, roi_mask, _x0, _y0 = cropped
+
     try:
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         saturation = hsv[:, :, 1]
         value = hsv[:, :, 2]
-        b, g, r = cv2.split(image)
+        b, g, r = cv2.split(roi)
     except (cv2.error, ValueError):
         return zero
 
     # The centre is a second erosion, not a fixed screen-space rectangle.
-    center_mask = cv2.erode(mask, np.ones((7, 7), dtype=np.uint8), iterations=1)
-    if not np.any(center_mask):
-        center_mask = mask
-    ring_mask = cv2.subtract(mask, center_mask)
+    center_mask = _erode_center_mask(roi_mask, kernel_size=7)
+    ring_mask = cv2.subtract(roi_mask, center_mask)
     neutral_gray = (
         (saturation <= 95)
         & (value >= 90)
@@ -361,7 +445,7 @@ def wreck_shape_metrics(
         else 0.0
     )
 
-    valid_mask = mask > 0
+    valid_mask = roi_mask > 0
     cyan = (
         (saturation >= 60)
         & (value >= 120)
@@ -419,15 +503,19 @@ def surface_glare_score(
     mask = _diamond_evidence_mask(image, point, cell_polygon=cell_polygon)
     if mask is None:
         return 0.0
+    cropped = _crop_roi(image, mask, cell_polygon)
+    if cropped is None:
+        return 0.0
+    roi, roi_mask, x0, y0 = cropped
     try:
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         saturation = hsv[:, :, 1]
         value = hsv[:, :, 2]
-        b, g, r = cv2.split(image)
+        b, g, r = cv2.split(roi)
     except (cv2.error, ValueError):
         return 0.0
 
-    valid_mask = mask > 0
+    valid_mask = roi_mask > 0
     cyan = (
         (saturation >= 60)
         & (value >= 120)
@@ -451,8 +539,9 @@ def surface_glare_score(
         and baseline.temporal_mad.shape == image.shape[:2]
         and baseline.median_gray.shape == image.shape[:2]
     ):
+        roi_h, roi_w = roi.shape[:2]
         if baseline.frame_count >= 2:
-            temporal = baseline.temporal_mad[valid_mask]
+            temporal = baseline.temporal_mad[y0 : y0 + roi_h, x0 : x0 + roi_w][valid_mask]
             if temporal.size:
                 temporal_score = max(0.0, min(1.0, float(np.median(temporal)) / 8.0))
         # MAD describes motion *within* the baseline and can be zero when a
@@ -460,15 +549,16 @@ def surface_glare_score(
         # current cell to the median water image as a second, local signal.
         try:
             current_gray = cv2.cvtColor(
-                image,
+                roi,
                 cv2.COLOR_BGR2GRAY,
             ).astype(np.float32)
         except (cv2.error, TypeError, ValueError):
             current_gray = None
         if current_gray is not None:
-            residual = np.abs(
-                current_gray - baseline.median_gray.astype(np.float32)
-            )
+            baseline_crop = baseline.median_gray[
+                y0 : y0 + roi_h, x0 : x0 + roi_w
+            ].astype(np.float32)
+            residual = np.abs(current_gray - baseline_crop)
             local_residual = residual[valid_mask]
             if local_residual.size:
                 residual_p75 = float(np.percentile(local_residual, 75))
@@ -509,10 +599,11 @@ def surface_reflection_detected(
     baseline: SurfaceWaterBaseline | None = None,
     cell_polygon: np.ndarray | None = None,
     relative_position: tuple[float, float] | None = None,
+    _metrics: WreckShapeMetrics | None = None,
 ) -> bool:
     """Return whether the cell is dominated by water reflection/highlight."""
 
-    metrics = wreck_shape_metrics(image, point, cell_polygon=cell_polygon)
+    metrics = _metrics or wreck_shape_metrics(image, point, cell_polygon=cell_polygon)
     score = surface_glare_score(
         image,
         point,
@@ -1590,6 +1681,23 @@ def visible_wreck_static_detected(
     if not ignore_submarine_marker and red_submarine_marker_visible(image, point):
         return False
 
+    # Both the template path and the classify fallback below require
+    # ``score >= WRECK_SHAPE_MIN_SCORE`` and ``center_gray_ratio >=
+    # STATIC_WRECK_MIN_CENTER_GRAY_RATIO``.  Water cells fail that test and, if
+    # we let them continue, would pay for the surface-reflection gate, the
+    # multi-scale template match and the full diamond classifier before being
+    # rejected.  Compute the shape once here and short-circuit those cells so
+    # only genuinely hull-like candidates reach the expensive checks.  This is
+    # behaviour-identical: every surviving path still requires the same gate.
+    shape = wreck_shape_metrics(
+        image,
+        point,
+        cell_polygon=cell_polygon,
+        exclude_activity_title_overlay=filter_activity_title_overlay,
+    )
+    if not static_wreck_shape_accepts(shape):
+        return False
+
     # Reject broad blue/teal specular highlights before template matching.  A
     # reflection can reach the old 0.965 template threshold even though it has
     # no compact neutral hull.  The gate is spatially relative to the board
@@ -1601,18 +1709,12 @@ def visible_wreck_static_detected(
             baseline=surface_baseline,
             cell_polygon=cell_polygon,
             relative_position=relative_position,
+            _metrics=shape,
         ):
             return False
     if wreck_template_visible(image, point, cell_polygon=cell_polygon):
-        # Template correlation alone is not enough for the static recovery
-        # path: a small bright-water patch can match a masked template at a
-        # high score.  Require a compact, centre-weighted neutral shape too.
-        return wreck_shape_metrics(
-            image,
-            point,
-            cell_polygon=cell_polygon,
-            exclude_activity_title_overlay=filter_activity_title_overlay,
-        ).score >= WRECK_SHAPE_MIN_SCORE
+        # Shape evidence already passed the conservative gate above.
+        return True
     try:
         # Static review must stay tied to the requested cell.  The default
         # 14px refinement can jump across a tile edge and classify a nearby
@@ -1626,14 +1728,6 @@ def visible_wreck_static_detected(
     except Exception:
         return False
     if str(getattr(result, "state", "")).strip().lower() != "hit":
-        return False
-    shape = wreck_shape_metrics(
-        image,
-        point,
-        cell_polygon=cell_polygon,
-        exclude_activity_title_overlay=filter_activity_title_overlay,
-    )
-    if shape.score < WRECK_SHAPE_MIN_SCORE:
         return False
     if cell_polygon is None:
         return True

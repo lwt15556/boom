@@ -77,7 +77,7 @@ RUN_STDOUT = PROJECT_ROOT / "run_stdout.log"
 RUN_STDERR = PROJECT_ROOT / "run_stderr.log"
 STATUS_FILE = PROJECT_ROOT / "_debug" / "runtime" / "status.json"
 PANEL_LOCK_FILE = PROJECT_ROOT / "_debug" / "runtime" / "control_panel.lock"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 NETWORK_BLOCK_SETTLE_SECONDS = 0.2
 APP_STOP_TIMEOUT_SECONDS = 5.0
@@ -1484,15 +1484,36 @@ class ControlPanel(QMainWindow):
         else:
             self.visual_mapping_value.setText("--")
 
-        self._set_progress(self.shot_progress, shots_done, total_cells)
-        self._set_progress(self.hit_progress, hits, total_ship_cells)
-        self._set_progress(self.ship_progress, confirmed_ships, total_ships)
         self.update_board_status(
             level,
             board_states,
             current_cell,
             self.runtime_status.get("visual_candidates", []),
         )
+        # 已探测格子与棋盘实际判定保持一致：统计所有不被"未探测/视觉候选"
+        # 占据的格子。命中(miss/hit/ship/scout_hit/scout_miss/blocked)都计入，
+        # 这样"已探测"永远不会小于"确认命中"，且与棋盘显示完全一致。
+        counts = self.board_widget.state_counts()
+        total_on_board = sum(counts.values())
+        detected = (
+            total_on_board
+            - counts.get("unknown", 0)
+            - counts.get("visual_candidate", 0)
+            if total_on_board
+            else None
+        )
+        self._set_progress(self.shot_progress, detected, total_cells)
+        self._set_progress(self.hit_progress, hits, total_ship_cells)
+        # ``confirmed_ships`` is not always refreshed during the red-scout /
+        # blue strategy phases (it can lag at 0 even though the sidebar already
+        # confirms several submarines).  Use the sidebar-confirmed lengths as the
+        # authoritative completed-submarine count each time it is present.
+        completed_count = (
+            len(completed_lengths)
+            if isinstance(completed_lengths, list) and completed_lengths
+            else confirmed_ships
+        )
+        self._set_progress(self.ship_progress, completed_count, total_ships)
         self.update_recent_results()
         self.update_controls(running=running)
 

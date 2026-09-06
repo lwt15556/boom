@@ -23,7 +23,7 @@ from tools.control_panel import (
 class ControlPanelHelperTest(unittest.TestCase):
     def test_control_panel_version_is_defined(self):
         self.assertRegex(control_panel.APP_VERSION, r"^\d+\.\d+\.\d+$")
-        self.assertEqual(control_panel.APP_VERSION, "1.0.2")
+        self.assertEqual(control_panel.APP_VERSION, "1.0.3")
 
     def test_build_main_environment_configures_red_scout(self):
         environment = build_main_environment("red_scout", 3)
