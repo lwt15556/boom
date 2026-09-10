@@ -534,6 +534,63 @@ class LatestLShapeRuleTest(unittest.TestCase):
         for row, col in unrelated_visual:
             self.assertEqual(hit_map[row][col], 1)
 
+    def test_historical_committed_hit_completes_l_and_skips_upper_blue(self):
+        """Level-10 (0,4)/(1,4)/(1,5): red omits known (1,4), so L must still form.
+
+        Scout already confirmed (1,4).  A later scout reports the upper
+        projection (0,4) and the real tip (1,5).  Adjacent historical hits
+        must join the 2x2 evidence so (0,4) is discarded before any blue shot.
+        """
+        historical = (1, 4)
+        false_upper = (0, 4)
+        real_tip = (1, 5)
+        first = self._red_result({historical}, center=(5, 3))
+        second = self._red_result(
+            {false_upper, real_tip},
+            affected_cells={false_upper, real_tip},
+            center=(8, 7),
+        )
+        settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 2)
+        click_points = [
+            (400 + (index % 10) * 40, 300 + (index // 10) * 40)
+            for index in range(100)
+        ]
+        with (
+            patch.object(
+                self.main.RedScoutPlanner,
+                "choose_center",
+                side_effect=[(5, 3), (8, 7)],
+            ),
+            patch.object(
+                self.main,
+                "_execute_red_scout_transaction",
+                side_effect=[first, second],
+            ),
+            patch.object(
+                self.main,
+                "_execute_online_scout_hit",
+                return_value=self.main.ProbeResult.HIT,
+            ) as online_hit,
+            patch.object(self.main, "_scan_level_by_strategy", return_value=True) as scan,
+            patch.object(self.main, "ONLINE_SCOUT_BATCH_ENABLED", False),
+        ):
+            completed = self.main._run_red_scout_and_blue_strategy(
+                10,
+                [[0] * 10 for _row in range(10)],
+                click_points,
+                [2, 2, 3, 4, 4, 5],
+                set(),
+                settings,
+            )
+
+        self.assertTrue(completed)
+        blue_cells = {call.kwargs["cell"] for call in online_hit.call_args_list}
+        self.assertIn(historical, blue_cells)
+        self.assertIn(real_tip, blue_cells)
+        self.assertNotIn(false_upper, blue_cells)
+        self.assertNotIn(false_upper, scan.call_args.kwargs["initial_hits"])
+        self.assertIn(false_upper, scan.call_args.kwargs["initial_misses"])
+
 
 if __name__ == "__main__":
     unittest.main()

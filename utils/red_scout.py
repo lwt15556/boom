@@ -49,7 +49,13 @@ MINIMUM_FRAME_VOTES = 2
 RED_SCOUT_RESULT_CELL_COUNT = 6
 RED_SCOUT_MISS_MIN_CHANGE = 0.88
 RED_SCOUT_MISS_MIN_VOTES = 3
-RED_SCOUT_MISS_FALLBACK_MIN_CHANGE = 0.60
+# 凑数门槛：真实炸弹格的变化量在 0.90 以上，而**水面动画基线**是 0.39~0.63
+# （全盘中位数 0.50）。原来的 0.60 只比基线高一点点，于是凑数会抓到普通水面格
+# 并把它们记成「侦察未命中」——level 24 的 (0,5)=0.623、(1,7)=0.611 就是这样被抓
+# 进来的，而这两格炸弹根本没碰到。那些伪造的 miss 会经
+# strategy._miss_cells() 进入 _all_placements(include_scout_misses=True)，让包含
+# 它们的潜艇摆位全部作废 → 真潜艇永远确认不了。0.80 落在 0.63 与 0.90 之间的空隙。
+RED_SCOUT_MISS_FALLBACK_MIN_CHANGE = 0.80
 COMPLETED_SHIP_ENDPOINT_MIN_MARGIN = 0.08
 # A surfaced ship's end cell is often partially occluded by the wake.  Keep
 # the normal body threshold for ordinary candidates, but allow a slightly
@@ -72,6 +78,77 @@ RED_SCOUT_TRANSITION_PIXEL_DIFF = 24.0
 RED_SCOUT_TRANSITION_MIN_DISTANCE = 0.10
 RED_SCOUT_TRANSITION_MIN_CHANGED_RATIO = 0.35
 RED_SCOUT_TRANSITION_OUTLIER_FACTOR = 2.5
+
+
+def _geometric_forced_endpoints(
+    body_candidates: set[Cell],
+    *,
+    unresolved_lengths: Sequence[int],
+    grid_size: int,
+) -> set[Cell]:
+    """Return endpoints forced by a length-1 body run for an unresolved ship.
+
+    When the sidebar has already confirmed a length-L submarine and the stable
+    body mask contains a contiguous run of exactly L-1 cells, the missing hull
+    cell can only sit at one of the two run ends.  Wake and upper-right sea
+    highlight often erase that endpoint's body score; geometry still identifies
+    it, so the cell must be protected from the miss classifier.
+    """
+    forced: set[Cell] = set()
+    try:
+        lengths = tuple(int(length) for length in unresolved_lengths)
+    except (TypeError, ValueError):
+        return forced
+    if not lengths or grid_size <= 0:
+        return forced
+
+    def maximal_runs(values: set[int]) -> list[tuple[int, ...]]:
+        runs: list[tuple[int, ...]] = []
+        pending: list[int] = []
+        for value in sorted(values):
+            if pending and value != pending[-1] + 1:
+                runs.append(tuple(pending))
+                pending = []
+            pending.append(value)
+        if pending:
+            runs.append(tuple(pending))
+        return runs
+
+    for raw_length in lengths:
+        length = int(raw_length)
+        if length < 2 or length > grid_size:
+            continue
+        for row in range(grid_size):
+            columns = {
+                col
+                for candidate_row, col in body_candidates
+                if candidate_row == row
+            }
+            for run in maximal_runs(columns):
+                if len(run) != length - 1:
+                    continue
+                for endpoint in ((row, run[0] - 1), (row, run[-1] + 1)):
+                    if (
+                        0 <= endpoint[1] < grid_size
+                        and endpoint not in body_candidates
+                    ):
+                        forced.add(endpoint)
+        for col in range(grid_size):
+            rows = {
+                row
+                for row, candidate_col in body_candidates
+                if candidate_col == col
+            }
+            for run in maximal_runs(rows):
+                if len(run) != length - 1:
+                    continue
+                for endpoint in ((run[0] - 1, col), (run[-1] + 1, col)):
+                    if (
+                        0 <= endpoint[0] < grid_size
+                        and endpoint not in body_candidates
+                    ):
+                        forced.add(endpoint)
+    return forced
 
 
 def _infer_completed_ship_endpoints(
@@ -158,16 +235,30 @@ def _infer_completed_ship_endpoints(
                         score = completed_ship_body_score(image, point)
                     scores.append(float(score))
                 if scores:
-                    scored.append((float(median(scores)), cell))
+                    # Wake/glare can bury the endpoint in some frames only.
+                    # Use the median as the primary evidence, but keep the
+                    # strongest frame as a secondary rescue when the median
+                    # is merely weak rather than absent.
+                    scored.append((float(median(scores)), float(max(scores)), cell))
             if not scored:
                 continue
-            scored.sort(reverse=True)
-            best_score, best_cell = scored[0]
-            second_score = scored[1][0] if len(scored) > 1 else 0.0
-            if (
-                best_score >= endpoint_min_score
-                and best_score - second_score >= COMPLETED_SHIP_ENDPOINT_MIN_MARGIN
-            ):
+            scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            best_median, best_max, best_cell = scored[0]
+            second_median = scored[1][0] if len(scored) > 1 else 0.0
+            # Primary: median above the relaxed endpoint floor.
+            # Secondary: median is weak but one frame clearly saw hull while
+            # the alternative endpoint stayed near water — typical of an
+            # upper-right wake occluding only part of the capture.
+            primary_ok = (
+                best_median >= endpoint_min_score
+                and best_median - second_median >= COMPLETED_SHIP_ENDPOINT_MIN_MARGIN
+            )
+            secondary_ok = (
+                best_median >= max(0.10, endpoint_min_score * 0.6)
+                and best_max >= max(0.28, endpoint_min_score + 0.08)
+                and best_max - second_median >= COMPLETED_SHIP_ENDPOINT_MIN_MARGIN + 0.05
+            )
+            if primary_ok or secondary_ok:
                 inferred.add(best_cell)
     return inferred
 
@@ -329,6 +420,11 @@ class _CompletedShipEvidence:
     new_hit_cells: frozenset[Cell]
     ship_cells: frozenset[Cell]
     perimeter_cells: frozenset[Cell]
+    # Cells that are geometrically forced to complete a sidebar-confirmed
+    # submarine but whose visual body evidence is weak (commonly wake/glare
+    # occlusion on the upper-right board corner).  They must never become
+    # scout-miss; leave them unknown so blue confirmation can still decide.
+    protected_unknown_cells: frozenset[Cell] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -810,6 +906,7 @@ class RedScoutAnalyzer:
         excluded_cells: Sequence[Cell] | set[Cell] | frozenset[Cell] = (),
         learned_footprint: RedFootprint | None = None,
         submarine_lengths: Sequence[int] = (),
+        binarize_hit_cells: frozenset[Cell] = frozenset(),
     ) -> RedScoutResult:
         normalized_center = _normalize_pair(center_cell)
         result_center = normalized_center if normalized_center is not None else (0, 0)
@@ -911,11 +1008,27 @@ class RedScoutAnalyzer:
                 diagnostics=diagnostics,
             )
         median_change_by_cell, states_by_cell = evidence
+        # ``states`` 是**前后帧差分**分类器（classify_diamond_hit(before, after)）的
+        # 输出，只说明「这一格变化得像不像命中」；而真正的命中判定用的是
+        # ``_detect_hit``（只看结果帧里有没有残骸）。两者会不一致——level 24 的
+        # (1,8) 就是 states=hit/hit/hit 但 detector 三帧全 False（水面动画骗过了差分）。
+        # 把 detector 投票也写进诊断，避免下次查日志时被 states 误导。
+        def _detector_votes(cell: Cell) -> tuple[bool, ...]:
+            point = points_by_cell[cell]
+            votes: list[bool] = []
+            for after_image in frames:
+                try:
+                    votes.append(bool(self._detect_hit(after_image, point)))
+                except Exception:
+                    votes.append(False)
+            return tuple(votes)
+
         diagnostics["cell_evidence"] = tuple(
             {
                 "cell": cell,
                 "median_change": float(median_change_by_cell[cell]),
                 "states": states_by_cell[cell],
+                "detector_votes": _detector_votes(cell),
             }
             for cell in sorted(median_change_by_cell)
         )
@@ -934,11 +1047,27 @@ class RedScoutAnalyzer:
         diagnostics.update(completed_diagnostics)
         completed_visual_zone: set[Cell] = set()
         independent_stable_hits = set(raw_stable_result_hits)
+        protected_ship_endpoints: set[Cell] = set()
         if completed_ship is not None:
             completed_visual_zone = set(
                 completed_ship.ship_cells | completed_ship.perimeter_cells
             )
+            protected_ship_endpoints.update(completed_ship.protected_unknown_cells)
             independent_stable_hits.difference_update(completed_visual_zone)
+        try:
+            for raw_protected in diagnostics.get(
+                "protected_completed_endpoints", ()
+            ):
+                protected = _normalize_pair(raw_protected)
+                if protected is not None and _inside_grid(protected, grid_size):
+                    protected_ship_endpoints.add(protected)
+        except (TypeError, ValueError):
+            pass
+        protected_ship_endpoints -= before_visible
+        if protected_ship_endpoints:
+            diagnostics["protected_ship_endpoints"] = tuple(
+                sorted(protected_ship_endpoints)
+            )
 
         stable_result_hits = self._collapse_completed_submarine_hits(
             independent_stable_hits,
@@ -960,6 +1089,7 @@ class RedScoutAnalyzer:
             excluded_cells=(
                 raw_stable_result_hits
                 | completed_visual_zone
+                | protected_ship_endpoints
             ),
         )
         diagnostics["strong_miss_required_votes"] = _required_strong_miss_votes(
@@ -1044,6 +1174,10 @@ class RedScoutAnalyzer:
             affected = stable_result_hits | strong_result_misses
 
         consistent_misses: list[Cell] = []
+        # 为凑够 RED_SCOUT_RESULT_CELL_COUNT 而补进来的格子。它们**没有**被炸弹
+        # 碰到，只是变化量恰好超过门槛的水面格，因此绝不能当成「已探明的水」——
+        # 详见 RED_SCOUT_MISS_FALLBACK_MIN_CHANGE 的说明。
+        padded_cells: set[Cell] = set()
         if len(affected) < RED_SCOUT_RESULT_CELL_COUNT:
             consistent_misses = sorted(
                 (
@@ -1054,6 +1188,7 @@ class RedScoutAnalyzer:
                         and cell not in before_visible
                         and cell not in raw_stable_result_hits
                         and cell not in completed_visual_zone
+                        and cell not in protected_ship_endpoints
                         and changed_ratio >= RED_SCOUT_MISS_FALLBACK_MIN_CHANGE
                         and states_by_cell[cell]
                         and states_by_cell[cell].count("miss")
@@ -1067,7 +1202,8 @@ class RedScoutAnalyzer:
                 ),
             )
             missing_count = RED_SCOUT_RESULT_CELL_COUNT - len(affected)
-            affected.update(consistent_misses[:missing_count])
+            padded_cells = set(consistent_misses[:missing_count])
+            affected.update(padded_cells)
         diagnostics["moderate_misses"] = tuple(consistent_misses)
 
         safe_perimeter_misses: list[Cell] = []
@@ -1127,6 +1263,8 @@ class RedScoutAnalyzer:
             points_by_cell=points_by_cell,
             affected=affected,
             states_by_cell=states_by_cell,
+            binarize_hit_cells=binarize_hit_cells,
+            protected_cells=protected_ship_endpoints,
         )
         if classified is None:
             diagnostics["stage"] = "classify_affected_cells"
@@ -1136,6 +1274,14 @@ class RedScoutAnalyzer:
                 diagnostics=diagnostics,
             )
         hit_cells, miss_cells, unknown_cells = classified
+        # 凑数格单独记进诊断，便于事后审计「哪些 miss 是凑出来的」。
+        # 注意：**不能**把它们降级成 unknown —— main.py 的
+        # ``_red_scout_result_is_complete_six`` 要求 ``not result.unknown_cells``，
+        # 降级会让 complete_six 永远不成立，破坏炸弹足迹学习。
+        # 真正的防线是上面的门槛：0.80 已高于水面动画上限(~0.63)、低于真实炸弹格
+        # (>=0.90)，所以能进凑数池的格子一定是炸弹真正改变过的格，记成 miss 是对的。
+        if padded_cells:
+            diagnostics["padded_cells"] = tuple(sorted(padded_cells))
         # The discarded flag cell is known to be a visual false positive. Keep
         # it as a miss observation for the board even though it is excluded
         # from the six-cell footprint used by the planner.
@@ -1633,6 +1779,19 @@ class RedScoutAnalyzer:
         if resolution.unresolved_lengths:
             if details.get("completed_ship_failure") is None:
                 details["completed_ship_failure"] = "ship_geometry_unresolved"
+            # Geometry is incomplete (commonly a wake/glare-occluded endpoint
+            # in the board's upper-right), but the length-1 body run still
+            # identifies the only legal missing cells.  Record them so the
+            # analyzer never writes scout-miss onto a forced ship endpoint.
+            forced_endpoints = _geometric_forced_endpoints(
+                stable_body_candidates,
+                unresolved_lengths=resolution.unresolved_lengths,
+                grid_size=grid_size,
+            ) - before_visible
+            if forced_endpoints:
+                details["protected_completed_endpoints"] = tuple(
+                    sorted(forced_endpoints)
+                )
             return None
 
         # A completed sidebar entry proves that a submarine was finished, but
@@ -1701,13 +1860,28 @@ class RedScoutAnalyzer:
                             and _inside_grid(neighbor, grid_size)
                         ):
                             direct_perimeter.add(neighbor)
+            # The unsupported hull cells are still part of this placement.
+            # Keep them protected so wake/glare on an endpoint cannot flip
+            # them into scout-miss while the rest of the ship is committed.
+            placement_only_cells = {
+                cell
+                for placement in under_supported_placements
+                for cell in placement
+                if cell not in supported_cells
+                and cell not in before_visible
+                and _inside_grid(cell, grid_size)
+            }
             details["partial_completed_body_hits"] = tuple(
                 sorted(direct_body_hits)
+            )
+            details["protected_completed_endpoints"] = tuple(
+                sorted(placement_only_cells)
             )
             return _CompletedShipEvidence(
                 new_hit_cells=frozenset(direct_body_hits),
                 ship_cells=frozenset(direct_body_hits),
                 perimeter_cells=frozenset(direct_perimeter),
+                protected_unknown_cells=frozenset(placement_only_cells),
             )
 
         # When more than one submarine completes in the same red-scout frame,
@@ -1989,11 +2163,18 @@ class RedScoutAnalyzer:
         points_by_cell: Mapping[Cell, tuple[int, int]],
         affected: set[Cell],
         states_by_cell: Mapping[Cell, tuple[str, ...]],
+        binarize_hit_cells: frozenset[Cell] = frozenset(),
+        protected_cells: frozenset[Cell] | set[Cell] = frozenset(),
     ) -> tuple[set[Cell], set[Cell], set[Cell]] | None:
         hit_cells: set[Cell] = set()
         miss_cells: set[Cell] = set()
         unknown_cells: set[Cell] = set()
+        protected = set(protected_cells)
         for cell in sorted(affected):
+            # 二值法（前后帧差分）判定该格新出现潜艇内容时，作为一条独立的命中证据。
+            if cell in binarize_hit_cells:
+                hit_cells.add(cell)
+                continue
             point = points_by_cell[cell]
             detector_votes = 0
             for after_image in after_images:
@@ -2005,6 +2186,11 @@ class RedScoutAnalyzer:
             miss_votes = states_by_cell[cell].count("miss")
             if detector_votes >= MINIMUM_FRAME_VOTES:
                 hit_cells.add(cell)
+            elif cell in protected:
+                # A forced completed-ship endpoint (wake/glare occluded) is
+                # not water evidence.  Leave it unknown so blue confirmation
+                # can still open the cell instead of locking a false miss.
+                unknown_cells.add(cell)
             elif detector_votes == 0 and miss_votes >= MINIMUM_FRAME_VOTES:
                 miss_cells.add(cell)
             else:

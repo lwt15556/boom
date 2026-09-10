@@ -20,7 +20,7 @@ class ScriptSafetyTest(unittest.TestCase):
         self.assertIn('PrefixArguments @("-3")', script)
         self.assertIn('"-m", "venv"', script)
         self.assertIn('"-m", "pip", "install", "-r"', script)
-        self.assertIn('"import cv2, numpy, PyQt6;', script)
+        self.assertIn('"import cv2, numpy, PyQt6, sklearn;', script)
         self.assertIn('Arguments @(\"version\")', script)
         self.assertIn('tools\setup_preflight.py', script)
         self.assertIn('$adbReady = $LASTEXITCODE -eq 0', script)
