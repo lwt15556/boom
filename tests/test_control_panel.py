@@ -23,7 +23,7 @@ from tools.control_panel import (
 class ControlPanelHelperTest(unittest.TestCase):
     def test_control_panel_version_is_defined(self):
         self.assertRegex(control_panel.APP_VERSION, r"^\d+\.\d+\.\d+$")
-        self.assertEqual(control_panel.APP_VERSION, "1.0.3")
+        self.assertEqual(control_panel.APP_VERSION, "1.1.0")
 
     def test_build_main_environment_configures_red_scout(self):
         environment = build_main_environment("red_scout", 3)
@@ -191,9 +191,14 @@ class ControlPanelHelperTest(unittest.TestCase):
 
     def test_visual_candidates_overlay_only_unknown_cells(self):
         states = [["unknown", "hit"], ["miss", "ship"]]
-        overlaid = overlay_visual_candidates(states, [(0, 0), (0, 1), (1, 0)])
+        overlaid = overlay_visual_candidates(states, [(0, 0), (0, 1), (1, 0)], show=True)
         self.assertEqual(overlaid, [["visual_candidate", "hit"], ["miss", "ship"]])
         self.assertEqual(states[0][0], "unknown")
+
+    def test_visual_candidates_hidden_by_default(self):
+        states = [["unknown", "unknown"], ["unknown", "unknown"]]
+        overlaid = overlay_visual_candidates(states, [(0, 0), (1, 1)])
+        self.assertEqual(overlaid, [["unknown", "unknown"], ["unknown", "unknown"]])
 
     def test_legacy_blocked_safety_area_is_rendered_as_a_miss(self):
         overlaid = overlay_visual_candidates([["blocked"]], [])

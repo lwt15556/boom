@@ -9,6 +9,7 @@ from config import LEVEL_GRID_SIZES
 from save_points.points import read_saved_points
 from utils.wreck_detection import (
     COMPLETED_SHIP_BODY_MIN_SCORE,
+    _deduplicate_anchor_collisions,
     _title_flag_l_hull_pairs,
     completed_ship_body_score,
     detect_completed_submarine_candidate_cells,
@@ -531,6 +532,102 @@ class WreckDetectionTest(unittest.TestCase):
 
         self.assertEqual(marker_cells, {cell})
         self.assertFalse(visible_wreck_static_detected(frame, points[45]))
+
+    def test_collapsed_red_markers_split_onto_distinct_hull_runs(self):
+        """Two flags on overlapping parallel submarines must not collapse to one
+        anchor.  The marker with no alternative hull keeps the shared brightest
+        cell; the other marker moves to its own strong parallel run."""
+        records = [
+            {
+                # Upper torpedo flag: every candidate is either on the shared
+                # cell, adjacent to it, or too weak, so it must keep (1,1).
+                "nearest_cell": (0, 1),
+                "best_cell": (1, 1),
+                "body": 0.69,
+                "candidate_bodies": {
+                    (0, 0): 0.21,
+                    (0, 1): 0.40,
+                    (0, 2): 0.36,
+                    (1, 1): 0.69,
+                    (1, 2): 0.68,
+                },
+            },
+            {
+                # Lower torpedo flag: shares (1,1) with the upper flag but has a
+                # distinct strong hull run at row 3, so it must move there.
+                "nearest_cell": (2, 1),
+                "best_cell": (1, 1),
+                "body": 0.69,
+                "candidate_bodies": {
+                    (1, 0): 0.63,
+                    (1, 1): 0.69,
+                    (1, 2): 0.68,
+                    (2, 1): 0.24,
+                    (2, 2): 0.31,
+                    (3, 1): 0.60,
+                    (3, 2): 0.62,
+                },
+            },
+            {
+                # An unrelated marker must be untouched.
+                "nearest_cell": (9, 0),
+                "best_cell": (8, 0),
+                "body": 0.67,
+                "candidate_bodies": {(8, 0): 0.67, (9, 0): 0.51},
+            },
+        ]
+        anchors = _deduplicate_anchor_collisions(records, 10)
+        self.assertIn((1, 1), anchors)
+        self.assertIn((3, 2), anchors)
+        self.assertIn((8, 0), anchors)
+        self.assertEqual(len(anchors), 3)
+
+    def test_adjacent_red_markers_split_onto_distinct_hull_rows(self):
+        """Flags bound to neighbouring cells must be split too.
+
+        Adjacent cells can never be two different submarines, so a neighbouring
+        pair is an overlap mis-binding.  Leaving both anchors on one row made the
+        per-anchor solver fail and demoted every submarine cell to a provisional
+        candidate (the level-20 board explosion).
+        """
+        records = [
+            {
+                "nearest_cell": (0, 1),
+                "best_cell": (1, 1),
+                "body": 0.69,
+                "candidate_bodies": {
+                    (0, 1): 0.40,
+                    (0, 2): 0.36,
+                    (1, 1): 0.69,
+                    (1, 2): 0.68,
+                },
+            },
+            {
+                "nearest_cell": (2, 1),
+                "best_cell": (1, 2),
+                "body": 0.68,
+                "candidate_bodies": {
+                    (1, 0): 0.63,
+                    (1, 1): 0.69,
+                    (1, 2): 0.68,
+                    (2, 1): 0.24,
+                    (2, 2): 0.31,
+                    (3, 1): 0.60,
+                    (3, 2): 0.62,
+                },
+            },
+            {
+                "nearest_cell": (9, 0),
+                "best_cell": (8, 0),
+                "body": 0.67,
+                "candidate_bodies": {(8, 0): 0.67, (9, 0): 0.51},
+            },
+        ]
+        anchors = _deduplicate_anchor_collisions(records, 10)
+        self.assertIn((1, 1), anchors)
+        self.assertIn((3, 2), anchors)
+        self.assertIn((8, 0), anchors)
+        self.assertEqual(len(anchors), 3)
 
     def test_water_cell_next_to_submarine_is_not_a_static_wreck(self):
         """A neighboring hull must not be pulled into the water cell at (8,7)."""
