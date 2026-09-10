@@ -43,7 +43,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config import LEVEL_GRID_SIZES, MAX_LEVEL, SUBMARINES
+from config import LEVEL_GRID_SIZES, SUBMARINES
 from save_points.points import read_saved_points
 from utils.image_io import read_image_compat
 from utils.level_title_recognition import recognize_level_title
@@ -115,7 +115,7 @@ def _recognize_level(image: Any, fallback_level: int | None) -> int:
         reference_dir=PROJECT_ROOT / "save_points" / "imgs",
         min_score=min_score,
     )
-    if title is not None and title.confident and 1 <= title.level <= MAX_LEVEL:
+    if title is not None and title.confident and 1 <= title.level <= 50:
         return title.level
     return int(fallback_level) if fallback_level is not None else 0
 
