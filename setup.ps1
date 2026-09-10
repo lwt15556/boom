@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$SkipLaunch
 )
 
@@ -228,12 +228,12 @@ else {
     Write-Host "依赖没有变化，跳过重复安装。" -ForegroundColor DarkGray
 }
 
-Write-Step "验证 Python、OpenCV、PyQt6、NumPy、scikit-learn 和内置 ADB"
+Write-Step "验证 Python、OpenCV、PyQt6、NumPy 和内置 ADB"
 Invoke-Checked `
     -FilePath $venvPython `
     -Arguments @(
         "-c",
-        "import cv2, numpy, PyQt6, sklearn; print('Python 环境验证通过')"
+        "import cv2, numpy, PyQt6; print('Python 环境验证通过')"
     ) `
     -FailureMessage "Python 依赖验证失败"
 Invoke-Checked `

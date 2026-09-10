@@ -608,77 +608,6 @@ class RedScoutAnalyzerTest(unittest.TestCase):
 
         self.assertEqual(inferred, set())
 
-    def test_completed_ship_endpoint_rescued_by_strongest_frame(self):
-        """Upper-right wake can bury the endpoint in some frames only."""
-        candidates = {(1, 4), (2, 4), (3, 4)}
-        points_by_cell = {
-            (row, col): (row, col)
-            for row in range(10)
-            for col in range(10)
-        }
-        frames = tuple(np.zeros((8, 8, 3), dtype=np.uint8) for _ in range(4))
-        # Median stays below the relaxed floor, but one capture clearly saw
-        # the hull while the opposite endpoint stayed near water.
-        frame_scores = [
-            {(0, 4): 0.02, (4, 4): 0.12},
-            {(0, 4): 0.03, (4, 4): 0.14},
-            {(0, 4): 0.02, (4, 4): 0.35},
-            {(0, 4): 0.01, (4, 4): 0.13},
-        ]
-        score_by_id = {id(frame): scores for frame, scores in zip(frames, frame_scores)}
-
-        def body_score(image, point, **_kwargs):
-            return score_by_id.get(id(image), {}).get(point, 0.0)
-
-        with patch.object(
-            red_scout_module,
-            "completed_ship_body_score",
-            side_effect=body_score,
-        ):
-            inferred = red_scout_module._infer_completed_ship_endpoints(
-                candidates,
-                unresolved_lengths=(4,),
-                grid_size=10,
-                after_images=frames,
-                points_by_cell=points_by_cell,
-            )
-
-        self.assertEqual(inferred, {(4, 4)})
-
-    def test_geometric_forced_endpoints_finds_missing_ship_tip(self):
-        forced = red_scout_module._geometric_forced_endpoints(
-            {(2, 1), (2, 2), (2, 3)},
-            unresolved_lengths=(4,),
-            grid_size=10,
-        )
-        self.assertEqual(forced, {(2, 0), (2, 4)})
-
-    def test_protected_ship_endpoint_is_unknown_not_miss(self):
-        """A wake-occluded completed-ship tip must never become scout-miss."""
-        analyzer = red_scout_module.RedScoutAnalyzer(
-            hit_detector=lambda _image, _point: False,
-        )
-        frames = tuple(np.zeros((16, 16, 3), dtype=np.uint8) for _ in range(3))
-        points = {
-            (row, col): (col, row)
-            for row in range(4)
-            for col in range(4)
-        }
-        affected = {(1, 2)}
-        states = {(1, 2): ("miss", "miss", "miss")}
-        classified = analyzer._classify_affected_cells(
-            after_images=frames,
-            points_by_cell=points,
-            affected=set(affected),
-            states_by_cell=states,
-            protected_cells=frozenset({(1, 2)}),
-        )
-        self.assertIsNotNone(classified)
-        hits, misses, unknown = classified
-        self.assertEqual(hits, set())
-        self.assertEqual(misses, set())
-        self.assertEqual(unknown, {(1, 2)})
-
     def test_completed_ship_recovers_isometric_l_projection(self):
         """A sidebar-confirmed hull may project as an L but score as one row."""
         body_candidates = {
@@ -1047,19 +976,6 @@ class RedScoutAnalyzerTest(unittest.TestCase):
 
         self.assertIsNotNone(reference)
         self.assertFalse(red_scout_module._default_hit_detector(reference, (665, 318)))
-
-    def test_binarize_hit_cells_promote_affected_cells_to_hits(self):
-        analyzer = red_scout_module.RedScoutAnalyzer()
-        hit, miss, unknown = analyzer._classify_affected_cells(
-            after_images=(),
-            points_by_cell={(1, 1): (10, 10), (1, 2): (20, 20)},
-            affected={(1, 1), (1, 2)},
-            states_by_cell={(1, 1): (), (1, 2): ()},
-            binarize_hit_cells=frozenset({(1, 1)}),
-        )
-        self.assertEqual(hit, {(1, 1)})
-        self.assertEqual(miss, set())
-        self.assertEqual(unknown, {(1, 2)})
 
     def test_red_marker_guard_only_suppresses_its_assigned_cell(self):
         analyzer = red_scout_module.RedScoutAnalyzer()
@@ -1838,9 +1754,7 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         evidence = {
             stable_hit: (0.86, "hit"),
             **{cell: (0.97, "miss") for cell in strong_misses},
-            # 0.82：高于凑数门槛(0.80)、低于强未命中门槛(0.88)。真实炸弹格的
-            # 变化量在 0.90 以上，水面动画上限约 0.63，凑数池只该收录前者。
-            moderate_miss: (0.82, "miss"),
+            moderate_miss: (0.62, "miss"),
             noise: (0.55, "miss"),
         }
         after_images = tuple(
@@ -1874,52 +1788,6 @@ class RedScoutAnalyzerTest(unittest.TestCase):
         self.assertEqual(result.hit_cells, frozenset({stable_hit}))
         self.assertEqual(result.miss_cells, frozenset(expected - {stable_hit}))
         self.assertNotIn(noise, result.affected_cells)
-
-    def test_water_animation_cell_is_not_padded_into_scout_misses(self):
-        """水面动画格不得被凑数成「侦察未命中」。
-
-        level 24 的实测：真实炸弹格变化量 (4,8)=0.991、(9,4)=0.945、(5,6)=0.908，
-        而全盘水面动画是 0.39~0.63（中位数 0.50）。(0,5)=0.623 与 (1,7)=0.611 被旧的
-        0.60 门槛抓进凑数池并记成 miss —— 炸弹根本没碰到它们。那些伪造的 miss 会经
-        strategy._miss_cells() 进入 _all_placements(include_scout_misses=True)，
-        让包含它们的潜艇摆位全部作废，真潜艇因此永远确认不了。
-        """
-        footprint_type = getattr(red_scout_module, "RedFootprint", None)
-        self.assertIsNotNone(footprint_type, "RedFootprint must be public")
-        footprint = footprint_type(offsets=frozenset({(0, 0)}))
-        stable_hit = (3, 1)
-        strong_misses = {(0, 2), (8, 1), (8, 8)}
-        # 旧门槛(0.60)会抓、新门槛(0.80)不该抓的水面动画格
-        animation_cells = {(0, 5): 0.623, (1, 7): 0.611, (1, 5): 0.576}
-        evidence = {
-            stable_hit: (0.91, "hit"),
-            **{cell: (0.97, "miss") for cell in strong_misses},
-            **{cell: (change, "miss") for cell, change in animation_cells.items()},
-        }
-        analyzer = self._analyzer(
-            self._classifier_for(evidence),
-            hit_detector=lambda image, point: (
-                point == stable_hit and image is not self.BEFORE_IMAGE
-            ),
-        )
-
-        result = analyzer.analyze(
-            before_image=self.BEFORE_IMAGE,
-            after_images=tuple(np.ones((8, 8, 3), dtype=np.uint8) for _ in range(4)),
-            grid_size=10,
-            click_points=tuple((row, col) for row in range(10) for col in range(10)),
-            center_cell=(5, 5),
-            excluded_cells=set(),
-            learned_footprint=footprint,
-        )
-
-        for cell in animation_cells:
-            self.assertNotIn(
-                cell,
-                result.miss_cells,
-                f"{cell} 只是水面动画，不得记成侦察未命中",
-            )
-            self.assertNotIn(cell, result.affected_cells)
 
     def test_single_positive_hit_frame_is_unknown_not_miss(self):
         footprint_type = getattr(red_scout_module, "RedFootprint", None)

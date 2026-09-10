@@ -150,5 +150,6 @@ class SurfaceGlareDetectionTest(unittest.TestCase):
         self.assertGreater(resized_metrics.cyan_ratio, 0.5)
         self.assertTrue(surface_reflection_detected(resized, resized_point))
 
+
 if __name__ == "__main__":
     unittest.main()
