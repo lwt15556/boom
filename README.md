@@ -45,7 +45,7 @@
 - 提供桌面运行控制台，可启动、停止、恢复网络、检查模拟器、查看日志和实时棋盘。
 - 支持“仅蓝色炮弹”和“红色侦察 + 蓝色攻击”两种运行模式。
 - 自动识别当前海域，并按关卡加载网格尺寸、潜艇长度、参考图和校准点位。
-- 支持 1 至 50 号海域；11 至 50 号海域当前共用默认的 `10x10` 网格和潜艇配置 `(2, 2, 3, 4, 5)`。
+- 支持 1 至 70 号海域；11 至 70 号海域当前共用默认的 `10x10` 网格和潜艇配置 `(2, 2, 3, 4, 5)`。
 - 中途启动时尝试从可见残骸、部分残骸和左侧潜艇进度恢复当前棋盘。
 - 命中后优先追击相邻格和潜艇延伸方向；确认完整潜艇后屏蔽周围一圈安全区。
 - 策略无法完成时进入保守逐格扫描，并优先处理已命中位置附近的格子。
@@ -157,7 +157,6 @@ py -3.11 -m venv .venv
 4. 模拟器分辨率为 `1280x720`。
 5. 活动棋盘没有被手动拖动、缩放或遮挡。
 
-![alt text](<屏幕截图 2026-07-15 101010.png>)
 
 ### 5. 启动控制台
 
@@ -173,7 +172,6 @@ powershell -ExecutionPolicy Bypass -File .\run_control_panel.ps1
 .\.venv\Scripts\python.exe tools\control_panel.py
 ```
 
-![alt text](image.png)
 
 ## 控制台
 
@@ -456,6 +454,23 @@ powershell -ExecutionPolicy Bypass -File .\stop_all.ps1
 
 用于单独测试 DROP、REJECT、iptables 和 ip6tables 规则。不要在主程序探测事务进行中手动切换网络规则。
 
+### 潜艇/残骸检测逐步落盘
+
+```powershell
+# 单张截图
+.\.venv\Scripts\python.exe tools\dump_detector_steps.py _debug\screenshots\shot.png
+# 整个目录（每个文件一个子目录）
+.\.venv\Scripts\python.exe tools\dump_detector_steps.py _debug\screenshots\probes
+# 带关卡号：额外输出“框 -> 棋盘格子”映射图
+.\.venv\Scripts\python.exe tools\dump_detector_steps.py shot.png --level 9
+```
+
+每个输入图片输出到 `_debug/detector_steps/<图片名>/`，包含 `step01_input.png` 到 `step17_cells.png` 的逐步中间图和 `report.txt`（每步的像素数、每个簇和每个碎片的判定数值）。
+
+检测区域是棋盘大菱形四角围成的四边形：**默认优先用该关在 `save_points/points.json` 里校准的棋盘四角（主程序里的 `grid_quad`）**，前 7 关棋盘大小不同也能各用各的；取不到四角时才回退到 `utils/submarine_detector.py` 里的 `ROI_QUAD`（默认 `(676,96),(1100,355),(686,718),(262,352)`，按 after_swipe 校准）。四边形外的海面不参与检测；`ROI_QUAD_MARGIN` 是掩码外扩像素，避免贴边探出的潜艇被裁掉（默认 20）。
+
+主程序运行中也可以开启：把环境变量 `BBMA_DETECTOR_DEBUG_DIR` 设为输出目录，每次检测会在其下建一个时间戳子目录。不设置时不写任何文件，也不影响性能。
+
 ### 关卡参考截图
 
 `save_points/imgs/1.png` 至 `50.png` 用于关卡识别。`take_screenshot.py` 是简单开发辅助脚本，当前保存目标仍写死为 `save_points/imgs/14.png`；使用前需要修改目标文件名，避免覆盖已有参考图。
@@ -478,6 +493,7 @@ powershell -ExecutionPolicy Bypass -File .\stop_all.ps1
 ├── tools/
 │   ├── control_panel.py        # 运行控制台
 │   ├── log_overlay.py          # 日志悬浮窗
+│   ├── dump_detector_steps.py  # 潜艇/残骸检测逐步落盘（调试）
 │   └── platform-tools/         # Windows ADB 工具
 ├── utils/
 │   ├── adb_control.py          # ADB、应用和网络控制
@@ -577,7 +593,7 @@ powershell -ExecutionPolicy Bypass -File .\stop_all.ps1
 ## 当前限制
 
 - 主要适配单一分辨率、国服界面和单台 Root 模拟器。
-- 11 至 50 关使用同一套默认潜艇长度，游戏活动变化后需要重新核对。
+- 11 至 70 关使用同一套默认潜艇长度，游戏活动变化后需要重新核对。
 - 模板、固定坐标和人工点位对游戏 UI 变化较敏感。
 - 中途恢复无法可靠识别历史未命中格。
 - 红色侦察后的蓝色在线攻击依赖侦察结果，假命中可能消耗蓝色炮弹。
