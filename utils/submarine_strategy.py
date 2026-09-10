@@ -5,11 +5,6 @@ from dataclasses import dataclass
 from numbers import Integral
 from typing import Callable, FrozenSet, Iterable, Mapping, Optional, Sequence
 
-from utils.logger import get_logger
-
-
-logger = get_logger(__name__)
-
 
 Cell = tuple[int, int]
 
@@ -90,15 +85,7 @@ class SubmarineStrategy:
         miss_cells = self._normalize_scout_cells(misses, label="misses")
         overlap = hit_cells & miss_cells
         if overlap:
-            # A later scout can reclassify a cell (for example a sea-highlight
-            # filter downgrades a hit to a miss) while the cell was already
-            # recorded as a hit.  Hit evidence wins: keep the cell as a hit and
-            # drop it from the miss set rather than crashing the whole run.
-            logger.warning(
-                "scout observations overlap at %s; keeping hit evidence",
-                sorted(overlap),
-            )
-            miss_cells = miss_cells - hit_cells
+            raise ValueError(f"scout hits and misses overlap: {sorted(overlap)}")
 
         incoming = {cell: True for cell in hit_cells}
         incoming.update({cell: False for cell in miss_cells})

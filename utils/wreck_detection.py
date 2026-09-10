@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Sequence
@@ -61,14 +60,8 @@ COMPLETED_SHIP_DIAGONAL_BODY_MIN_SCORE = 0.48
 # prove a coherent submarine line before the cells are used.
 COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE = 0.35
 # A red component can sit on an endpoint while the hull extends up to two
-# tiles away along its orientation.  For a length-5 submarine the red marker is
-# usually centred, so the far endpoint sits up to three cells from the marker
-# ((2,4),(3,4),(4,4),(5,4),(6,4) with the marker on (3,4) leaves (6,4) three
-# cells away).  A radius of 2 dropped that endpoint, so the candidate set could
-# no longer form the full straight run and the whole fleet resolver failed.
-# Widening the axial reach to 3 recovers the far endpoint and keeps the already
-# correct shorter boards unchanged (verified over the training boards).
-COMPLETED_SHIP_ANCHOR_MAX_CELL_DISTANCE = 3
+# tiles away along its orientation.
+COMPLETED_SHIP_ANCHOR_MAX_CELL_DISTANCE = 2
 COMPLETED_SHIP_MARKER_MAX_POINT_DISTANCE_FACTOR = 1.3
 # The flag's anti-aliased red component grows between game frames.  Keep the
 # component-size guard, but allow the ~300-400px variants seen at 1280x720.
@@ -107,32 +100,6 @@ SURFACE_GLARE_BRIGHT_MIN_RATIO = 0.34
 SURFACE_GLARE_TEMPORAL_MAD = 3.5
 SURFACE_GLARE_WEAK_SHAPE_SCORE = 0.34
 WRECK_SHAPE_MIN_SCORE = 0.28
-# A bright grey patch over the board can reach WRECK_SHAPE_MIN_SCORE while
-# still being plain water: it is broad and bright but has no compact,
-# centre-bright hull core.  Water reflections sit across the whole cell, so
-# their centre vs ring grey contrast stays flat or negative.  Real wrecks and
-# surfaced submarine hulls keep a bright core that covers most of the eroded
-# centre region.  A board-wide replay of the training screenshots shows that
-# requiring a centre grey ratio of 0.35 removes roughly 78% of the water cells
-# that otherwise pass the shape-score gate while keeping over 97% of
-# red-anchor (completed submarine) cells and 100% of resolved completed-ship
-# cells.  Cells that fail this gate are merely left unknown for a later blue or
-# red probe, so a conservative threshold never costs a shell.
-STATIC_WRECK_MIN_CENTER_GRAY_RATIO = 0.35
-
-
-def static_wreck_shape_accepts(shape: WreckShapeMetrics) -> bool:
-    """Return whether shape evidence qualifies as an authoritative static wreck.
-
-    ``shape.score`` alone is too permissive: a broad, bright water patch can
-    reach ``WRECK_SHAPE_MIN_SCORE`` while lacking a compact, centre-bright hull
-    core.  Requiring a minimum ``center_gray_ratio`` removes those patches
-    without dropping real hulls (see ``STATIC_WRECK_MIN_CENTER_GRAY_RATIO``).
-    """
-    return bool(
-        shape.score >= WRECK_SHAPE_MIN_SCORE
-        and shape.center_gray_ratio >= STATIC_WRECK_MIN_CENTER_GRAY_RATIO
-    )
 
 
 @dataclass(frozen=True)
@@ -321,55 +288,6 @@ def _diamond_evidence_mask(
     return mask
 
 
-def _crop_roi(
-    image: np.ndarray,
-    mask: np.ndarray,
-    cell_polygon: np.ndarray | None,
-    pad: int = 10,
-) -> tuple[np.ndarray, np.ndarray, int, int] | None:
-    """Crop an image and mask to the cell's region without scanning the frame.
-
-    When ``cell_polygon`` is available its bounding box already covers the
-    whole eroded diamond, so the crop window can be derived geometrically
-    (cheap).  Only the fallback path (no polygon, used by replay callers) scans
-    the mask.  The shape-ratio features only use ``mask > 0`` pixels, so every
-    metric is identical on the crop.
-    """
-    height, width = image.shape[:2]
-    pad = max(0, int(pad))
-    if cell_polygon is not None:
-        polygon = np.asarray(cell_polygon, dtype=np.float32)
-        xs = polygon[:, 0]
-        ys = polygon[:, 1]
-        x1 = max(0, int(np.floor(xs.min())) - pad)
-        x2 = min(width, int(np.ceil(xs.max())) + pad + 1)
-        y1 = max(0, int(np.floor(ys.min())) - pad)
-        y2 = min(height, int(np.ceil(ys.max())) + pad + 1)
-    else:
-        ys, xs = np.where(mask > 0)
-        if xs.size == 0:
-            return None
-        x1 = max(0, int(xs.min()) - pad)
-        x2 = min(width, int(xs.max()) + pad + 1)
-        y1 = max(0, int(ys.min()) - pad)
-        y2 = min(height, int(ys.max()) + pad + 1)
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return image[y1:y2, x1:x2].copy(), mask[y1:y2, x1:x2].copy(), x1, y1
-
-
-def _erode_center_mask(mask: np.ndarray, kernel_size: int = 7) -> np.ndarray:
-    """Erode a possibly small mask into a centre region, never failing on size."""
-    height, width = mask.shape[:2]
-    if height < kernel_size or width < kernel_size:
-        return mask.copy()
-    kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-    centre = cv2.erode(mask, kernel, iterations=1)
-    if not np.any(centre):
-        return mask.copy()
-    return centre
-
-
 def wreck_shape_metrics(
     image: np.ndarray,
     point: tuple[int, int],
@@ -396,22 +314,19 @@ def wreck_shape_metrics(
     if mask is None:
         return zero
 
-    cropped = _crop_roi(image, mask, cell_polygon)
-    if cropped is None:
-        return zero
-    roi, roi_mask, _x0, _y0 = cropped
-
     try:
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         saturation = hsv[:, :, 1]
         value = hsv[:, :, 2]
-        b, g, r = cv2.split(roi)
+        b, g, r = cv2.split(image)
     except (cv2.error, ValueError):
         return zero
 
     # The centre is a second erosion, not a fixed screen-space rectangle.
-    center_mask = _erode_center_mask(roi_mask, kernel_size=7)
-    ring_mask = cv2.subtract(roi_mask, center_mask)
+    center_mask = cv2.erode(mask, np.ones((7, 7), dtype=np.uint8), iterations=1)
+    if not np.any(center_mask):
+        center_mask = mask
+    ring_mask = cv2.subtract(mask, center_mask)
     neutral_gray = (
         (saturation <= 95)
         & (value >= 90)
@@ -446,7 +361,7 @@ def wreck_shape_metrics(
         else 0.0
     )
 
-    valid_mask = roi_mask > 0
+    valid_mask = mask > 0
     cyan = (
         (saturation >= 60)
         & (value >= 120)
@@ -504,19 +419,15 @@ def surface_glare_score(
     mask = _diamond_evidence_mask(image, point, cell_polygon=cell_polygon)
     if mask is None:
         return 0.0
-    cropped = _crop_roi(image, mask, cell_polygon)
-    if cropped is None:
-        return 0.0
-    roi, roi_mask, x0, y0 = cropped
     try:
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         saturation = hsv[:, :, 1]
         value = hsv[:, :, 2]
-        b, g, r = cv2.split(roi)
+        b, g, r = cv2.split(image)
     except (cv2.error, ValueError):
         return 0.0
 
-    valid_mask = roi_mask > 0
+    valid_mask = mask > 0
     cyan = (
         (saturation >= 60)
         & (value >= 120)
@@ -540,9 +451,8 @@ def surface_glare_score(
         and baseline.temporal_mad.shape == image.shape[:2]
         and baseline.median_gray.shape == image.shape[:2]
     ):
-        roi_h, roi_w = roi.shape[:2]
         if baseline.frame_count >= 2:
-            temporal = baseline.temporal_mad[y0 : y0 + roi_h, x0 : x0 + roi_w][valid_mask]
+            temporal = baseline.temporal_mad[valid_mask]
             if temporal.size:
                 temporal_score = max(0.0, min(1.0, float(np.median(temporal)) / 8.0))
         # MAD describes motion *within* the baseline and can be zero when a
@@ -550,16 +460,15 @@ def surface_glare_score(
         # current cell to the median water image as a second, local signal.
         try:
             current_gray = cv2.cvtColor(
-                roi,
+                image,
                 cv2.COLOR_BGR2GRAY,
             ).astype(np.float32)
         except (cv2.error, TypeError, ValueError):
             current_gray = None
         if current_gray is not None:
-            baseline_crop = baseline.median_gray[
-                y0 : y0 + roi_h, x0 : x0 + roi_w
-            ].astype(np.float32)
-            residual = np.abs(current_gray - baseline_crop)
+            residual = np.abs(
+                current_gray - baseline.median_gray.astype(np.float32)
+            )
             local_residual = residual[valid_mask]
             if local_residual.size:
                 residual_p75 = float(np.percentile(local_residual, 75))
@@ -600,11 +509,10 @@ def surface_reflection_detected(
     baseline: SurfaceWaterBaseline | None = None,
     cell_polygon: np.ndarray | None = None,
     relative_position: tuple[float, float] | None = None,
-    _metrics: WreckShapeMetrics | None = None,
 ) -> bool:
     """Return whether the cell is dominated by water reflection/highlight."""
 
-    metrics = _metrics or wreck_shape_metrics(image, point, cell_polygon=cell_polygon)
+    metrics = wreck_shape_metrics(image, point, cell_polygon=cell_polygon)
     score = surface_glare_score(
         image,
         point,
@@ -1073,15 +981,7 @@ def detect_red_submarine_marker_cells(
     click_points: list[tuple[int, int]],
     grid_size: int,
 ) -> set[Cell]:
-    """Assign visible red submarine components to their unique grid cells.
-
-    Overlapping parallel submarines would otherwise bind both flags onto one row
-    ((1,1) and (1,2) on level 20), which makes the per-anchor binding solver
-    unable to tell the two hulls apart and demotes every submarine cell to a
-    provisional candidate.  Split neighbouring mis-bindings here so each flag
-    owns a distinct hull row, while leaving same-cell collapses collapsed: that
-    count selects the (more robust) global geometry branch in main.py.
-    """
+    """Assign visible red submarine components to their unique grid cells."""
     if not isinstance(screenshot, np.ndarray) or screenshot.ndim != 3:
         return set()
     if grid_size <= 0 or len(click_points) != grid_size * grid_size:
@@ -1090,8 +990,6 @@ def detect_red_submarine_marker_cells(
         screenshot,
         [(int(x), int(y)) for x, y in click_points],
         grid_size,
-        deduplicate=True,
-        split_exact=False,
     )
 
 
@@ -1149,16 +1047,7 @@ def detect_completed_submarine_candidate_cells(
         return set()
 
     normalized_points = [(int(x), int(y)) for x, y in click_points]
-    # Use the de-duplicated anchors here (unlike detect_red_submarine_marker_cells):
-    # when two overlapping submarines share one brightest hull cell, the split
-    # anchor for the second hull widens the candidate reach onto its own row, so
-    # the global geometry solver can recover it.
-    anchors = _detect_completed_ship_anchor_cells(
-        screenshot,
-        normalized_points,
-        grid_size,
-        deduplicate=True,
-    )
+    anchors = _detect_completed_ship_anchor_cells(screenshot, normalized_points, grid_size)
     if not anchors:
         return set()
 
@@ -1330,13 +1219,13 @@ def detect_completed_submarine_candidate_cells(
                     end_col = max(col for _, col in placement)
                     while start_col > 0:
                         cell = (row, start_col - 1)
-                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_BODY_MIN_SCORE:
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
                             break
                         selected.add(cell)
                         start_col -= 1
                     while end_col + 1 < grid_size:
                         cell = (row, end_col + 1)
-                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_BODY_MIN_SCORE:
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
                             break
                         selected.add(cell)
                         end_col += 1
@@ -1346,13 +1235,13 @@ def detect_completed_submarine_candidate_cells(
                     end_row = max(row for row, _ in placement)
                     while start_row > 0:
                         cell = (start_row - 1, col)
-                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_BODY_MIN_SCORE:
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
                             break
                         selected.add(cell)
                         start_row -= 1
                     while end_row + 1 < grid_size:
                         cell = (end_row + 1, col)
-                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_BODY_MIN_SCORE:
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
                             break
                         selected.add(cell)
                         end_row += 1
@@ -1367,9 +1256,6 @@ def _detect_completed_ship_anchor_cells(
     image: np.ndarray,
     click_points: list[tuple[int, int]],
     grid_size: int,
-    *,
-    deduplicate: bool = False,
-    split_exact: bool = True,
 ) -> set[Cell]:
     height, width = image.shape[:2]
     xs = [point[0] for point in click_points]
@@ -1416,16 +1302,8 @@ def _detect_completed_ship_anchor_cells(
     )
     max_point_distance_sq = (step * COMPLETED_SHIP_MARKER_MAX_POINT_DISTANCE_FACTOR) ** 2
 
+    anchors: set[Cell] = set()
     num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(red_mask, connectivity=8)
-
-    # Each red component is assigned to a hull cell.  In an isometric frame two
-    # surfaced submarines can overlap (the parallel length-5 and length-3 hulls
-    # at the top of level 20) so their flags can project onto the *same*
-    # brightest hull cell.  Keeping the per-marker single best cell then
-    # collapses two real submarines into one anchor, and the later per-anchor
-    # straight-run step silently drops the second hull.  Collect all
-    # per-component binding candidates first and resolve those collisions below.
-    component_records: list[dict[str, object]] = []
     for label_index in range(1, num_labels):
         area = int(stats[label_index, cv2.CC_STAT_AREA])
         component_width = int(stats[label_index, cv2.CC_STAT_WIDTH])
@@ -1480,7 +1358,6 @@ def _detect_completed_ship_anchor_cells(
 
         best_index = nearest_index
         best_key: tuple[float, float, float, int] | None = None
-        candidate_bodies: dict[tuple[int, int], float] = {}
         for index in candidate_indices:
             point = click_points[index]
             candidate_row, candidate_col = divmod(index, grid_size)
@@ -1493,7 +1370,6 @@ def _detect_completed_ship_anchor_cells(
                 point,
                 cell_polygon=grid_cell_polygon(click_points, index, grid_size),
             )
-            candidate_bodies[(candidate_row, candidate_col)] = float(body_score)
             # Prefer strong hull evidence first, then proximity.  The small
             # proximity tie-break keeps a flag centred on its own hull from
             # jumping to a similarly bright neighbouring cell.
@@ -1512,161 +1388,9 @@ def _detect_completed_ship_anchor_cells(
 
         if best_key is not None and best_key[0] < COMPLETED_SHIP_BODY_MIN_SCORE:
             best_index = nearest_index
-        best_cell = (best_index // grid_size, best_index % grid_size)
-        component_records.append(
-            {
-                "nearest_cell": (nearest_row, nearest_col),
-                "best_cell": best_cell,
-                "body": float(best_key[0]) if best_key is not None else 0.0,
-                "candidate_bodies": candidate_bodies,
-            }
-        )
+        anchors.add((best_index // grid_size, best_index % grid_size))
 
-    if deduplicate:
-        return _deduplicate_anchor_collisions(
-            component_records,
-            grid_size,
-            split_exact=split_exact,
-        )
-    return {
-        (int(record["best_cell"][0]), int(record["best_cell"][1]))
-        for record in component_records
-        if record["best_cell"] is not None
-    }
-
-
-def _deduplicate_anchor_collisions(
-    records: Sequence[dict[str, object]],
-    grid_size: int,
-    *,
-    split_exact: bool = True,
-) -> set[Cell]:
-    """Resolve red-marker anchors that overlap onto the same or adjacent cells.
-
-    Two surfaced submarines seen in the same isometric frame can overlap (the
-    parallel length-5 and length-3 hulls at the top of level 20).  Their flags
-    then bind either to the *same* brightest hull cell or to two *neighbouring*
-    cells ((1,1) and (1,2)).  Adjacent cells can never belong to two different
-    submarines because the game keeps at least one empty cell between hulls, so
-    both shapes are mis-bindings that leave two anchors on one row and hide the
-    parallel hull from the per-anchor solver.
-
-    For each such group, keep the marker that has no independent strong hull to
-    retreat to, and move every other marker to its own distinct,
-    strongly-supported hull cell that is not on the same sub-region as the
-    shared cell (Chebyshev distance > 1).  Cells already claimed by another
-    marker are never reused.
-
-    ``split_exact`` controls whether markers that landed on the *same* cell are
-    split as well.  The red-marker anchor set used by main.py keeps those
-    collapsed: that count selects the global geometry branch, which is more
-    robust than the per-anchor branch for those frames.  Only the neighbouring
-    pairs are split there.  The candidate generator splits both.
-    """
-    by_cell: dict[Cell, list[dict[str, object]]] = defaultdict(list)
-    for record in records:
-        cell = record["best_cell"]
-        if cell is None:
-            continue
-        by_cell[(int(cell[0]), int(cell[1]))].append(record)
-
-    cell_entries: list[tuple[Cell, list[dict[str, object]]]] = []
-    for cell, group in by_cell.items():
-        if len(group) > 1 and not split_exact:
-            strongest = max(group, key=lambda r: float(r.get("body", 0.0)))
-            cell_entries.append((cell, [strongest]))
-        else:
-            cell_entries.append((cell, list(group)))
-
-    merged_groups: list[tuple[Cell, list[dict[str, object]]]] = []
-    for cell, group in cell_entries:
-        for index, (_rep_cell, accumulated) in enumerate(merged_groups):
-            if any(
-                max(abs(cell[0] - int(r["best_cell"][0])), abs(cell[1] - int(r["best_cell"][1]))) <= 1
-                for r in accumulated
-            ):
-                accumulated.extend(group)
-                strongest = max(accumulated, key=lambda r: float(r.get("body", 0.0)))
-                strongest_cell = strongest["best_cell"]
-                merged_groups[index] = (
-                    (int(strongest_cell[0]), int(strongest_cell[1])),
-                    accumulated,
-                )
-                break
-        else:
-            merged_groups.append((cell, list(group)))
-
-    def alternative_cells(
-        record: dict[str, object],
-        shared_cell: Cell,
-    ) -> list[Cell]:
-        candidate_bodies = record["candidate_bodies"]
-        if not isinstance(candidate_bodies, dict):
-            return []
-        alternatives: list[tuple[float, Cell]] = []
-        for cell, body in candidate_bodies.items():
-            cell = (int(cell[0]), int(cell[1])) if isinstance(cell, tuple) else cell
-            if cell == shared_cell:
-                continue
-            if not isinstance(body, (int, float)) or body < COMPLETED_SHIP_DIAGONAL_BODY_MIN_SCORE:
-                continue
-            if max(abs(cell[0] - shared_cell[0]), abs(cell[1] - shared_cell[1])) <= 1:
-                continue
-            alternatives.append((float(body), cell))
-        alternatives.sort(reverse=True)
-        return [cell for _body, cell in alternatives]
-
-    used: set[Cell] = set()
-    final: list[Cell] = []
-    for shared_cell, group in merged_groups:
-        if len(group) == 1:
-            cell = group[0]["best_cell"]
-            if cell is not None and cell not in used:
-                final.append((int(cell[0]), int(cell[1])))
-                used.add((int(cell[0]), int(cell[1])))
-            continue
-
-        # Keep the marker that cannot move to another strong hull.  If every
-        # marker in the group can move, keep the strongest body evidence.
-        stuck = [r for r in group if not alternative_cells(r, shared_cell)]
-        if stuck:
-            primary = max(stuck, key=lambda r: float(r.get("body", 0.0)))
-        else:
-            primary = max(group, key=lambda r: float(r.get("body", 0.0)))
-
-        if shared_cell in used:
-            placed = False
-            for candidate in alternative_cells(primary, shared_cell):
-                if candidate not in used:
-                    final.append(candidate)
-                    used.add(candidate)
-                    placed = True
-                    break
-            if not placed:
-                continue
-        else:
-            final.append(shared_cell)
-            used.add(shared_cell)
-
-        for record in group:
-            if record is primary:
-                continue
-            placed = False
-            for candidate in alternative_cells(record, shared_cell):
-                if candidate not in used:
-                    final.append(candidate)
-                    used.add(candidate)
-                    placed = True
-                    break
-            if not placed:
-                nearest = record.get("nearest_cell")
-                if isinstance(nearest, tuple) and nearest not in used:
-                    nearest_cell = (int(nearest[0]), int(nearest[1]))
-                    if nearest_cell not in used:
-                        final.append(nearest_cell)
-                        used.add(nearest_cell)
-
-    return set(final)
+    return anchors
 
 
 def grid_cell_polygon(
@@ -1866,23 +1590,6 @@ def visible_wreck_static_detected(
     if not ignore_submarine_marker and red_submarine_marker_visible(image, point):
         return False
 
-    # Both the template path and the classify fallback below require
-    # ``score >= WRECK_SHAPE_MIN_SCORE`` and ``center_gray_ratio >=
-    # STATIC_WRECK_MIN_CENTER_GRAY_RATIO``.  Water cells fail that test and, if
-    # we let them continue, would pay for the surface-reflection gate, the
-    # multi-scale template match and the full diamond classifier before being
-    # rejected.  Compute the shape once here and short-circuit those cells so
-    # only genuinely hull-like candidates reach the expensive checks.  This is
-    # behaviour-identical: every surviving path still requires the same gate.
-    shape = wreck_shape_metrics(
-        image,
-        point,
-        cell_polygon=cell_polygon,
-        exclude_activity_title_overlay=filter_activity_title_overlay,
-    )
-    if not static_wreck_shape_accepts(shape):
-        return False
-
     # Reject broad blue/teal specular highlights before template matching.  A
     # reflection can reach the old 0.965 template threshold even though it has
     # no compact neutral hull.  The gate is spatially relative to the board
@@ -1894,12 +1601,18 @@ def visible_wreck_static_detected(
             baseline=surface_baseline,
             cell_polygon=cell_polygon,
             relative_position=relative_position,
-            _metrics=shape,
         ):
             return False
     if wreck_template_visible(image, point, cell_polygon=cell_polygon):
-        # Shape evidence already passed the conservative gate above.
-        return True
+        # Template correlation alone is not enough for the static recovery
+        # path: a small bright-water patch can match a masked template at a
+        # high score.  Require a compact, centre-weighted neutral shape too.
+        return wreck_shape_metrics(
+            image,
+            point,
+            cell_polygon=cell_polygon,
+            exclude_activity_title_overlay=filter_activity_title_overlay,
+        ).score >= WRECK_SHAPE_MIN_SCORE
     try:
         # Static review must stay tied to the requested cell.  The default
         # 14px refinement can jump across a tile edge and classify a nearby
@@ -1913,6 +1626,14 @@ def visible_wreck_static_detected(
     except Exception:
         return False
     if str(getattr(result, "state", "")).strip().lower() != "hit":
+        return False
+    shape = wreck_shape_metrics(
+        image,
+        point,
+        cell_polygon=cell_polygon,
+        exclude_activity_title_overlay=filter_activity_title_overlay,
+    )
+    if shape.score < WRECK_SHAPE_MIN_SCORE:
         return False
     if cell_polygon is None:
         return True

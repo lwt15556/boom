@@ -19,12 +19,8 @@ import numpy as np
 
 from config import (
     AUTO_DETECT_LEVEL,
-    BOARD_RECOGNIZER_MODE,
-    BOARD_RECOGNIZER_STRICT_ONLY,
     DEFAULT_LEVEL,
     GAME_PACKAGE_NAME,
-    HIT_METHOD,
-    HIT_BINARIZE_PRIMARY,
     LEVEL_GRID_SIZES,
     LEVEL_REFERENCE_DIR,
     MAX_LEVEL,
@@ -33,7 +29,6 @@ from config import (
     MAX_SCREENSHOT_STORAGE_BYTES,
     OUTPUT_DIR,
     REQUIRE_CONFIDENT_LEVEL_DETECTION,
-    USE_SUBMARINE_DETECTOR,
     SCREENSHOT_DIR,
     SUBMARINES,
     TEMPLATE_DIR,
@@ -41,25 +36,11 @@ from config import (
 )
 from save_points.points import read_saved_points, read_saved_quad
 from utils import AdbController, MatchResult, find_template, get_logger
-from utils.submarine_detector import (
-    SURFACE_COVERAGE_SPURIOUS_MAX,
-    SURFACE_WATER,
-    SURFACE_WAVE,
-    classify_surface_cells,
-    detect_ship_and_debris_cells,
-    detect_ship_cells_by_red_tower,
-    detect_wreck_cells_by_features,
-    detect_water_cells_by_features,
-    surface_coverage_map,
-)
 from utils.adaptive_frames import (
     ADAPTIVE_HIT_MIN_FRAMES,
     can_stop_after_stable_hit_frames,
 )
-from utils.diamond_centers import (
-    detect_grid_points_red_roi,
-    centers_from_quad,
-)
+from utils.diamond_centers import detect_diamond_centers
 from utils.diamond_hit import classify_diamond_hit
 from utils.frame_stability import (
     analyze_stable_hit,
@@ -114,16 +95,15 @@ from utils.wreck_detection import (
     completed_ship_body_score,
     detect_completed_submarine_candidate_cells,
     detect_red_submarine_marker_cells,
-    # Re-exported for callers/tests that reach the wreck helpers through main.
-    red_hit_marker_visible,
+    VISIBLE_WRECK_TEMPLATES,
     PARTIAL_WRECK_TEMPLATES,
     detect_visible_wreck_cells,
     grid_cell_polygon,
     is_title_occluded_cell,
+    red_hit_marker_visible,
     red_submarine_marker_visible,
     surface_reflection_detected,
     wreck_shape_metrics,
-    wreck_template_visible,
     visible_wreck_static_detected,
 )
 from utils.red_scout import (
@@ -131,55 +111,9 @@ from utils.red_scout import (
     RedScoutSettings, RedScoutPlanner, ammo_fingerprint_matches, build_ammo_fingerprint,
     load_red_scout_settings, locate_red_bomb_button, red_bomb_selected,
 )
-from utils.board_recognizer import (
-    binarize_cell_hit,
-    binarize_reveal_cells,
-    classify_board_cells,
-    classify_board_cells_classes,
-    load_board_model,
-)
 
 logger = get_logger(__name__)
 adb = AdbController()
-
-_BOARD_MODEL_CACHE: object | None = None
-_BOARD_MODEL_CACHE_LOADED = False
-
-
-def board_recognizer_model_path() -> Path:
-    """返回二值法识别模型文件的路径（board_cell_model.json）。"""
-    from utils.board_recognizer import DEFAULT_WEIGHTS
-
-    return DEFAULT_WEIGHTS
-
-
-def _board_recognizer_model():
-    """懒加载并缓存二值法识别模型；无模型或加载失败返回 None。"""
-    global _BOARD_MODEL_CACHE, _BOARD_MODEL_CACHE_LOADED
-    if not _BOARD_MODEL_CACHE_LOADED:
-        _BOARD_MODEL_CACHE = load_board_model()
-        _BOARD_MODEL_CACHE_LOADED = True
-    return _BOARD_MODEL_CACHE
-
-
-def _board_strict_only() -> bool:
-    """严格二值法模式：开局识图只用二值法结果。环境变量优先，否则用 config 默认。"""
-    raw = os.environ.get(BOARD_STRICT_ONLY_ENV, "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "off", "no"}:
-        return False
-    return bool(BOARD_RECOGNIZER_STRICT_ONLY)
-
-
-def _hit_binarize_primary() -> bool:
-    """攻击后判定是否以二值法为准。环境变量优先，否则用 config 默认。"""
-    raw = os.environ.get(HIT_BINARIZE_PRIMARY_ENV, "").strip().lower()
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "off", "no"}:
-        return False
-    return bool(HIT_BINARIZE_PRIMARY)
 
 
 def completed_placement_safety_area(
@@ -252,14 +186,14 @@ VICTORY_WAIT_AFTER_CONFIRMED_INCOMPLETE_SECONDS = 2.0
 VICTORY_WAIT_BEFORE_LEVEL_SECONDS = 3.0
 VICTORY_SKIP_SETTLE_SECONDS = 2.0
 LEVEL_ADVANCE_RETRIES = 3
-HIT_RESULT_FRAME_DELAYS = (0.8, 0.2, 0.25)
+HIT_RESULT_FRAME_DELAYS = (1.0, 0.35, 0.45)
 # A white wreck can exist throughout the short explosion animation even when
 # the request did not open the cell. Delay one extra frame before committing a
 # static-template hit so transient animation cannot become a durable hit.
 STATIC_WRECK_PERSISTENCE_DELAY_SECONDS = 2.0
 # Red scout results only need three frames: misses require three consistent
 # votes, while hits still require at least two votes in the analyzer.
-RED_SCOUT_RESULT_FRAME_DELAYS = (0.50, 0.10, 0.10)
+RED_SCOUT_RESULT_FRAME_DELAYS = (0.55, 0.15, 0.20)
 # A red result is analysed only when at least two result frames survive the
 # transition-frame filter.  Keeping this threshold aligned with the analyzer's
 # vote requirement prevents a single potentially stale frame from becoming a
@@ -272,7 +206,7 @@ INITIAL_SURFACE_BASELINE_FRAME_DELAYS = (0.12, 0.16)
 # Online blue shots already have a confirmed target from the red scout. Keep
 # the same number of evidence frames, but sample the result sooner so the next
 # confirmed target is not delayed by the generic offline-probe timing.
-ONLINE_SCOUT_HIT_FRAME_DELAYS = (0.50, 0.15, 0.20)
+ONLINE_SCOUT_HIT_FRAME_DELAYS = (0.55, 0.20, 0.28, 0.40)
 ONLINE_SCOUT_STABLE_HIT_MIN_FRAMES = 3
 # Once a red-scout batch has established and verified blue mode, subsequent
 # confirmed targets can use a shorter two-frame evidence window. Unstable
@@ -294,17 +228,14 @@ ONLINE_SCOUT_BATCH_ENABLED = True
 # but confirm 10x10 red-scout hits one cell at a time.
 ONLINE_SCOUT_BATCH_MAX_GRID_SIZE = 9
 ONLINE_SCOUT_BATCH_CLICK_INTERVAL_SECONDS = 0.25
-ONLINE_SCOUT_BATCH_FRAME_DELAYS = (0.50, 0.15, 0.20)
+ONLINE_SCOUT_BATCH_FRAME_DELAYS = (0.55, 0.22, 0.32)
 ADAPTIVE_HIT_FRAMES_ENABLED = True
 # Misses are the common case in blue-only strategy scanning.  Once two
 # post-click frames both show a low-score miss with no completion evidence,
 # waiting for the remaining animation frames adds latency without improving
 # the decision.  Hits continue to use the existing multi-frame gate.
 ADAPTIVE_MISS_MIN_FRAMES = 2
-# Suspect-hit extra frames are disabled: the decision now uses only the
-# regular result frames (plus adaptive early stop) to keep capture count and
-# latency low.
-SUSPECT_HIT_EXTRA_FRAME_DELAYS = ()
+SUSPECT_HIT_EXTRA_FRAME_DELAYS = (0.45, 0.55, 0.65)
 MIN_HIT_RESULT_VOTES = 2
 SUSPECT_HIT_SCORE_THRESHOLD = 0.78
 STRONG_SINGLE_HIT_SCORE = 0.90
@@ -349,52 +280,6 @@ ONLINE_SCOUT_BLUE_SELECT_FAST_SETTLE_SECONDS = 0.1
 ONLINE_SCOUT_BLUE_SELECT_RETRY_SECONDS = 0.15
 STATUS_REPLACE_RETRIES = 5
 STATUS_REPLACE_RETRY_SECONDS = 0.05
-# Server-commit confirmation: after a hit restores the network, the committed
-# request must reach the server before the next probe can cut the network again.
-# A blind settle (BLUE_REQUEST_UPLOAD_SETTLE_SECONDS) is not enough, because the
-# upload can be slower.  Instead we wait for a flash of small orange markers in
-# the title/upper-submarine region -- that flash only occurs once the server has
-# accepted the upload.  ROI is measured on the 1280x720 screen.
-SERVER_CONFIRM_ROI = (585, 45, 705, 175)  # x0, y0, x1, y1
-SERVER_CONFIRM_MIN_NEW_MARKERS = 3
-SERVER_CONFIRM_MIN_AREA = 8
-SERVER_CONFIRM_HUE = (10, 35)
-SERVER_CONFIRM_SAT_MIN = 90
-SERVER_CONFIRM_VAL_MIN = 120
-SERVER_CONFIRM_POLL_SECONDS = 0.15
-SERVER_CONFIRM_TIMEOUT_SECONDS = 8.0
-
-# Opt-in: also merge the sprite-level submarine detector's cells into the
-# start-of-level recognition (helps cells with a surfaced submarine).
-USE_SUBMARINE_DETECTOR_ENV = "BBMA_USE_SUBMARINE_DETECTOR"
-# Opt-in: merge the binarized board-cell recognizer (board_cell_model.json) into
-# the start-of-level recognition.  Requires the model to exist (train it via
-# tools/train_board_real.py).  Off by default.
-USE_BOARD_RECOGNIZER_ENV = "BBMA_USE_BOARD_RECOGNIZER"
-# Values: "merge" (add to existing startup hits, default when enabled),
-# "only" (二值法作为启动潜艇格识别的唯一来源，丢弃残骸/模板/特征检测结果).
-BOARD_RECOGNIZER_MODE_ENV = "BBMA_BOARD_RECOGNIZER_MODE"
-# 严格二值法模式：开局识图只用二值法，丢弃其它所有开局视觉。默认关（保留现有行为）。
-BOARD_STRICT_ONLY_ENV = "BBMA_BOARD_STRICT_ONLY"
-# 攻击后判定是否以二值法为准（True）/ 只做补充（False）。
-HIT_BINARIZE_PRIMARY_ENV = "BBMA_HIT_BINARIZE_PRIMARY"
-# Reveal-board swipe: 10x10 (level 8+) boards have their top cells occluded by
-# the title bar.  After entering the activity, swipe the page down so the whole
-# board is visible, then re-calibrate on the revealed view.
-SWIPE_REVEAL_ENV = "BBMA_SWIPE_REVEAL"
-SWIPE_REVEAL_GRID_MIN = 10
-SWIPE_REVEAL_START_POINT = (170, 100)   # a point on the board to scroll from
-SWIPE_REVEAL_DISTANCE = 50              # px to swipe down
-SWIPE_REVEAL_DURATION_MS = 800   # slow drag: scrolls exactly, avoids inertia overshoot
-SWIPE_REVEAL_END_HOLD_MS = 300   # pause at the swipe endpoint before lifting
-SWIPE_REVEAL_SETTLE_SECONDS = 0.8
-# Fixed calibration quad for the revealed (post-swipe) 10x10 board view.  The
-# swipe moves the whole board down; snapping the quad to these four corners
-# (top / right / bottom / left) gives an exact fit.  bottom=(686,718) stays just
-# inside the frame so the calibration remains in-bounds.
-SWIPE_REVEAL_QUAD = np.array(
-    [[676, 96], [1100, 355], [686, 718], [262, 352]], dtype=np.float32
-)
 
 ACTIVITY_DETAIL_POINT = (1205, 644)
 ACTIVITY_LIST_SWIPE = (1000, 660, 1000, 180)
@@ -465,15 +350,6 @@ class RedScoutSafetyError(RuntimeError):
     pass
 
 
-class ProbeSafetyError(RuntimeError):
-    """蓝弹侧的安全停机（如网络隔离校验失败）。
-
-    刻意**不**继承 ``ProbeProtocolError``：后者在 main.py 有若干 ``except``
-    会把它吞掉并继续跑，而安全停机必须一路冒到入口、在断网状态下关掉游戏。
-    入口对它有专门的退出码，日志里也与「协议错误」区分开。
-    """
-
-
 class BlueAmmoDepletedError(RuntimeError):
     """Raised before a blue-bomb action when the visible count is zero."""
 
@@ -510,15 +386,6 @@ def _probe_result_completed_level(result: ProbeResult) -> bool:
         ProbeResult.HIT_AND_LEVEL_COMPLETE,
         ProbeResult.LEVEL_COMPLETE,
     }
-
-
-def _cells_are_adjacent(a: Cell, b: Cell, distance: int = 1) -> bool:
-    """切比雪夫邻接判断。
-
-    残骸/潜艇的「保护圈」（紧邻已确认物体就不当水面删、锚点附近可达等）统一用
-    这个距离定义，避免各处重复写 ``max(abs(...), abs(...)) <= N``。
-    """
-    return max(abs(a[0] - b[0]), abs(a[1] - b[1])) <= distance
 
 
 def build_runtime_board_states(strategy: object, grid_size: int) -> list[list[str]]:
@@ -577,6 +444,30 @@ def build_runtime_board_states(strategy: object, grid_size: int) -> list[list[st
     for row, col in set(getattr(strategy, "blocked_cells", set())) - visual_ship_cells:
         if 0 <= row < grid_size and 0 <= col < grid_size:
             states[row][col] = "miss"
+    return states
+
+
+def build_red_scout_board_states(
+    grid_size: int,
+    *,
+    hits: set[Cell],
+    misses: set[Cell],
+    initial_hits: set[Cell] | None = None,
+    initial_misses: set[Cell] | None = None,
+) -> list[list[str]]:
+    states = [["unknown" for _col in range(grid_size)] for _row in range(grid_size)]
+    for row, col in misses - hits:
+        if 0 <= row < grid_size and 0 <= col < grid_size:
+            states[row][col] = "scout_miss"
+    for row, col in hits:
+        if 0 <= row < grid_size and 0 <= col < grid_size:
+            states[row][col] = "scout_hit"
+    for row, col in initial_misses or set():
+        if 0 <= row < grid_size and 0 <= col < grid_size:
+            states[row][col] = "miss"
+    for row, col in initial_hits or set():
+        if 0 <= row < grid_size and 0 <= col < grid_size:
+            states[row][col] = "hit"
     return states
 
 
@@ -1450,6 +1341,23 @@ def _persist_probe_debug_images(
             frame_records[capture_index]["saved"] = True
 
 
+def _save_batch_tap_capture(
+    sample_dir: Path | None,
+    filename: str,
+    capture: object,
+) -> str | None:
+    """Persist a per-target tap frame and return its path for metadata."""
+    if sample_dir is None or capture is None:
+        return None
+    try:
+        path = sample_dir / filename
+        capture.save(path)
+        return str(path)
+    except (AttributeError, OSError) as exc:
+        logger.warning("could not save batch tap frame %s: %s", filename, exc)
+        return None
+
+
 def _save_batch_tap_image(
     sample_dir: Path | None,
     filename: str,
@@ -1508,6 +1416,30 @@ def _batch_screen_changed(before: object, after: object) -> bool:
     if before_img.shape != after_img.shape:
         return True
     return not np.array_equal(before_img, after_img)
+
+
+def _validate_batch_board_frame(
+    image: np.ndarray,
+    *,
+    level: int,
+    baseline: np.ndarray | None,
+    stage: str,
+) -> None:
+    """Fail closed when a batch leaves the current activity detail page."""
+    if not isinstance(image, np.ndarray):
+        raise ProbeProtocolError(f"online scout-hit batch {stage} screenshot is invalid")
+    if find_victory_banner(image) is not None:
+        raise ProbeProtocolError(
+            f"online scout-hit batch {stage} detected victory for level {level}"
+        )
+    if find_connection_interrupted_dialog(image) is not None:
+        raise ProbeProtocolError(
+            f"online scout-hit batch {stage} detected connection dialog"
+        )
+    if find_template(image, QUIT_ACTIVITY_TEMPLATE) is None:
+        raise ProbeProtocolError(
+            f"online scout-hit batch {stage} activity detail disappeared"
+        )
 
 
 def _is_near_hit_frame(result) -> bool:
@@ -1681,15 +1613,6 @@ def apply_wreck_template_confirmation(
     ):
         return False
 
-    # A real wreck opens toward gray: the local saturation drops (s_drop > 0).
-    # A template match on a cell that did not actually open (non-positive s_drop)
-    # is a nearby marker/submarine, not a hit -- refuse to promote it.
-    try:
-        if float(getattr(result, "s_drop", 0.0)) <= 0.0:
-            return False
-    except (TypeError, ValueError):
-        return False
-
     result.state = "hit"
     result.score = max(float(result.score), 0.94)
     result.confidence = max(float(result.confidence), 0.95)
@@ -1721,20 +1644,6 @@ def apply_completed_submarine_confirmation(
         )
         < COMPLETED_SHIP_BODY_MIN_SCORE
     ):
-        return False
-
-    # The red marker alone is not enough: a surfaced submarine right next to the
-    # probed cell can spill a red marker/hull into this cell's detection region
-    # even on a miss.  Require genuine centre evidence (a coherent gray/white
-    # hull component at the cell centre) before promoting to hit.  This is
-    # deliberately NOT gated on s_drop: a real surfaced-submarine marker is red
-    # and can raise saturation (s_drop <= 0), so centre-evidence is the gate.
-    try:
-        center_gray_ratio = float(getattr(result, "center_gray_ratio", 0.0))
-        component_ratio = float(getattr(result, "component_ratio", 0.0))
-    except (TypeError, ValueError):
-        center_gray_ratio, component_ratio = 0.0, 0.0
-    if not (center_gray_ratio >= 0.10 or component_ratio >= 0.10):
         return False
 
     result.state = "hit"
@@ -1884,7 +1793,10 @@ def _merge_completed_visual_snapshot(
     conflicting = {
         cell
         for cell in merged - authoritative
-        if any(_cells_are_adjacent(cell, (row, col)) for row, col in authoritative)
+        if any(
+            max(abs(cell[0] - row), abs(cell[1] - col)) <= 1
+            for row, col in authoritative
+        )
     }
     return (merged - conflicting) | authoritative
 
@@ -1914,33 +1826,11 @@ def enforce_positive_hit_evidence(
     if changed_ratio <= 0.0:
         return False
 
-    # A real hit opens the cell toward a gray wreck: the local saturation drops
-    # (s_drop > 0).  A large changed_ratio with a non-positive s_drop is a moving
-    # flag/marker (e.g. a surfaced-submarine flag crossing the cell), not a cell
-    # opened by a hit.  Never accept that as a hit.
-    try:
-        s_drop = float(getattr(result, "s_drop", 0.0))
-    except (TypeError, ValueError):
-        s_drop = 0.0
-
     if result.state != "hit":
-        if s_drop <= 0.0:
-            result.state = "miss"
-            result.evidence_vetoed = True
-            logger.info(
-                "rejecting visual-change hit with no hit pattern: "
-                "changed_ratio=%.3f s_drop=%.2f wreck=%s sidebar=%s",
-                changed_ratio,
-                s_drop,
-                wreck_hit,
-                sidebar_hit,
-            )
-            return False
         logger.info(
             "accepting blue result as hit from post-click visual change: "
-            "changed_ratio=%.3f s_drop=%.2f wreck=%s sidebar=%s",
+            "changed_ratio=%.3f wreck=%s sidebar=%s",
             changed_ratio,
-            s_drop,
             wreck_hit,
             sidebar_hit,
         )
@@ -2350,7 +2240,7 @@ def _exit_activity_after_probe_click(
     )
 
 
-def _reenter_activity_for_probe_result(level: int) -> bool:
+def _reenter_activity_for_probe_result() -> bool:
     return enter_activity(re_enter=True, max_retries=1) is True
 
 
@@ -2363,7 +2253,6 @@ def _analyze_red_result(
     excluded_cells: Sequence[Cell] | set[Cell] | frozenset[Cell] | None = None,
     learned_footprint: RedFootprint | None = None,
     submarine_lengths: Sequence[int] = (),
-    binarize_hit_cells: frozenset[Cell] = frozenset(),
 ):
     return RedScoutAnalyzer().analyze(
         before_image=before_image,
@@ -2374,7 +2263,6 @@ def _analyze_red_result(
         excluded_cells=set() if excluded_cells is None else excluded_cells,
         learned_footprint=learned_footprint,
         submarine_lengths=submarine_lengths,
-        binarize_hit_cells=binarize_hit_cells,
     )
 
 
@@ -2536,7 +2424,6 @@ def _analyze_red_result_with_baseline_consensus(
     excluded_cells: Sequence[Cell] | set[Cell] | frozenset[Cell] | None = None,
     learned_footprint: RedFootprint | None = None,
     submarine_lengths: Sequence[int] = (),
-    binarize_hit_cells: frozenset[Cell] = frozenset(),
 ) -> RedScoutResult:
     baselines = tuple(
         baseline
@@ -2562,7 +2449,6 @@ def _analyze_red_result_with_baseline_consensus(
             excluded_cells=excluded_cells,
             learned_footprint=learned_footprint,
             submarine_lengths=submarine_lengths,
-            binarize_hit_cells=binarize_hit_cells,
         )
 
     median_baseline = np.median(np.stack(baselines, axis=0), axis=0).astype(
@@ -2673,7 +2559,7 @@ def _stop_and_latch_red_safety_failure(reason: str) -> None:
 
 
 def _stop_and_latch_blue_safety_failure(reason: str) -> None:
-    _stop_and_latch_safety_failure(reason, ProbeSafetyError)
+    _stop_and_latch_safety_failure(reason, ProbeProtocolError)
 
 
 def _verify_network_isolated_or_fail_closed(*, red_scout: bool) -> None:
@@ -2745,7 +2631,6 @@ def _execute_red_scout_transaction(
     submarine_lengths: Sequence[int] = (),
     attempt: int | None = None,
     surface_baseline: SurfaceWaterBaseline | None = None,
-    grid_quad: object = None,
 ):
     global _active_probe
     transaction = None
@@ -2809,7 +2694,7 @@ def _execute_red_scout_transaction(
             ),
             use_system_back=True,
         )
-        if _reenter_activity_for_probe_result(level):
+        if _reenter_activity_for_probe_result():
             transaction.advance(ProbePhase.RESULT_VISIBLE)
             transaction.advance(ProbePhase.RESULT_RECORDED)
             update_pending_probe(phase=ProbePhase.RESULT_RECORDED.name, local_victory=True)
@@ -2910,26 +2795,6 @@ def _execute_red_scout_transaction(
                     invalid_reason="local_victory_screen",
                     diagnostics={"stage": "result_frame_victory"},
                 )
-            binarize_hit_cells: frozenset[Cell] = frozenset()
-            if HIT_METHOD == "binarize" and before_images and captured_after_images:
-                binarize_model = _board_recognizer_model()
-                if binarize_model is not None:
-                    try:
-                        binarize_hit_cells = frozenset(
-                            binarize_reveal_cells(
-                                before_images[0],
-                                captured_after_images[-1],
-                                all_click_points,
-                                grid_size,
-                                binarize_model,
-                            )
-                        )
-                        logger.info(
-                            "red scout binarize evidence (step 5): %s",
-                            sorted(binarize_hit_cells),
-                        )
-                    except Exception as exc:
-                        logger.warning("red scout binarize evidence failed: %s", exc)
             analyzed = _analyze_red_result_with_baseline_consensus(
                 before_images=before_images,
                 after_images=captured_after_images,
@@ -2939,7 +2804,6 @@ def _execute_red_scout_transaction(
                 excluded_cells=excluded_cells,
                 learned_footprint=learned_footprint,
                 submarine_lengths=submarine_lengths,
-                binarize_hit_cells=binarize_hit_cells,
             )
             if surface_baseline is None or not analyzed.hit_cells:
                 return analyzed
@@ -2947,10 +2811,7 @@ def _execute_red_scout_transaction(
             # Wide, moving sea highlights can satisfy the red analyzer's
             # change vote across a whole row.  Re-check each reported hit
             # against the pre-click water baseline; keep compact wreck/hull
-            # evidence.  Broad glare is never promoted to scout-miss when the
-            # cell belongs to completed-ship geometry or is a forced endpoint
-            # of a confirmed hull run — upper-right wake often hides exactly
-            # that last cell, and a miss would permanently exclude it.
+            # evidence, but downgrade broad dynamic glare to scout-miss.
             reference = next(
                 (
                     frame
@@ -2961,59 +2822,7 @@ def _execute_red_scout_transaction(
             )
             if reference is None:
                 return analyzed
-            result_diagnostics = analyzed.diagnostics or {}
-            protected_ship_cells: set[Cell] = set()
-            for key in (
-                "resolved_ship_placements",
-                "partial_completed_body_hits",
-                "protected_ship_endpoints",
-                "protected_completed_endpoints",
-            ):
-                raw_values = result_diagnostics.get(key, ())
-                if not isinstance(raw_values, Sequence):
-                    continue
-                for raw_item in raw_values:
-                    if key == "resolved_ship_placements":
-                        if not isinstance(raw_item, Sequence):
-                            continue
-                        for raw_cell in raw_item:
-                            if (
-                                isinstance(raw_cell, Sequence)
-                                and not isinstance(raw_cell, (str, bytes))
-                                and len(raw_cell) == 2
-                            ):
-                                protected_ship_cells.add(
-                                    (int(raw_cell[0]), int(raw_cell[1]))
-                                )
-                    elif (
-                        isinstance(raw_item, Sequence)
-                        and not isinstance(raw_item, (str, bytes))
-                        and len(raw_item) == 2
-                    ):
-                        protected_ship_cells.add(
-                            (int(raw_item[0]), int(raw_item[1]))
-                        )
-            # A glare-looking endpoint that continues a straight hit run next
-            # to red-marker-supported geometry is still hull evidence.
-            # Protect it even when ship resolution failed because that same
-            # endpoint lacked body score under upper-right wake.
-            straight_run_protected: set[Cell] = set()
-            for candidate in analyzed.hit_cells:
-                row, col = candidate
-                for drow, dcol in ((0, 1), (1, 0)):
-                    neighbor = (row + drow, col + dcol)
-                    if neighbor not in analyzed.hit_cells:
-                        continue
-                    pair = (candidate, neighbor)
-                    if any(
-                        max(abs(cell[0] - ship_row), abs(cell[1] - ship_col)) <= 1
-                        for cell in pair
-                        for ship_row, ship_col in protected_ship_cells
-                    ):
-                        straight_run_protected.update(pair)
-            protected_ship_cells |= straight_run_protected
             glare_hits: set[Cell] = set()
-            glare_unknown: set[Cell] = set()
             for candidate in analyzed.hit_cells:
                 candidate_index = candidate[0] * grid_size + candidate[1]
                 if not (0 <= candidate_index < len(all_click_points)):
@@ -3021,16 +2830,6 @@ def _execute_red_scout_transaction(
                 candidate_point = all_click_points[candidate_index]
                 if red_submarine_marker_visible(reference, candidate_point):
                     continue
-                if candidate in protected_ship_cells:
-                    continue
-                near_ship_support = any(
-                    max(abs(candidate[0] - ship_row), abs(candidate[1] - ship_col)) <= 2
-                    for ship_row, ship_col in protected_ship_cells
-                ) or any(
-                    max(abs(candidate[0] - hit_row), abs(candidate[1] - hit_col)) <= 1
-                    for hit_row, hit_col in analyzed.hit_cells
-                    if (hit_row, hit_col) != candidate
-                )
                 if surface_reflection_detected(
                     reference,
                     candidate_point,
@@ -3056,50 +2855,26 @@ def _execute_red_scout_transaction(
                     cell=candidate,
                     grid_size=grid_size,
                 ):
-                    if near_ship_support:
-                        # Next to confirmed hull: glare is plausible, but so
-                        # is a dim endpoint.  Do not invent water knowledge.
-                        glare_unknown.add(candidate)
-                    else:
-                        glare_hits.add(candidate)
-            if not glare_hits and not glare_unknown:
+                    glare_hits.add(candidate)
+            if not glare_hits:
                 return analyzed
-            diagnostics = dict(result_diagnostics)
-            if glare_hits:
-                diagnostics["sea_highlight_hits_discarded"] = tuple(
-                    sorted(glare_hits)
-                )
-            if glare_unknown:
-                diagnostics["sea_highlight_hits_unknown"] = tuple(
-                    sorted(glare_unknown)
-                )
-            if protected_ship_cells:
-                diagnostics["sea_highlight_protected_ship_cells"] = tuple(
-                    sorted(protected_ship_cells)
-                )
-            removed_from_hits = glare_hits | glare_unknown
-            kept_hits = set(analyzed.hit_cells) - removed_from_hits
-            # Isolated broad glare can safely become scout-miss.  Cells near
-            # ship geometry stay unknown so they remain blue-confirmable.
+            diagnostics = dict(analyzed.diagnostics)
+            diagnostics["sea_highlight_hits_discarded"] = tuple(sorted(glare_hits))
+            kept_hits = set(analyzed.hit_cells) - glare_hits
             kept_misses = set(analyzed.miss_cells) | glare_hits
-            kept_unknown = set(analyzed.unknown_cells) | glare_unknown
-            if glare_hits or glare_unknown:
-                logger.warning(
-                    "red scout sea-highlight filter discarded hit cells=%s unknown=%s protected=%s",
-                    sorted(glare_hits),
-                    sorted(glare_unknown),
-                    sorted(protected_ship_cells),
-                )
+            logger.warning(
+                "red scout sea-highlight filter discarded hit cells=%s",
+                sorted(glare_hits),
+            )
             return replace(
                 analyzed,
                 hit_cells=frozenset(kept_hits),
                 miss_cells=frozenset(kept_misses),
-                unknown_cells=frozenset(kept_unknown),
-                affected_cells=frozenset(kept_hits | kept_misses | kept_unknown),
+                affected_cells=frozenset(kept_hits | kept_misses | set(analyzed.unknown_cells)),
                 confidence_by_cell={
                     cell: score
                     for cell, score in analyzed.confidence_by_cell.items()
-                    if cell not in removed_from_hits
+                    if cell not in glare_hits
                 },
                 diagnostics=diagnostics,
             )
@@ -3402,14 +3177,10 @@ def enter_activity(
                         return True
                 except (TypeError, ValueError):
                     pass
-            if re_enter:
-                _reveal_swipe_on_reenter_if_10x10()
             return level_completed
 
         recovery = recover_activity_detail_timeout(re_enter=re_enter)
         if recovery == "ready":
-            if re_enter:
-                _reveal_swipe_on_reenter_if_10x10()
             return level_completed
         if recovery in {"level_complete", "pending_victory"}:
             level_completed = True
@@ -3600,7 +3371,6 @@ def get_click_points(
 ) -> tuple[list[tuple[int, int]], np.ndarray]:
     """按配置读取人工点位，失败时回退到自动识别。"""
     grid_size = get_level_grid_size(level)
-    saved_quad: np.ndarray | None = None
 
     if USE_SAVED_POINTS:
         try:
@@ -3626,13 +3396,7 @@ def get_click_points(
                 )
             logger.warning("第 %s 关人工点位不存在或数量不正确，回退自动识别", level)
 
-    # 回退时优先复用同一组固定四角（与保存点位一致），再尝试红色边框/白线检测，
-    # 保证裁剪、点击点、检测三处使用同一组 quad，不会互相冲突。
-    grid_result = detect_grid_points_red_roi(
-        grid_img,
-        grid_size,
-        fixed_quad=saved_quad,
-    )
+    grid_result = detect_diamond_centers(grid_img, grid_size)
     calibration_error = _grid_calibration_error(
         grid_result.points,
         grid_result.global_quad,
@@ -3865,383 +3629,6 @@ def _save_startup_vision_diagnostics(
     return evidence
 
 
-def _swipe_reveal_should_run(level: int) -> bool:
-    """Whether to scroll the activity page down to reveal the board top cells.
-
-    On by default for 10x10 (level 8+) boards; set ``BBMA_SWIPE_REVEAL=0`` to
-    disable.
-    """
-    value = os.environ.get(SWIPE_REVEAL_ENV, "").strip().lower()
-    if value in {"0", "false", "no", "off"}:
-        return False
-    try:
-        return get_level_grid_size(level) >= SWIPE_REVEAL_GRID_MIN
-    except Exception:
-        return False
-
-
-def _swipe_board_down() -> None:
-    """Scroll the activity detail page down so the whole board is visible.
-
-    Uses ``input swipe`` (the game scrolls only on this gesture).  The endpoint
-    hold via motionevent was tried but the emulator does not scroll on it.
-    """
-    x0, y0 = SWIPE_REVEAL_START_POINT
-    try:
-        adb.swipe(
-            "down",
-            SWIPE_REVEAL_DISTANCE,
-            duration_ms=SWIPE_REVEAL_DURATION_MS,
-            start=(x0, y0),
-        )
-    except Exception as exc:
-        logger.warning("board reveal swipe failed: %s", exc)
-    adb.delay(SWIPE_REVEAL_SETTLE_SECONDS)
-    try:
-        _debug_dir = Path(__file__).resolve().parent / "_debug" / "swipe_debug"
-        _debug_dir.mkdir(parents=True, exist_ok=True)
-        adb.read_screenshot(_debug_dir / "after_swipe.png")
-    except Exception:
-        pass
-
-
-def _reveal_swipe_on_reenter_if_10x10() -> None:
-    """Swipe after a successful activity re-entry, when the board is 10x10.
-
-    Called from ``enter_activity`` on the ``re_enter=True`` success path.  The
-    current level is read from the active probe transaction; the initial entry
-    (no active probe) is skipped because ``handle_game_level`` reveals the board
-    itself at level start.
-    """
-    probe = _active_probe
-    level = getattr(probe, "level", None) if probe is not None else None
-    if level is None:
-        return
-    if _swipe_reveal_should_run(level):
-        logger.info("reveal: swipe after re-enter activity (level %s)", level)
-        _swipe_board_down()
-    else:
-        logger.info("reveal: skip swipe after re-enter (level %s not 10x10)", level)
-
-
-def _reveal_quad_points(
-    level: int,
-    grid_img: np.ndarray,
-    grid_size: int,
-) -> tuple[list[tuple[int, int]], np.ndarray]:
-    """Generate the grid points from the fixed revealed-board calibration quad.
-
-    Instead of re-detecting (unreliable on translucent boards) or shifting saved
-    points, use the exact post-swipe quad corners so the 10x10 points align with
-    the revealed board.  The grid size is fixed at 10 for these levels.
-    """
-    quad = SWIPE_REVEAL_QUAD
-    points = centers_from_quad(quad, int(grid_size))
-    points_int = [(int(round(x)), int(round(y))) for x, y in points]
-    logger.info("reveal swipe: grid points from fixed revealed-board quad (level %s)", level)
-    return points_int, quad.copy()
-
-
-@dataclass
-class StartupWreckReview:
-    """开局残骸/完整潜艇识图护栏的产出（对应 review_startup_wreck_evidence）。"""
-
-    visible_hits: set[Cell]
-    visible_hits_over_limit: bool
-    partial_cells: set[Cell]
-    completed_anchor_candidates: set[Cell]
-    completed_red_anchor_cells: set[Cell]
-
-
-def review_startup_wreck_evidence(
-    level: int,
-    grid_img: np.ndarray,
-    click_points: Sequence[tuple[int, int]],
-    grid_size: int,
-    *,
-    submarines: Sequence[int],
-    sidebar_progress: SidebarProgress | None,
-    surface_baseline: SurfaceWaterBaseline | None,
-    visible_hits_over_limit: bool,
-) -> StartupWreckReview:
-    """跑完「残骸 / 完整潜艇」的全部判定护栏，返回过滤后的棋盘证据。
-
-    从 handle_game_level 抽出来的原因：这十几层启发式守卫是识别 bug 的高发区，
-    单独成函数后可以脱离整条扫描流程单独测试。
-    """
-    # ======================================================================
-    # 开局识图：残骸 / 完整潜艇判定护栏（按执行顺序，顺序不可随意调换）
-    # ----------------------------------------------------------------------
-    # 调试时按下面的顺序看日志，能快速定位是哪一层把格子弄丢了：
-    #   1. detect_visible_wreck_cells        静态残骸（形状+模板）→ visible_hits
-    #   2. feature_water_cells               纯水判定 → 剔除模板假阳性
-    #   3. feature_wreck_cells               精灵级残骸 → 并入 visible_hits
-    #   4. feature_ship_cells                精灵级潜艇（红塔）→ 从 visible_hits 剔除
-    #   5. surface classifier guard          「孤立+无模板+不邻物体」的水/浪格剔除
-    #   6. visible_hits_over_limit           超过 sum(submarines) 视为可疑批次
-    #   7. completed_anchor_candidates       潜艇候选格（锚点可达 + body ≥ 0.30）
-    #   8. surface reflection filter         水面反光剔除（多帧时序证据）
-    #   9. cyan-glare filter                 右上角青色反光剔除（直排保护除外）
-    #  10. resolve_completed_ship_cells_by_anchors  按锚点求解整艘潜艇
-    #  11. broad 回退 → coverage 回退 → 全局几何
-    #
-    # 已知易踩的坑（都是「真物体被当水面删掉」这一类）：
-    #  * 第 5 步用单格灰度特征判水，而暗淡的物体碎片与海水数值同分布 —— 必须靠
-    #    「不邻物体 + 无模板」兜底，否则会误删潜艇最后一格（右上角高光区）。
-    #  * 第 9 步用「右上区域 + cyan 高 + body 低」判反光，同样误伤暗淡艇身端点
-    #    （level 22 的 (4,6)）—— 用「直排保护」（与其它候选格同行/同列相邻）放行。
-    #  * 第 11 步的 coverage 回退只在前面全部失败后才跑，且用**覆盖率**而非地表
-    #    分类，因为暗淡端点仍有 0.3+ 覆盖率，不会被误删。
-    # ======================================================================
-    visible_hits = detect_visible_wreck_cells(
-        grid_img,
-        click_points,
-        grid_size,
-        surface_baseline=surface_baseline,
-    )
-    try:
-        feature_wreck_cells = detect_wreck_cells_by_features(
-            grid_img, click_points, grid_size
-        )
-        feature_water_cells = detect_water_cells_by_features(
-            grid_img, click_points, grid_size
-        )
-        feature_ship_cells = detect_ship_cells_by_red_tower(
-            grid_img, click_points, grid_size
-        )
-    except Exception as exc:
-        feature_wreck_cells = set()
-        feature_water_cells = set()
-        feature_ship_cells = set()
-        logger.warning("feature-based wreck/water detection failed: %s", exc)
-    # B: feature detection is the primary criterion.  A template hit on a
-    # cell the feature detector says is pure water is rejected; a cell with
-    # wreck-like features is admitted even if the template missed it.
-    if feature_water_cells:
-        rejected_water = visible_hits & feature_water_cells
-        if rejected_water:
-            visible_hits -= rejected_water
-            logger.info(
-                "level %s feature water guard rejected template wrecks: %s",
-                level,
-                sorted(rejected_water),
-            )
-    if feature_wreck_cells:
-        visible_hits |= feature_wreck_cells
-        logger.info(
-            "level %s feature-based wreck cells merged: %s",
-            level,
-            sorted(feature_wreck_cells),
-        )
-    # 完整潜艇不是"已命中"：整艘艇（艇身 + 尾迹）都带红色指挥塔，规则识别把
-    # 它们单独分出来，绝不写进命中格，否则开局策略会把潜艇当成打过的格子跳过。
-    if feature_ship_cells:
-        removed_ships = visible_hits & feature_ship_cells
-        if removed_ships:
-            visible_hits -= removed_ships
-        logger.info(
-            "level %s rule ship cells: %s (removed from hits: %s)",
-            level,
-            sorted(feature_ship_cells),
-            sorted(removed_ships),
-        )
-    # 四类地表判定（残骸/艇身/海浪/深水）。海浪泡沫与深水都不是残骸，静态检测器
-    # 会把部分帧的泡沫误判成残骸（level-20 的 (0,3)）。但右上角的动海水高光也会把
-    # 真残骸/潜艇最后一块判成水/浪（level 9 曾被误删 24 格、用户反馈红船炸出完整
-    # 潜艇最后一格却判成未命中）。所以**只有同时满足**下面三条才剔除：
-    #   1) 判为水/浪；
-    #   2) 不紧邻任何已确认物体（潜艇艇身 / 仍保留的残骸格）；
-    #   3) 没有模板命中（模板是最强的残骸证据，不该被颜色统计量覆盖）。
-    try:
-        surface_classes = classify_surface_cells(grid_img, click_points, grid_size)
-    except Exception as exc:
-        surface_classes = {}
-        logger.warning("surface class review failed: %s", exc)
-    if surface_classes:
-        confirmed_objects = set(feature_ship_cells)
-        for cell in visible_hits:
-            if surface_classes.get(cell) in (SURFACE_WAVE, SURFACE_WATER):
-                continue
-            confirmed_objects.add(cell)
-        rejected_surface = set()
-        for cell in visible_hits:
-            if surface_classes.get(cell) not in (SURFACE_WAVE, SURFACE_WATER):
-                continue
-            if any(_cells_are_adjacent(cell, obj) for obj in confirmed_objects):
-                continue
-            try:
-                if wreck_template_visible(
-                    grid_img,
-                    click_points[cell[0] * grid_size + cell[1]],
-                    cell_polygon=grid_cell_polygon(
-                        click_points, cell[0] * grid_size + cell[1], grid_size
-                    ),
-                ):
-                    continue
-            except Exception:
-                # 模板检查失败时保留该格：宁可留下假阳性，也不要误删真残骸。
-                continue
-            rejected_surface.add(cell)
-        if rejected_surface:
-            visible_hits -= rejected_surface
-            logger.info(
-                "level %s surface classifier removed wave/water conflicts from "
-                "authoritative hits (no template, not adjacent to a confirmed object): %s",
-                level,
-                sorted(rejected_surface),
-            )
-    max_visible_hits = sum(submarines)
-    if len(visible_hits) > max_visible_hits:
-        visible_hits_over_limit = True
-        logger.warning(
-            "level %s visible wreck review ignored suspicious result: %s/%s cells",
-            level,
-            len(visible_hits),
-            grid_size * grid_size,
-        )
-        # Keep the raw set only when the sidebar is valid so the later
-        # aggregate guard can retain the intersection of static and
-        # template wreck evidence.  Without a trustworthy sidebar, clear
-        # the suspicious batch and stay fully fail-closed.
-        if sidebar_progress is None or not sidebar_progress.valid:
-            visible_hits = set()
-    elif visible_hits:
-        logger.info("level %s visible wreck review found %s hit cells", level, len(visible_hits))
-
-    partial_wreck_cells = detect_partial_wreck_cells(
-        grid_img,
-        click_points,
-        grid_size=grid_size,
-        template_paths=PARTIAL_WRECK_TEMPLATES,
-    )
-    partial_wreck_cells = _remove_surface_reflection_candidates(
-        grid_img,
-        click_points,
-        set(partial_wreck_cells or set()),
-        grid_size,
-        baseline=surface_baseline,
-    )
-    partial_cells = {
-        cell
-        for cell in set(partial_wreck_cells or set())
-        if not is_title_occluded_cell(cell, grid_size)
-    }
-    if visible_hits_over_limit and not (set(visible_hits) & partial_cells):
-        # An over-limit batch with no independent template agreement is
-        # pure noise (for example a test frame matching every diamond).
-        # Drop it before any geometry solver sees the full board.
-        visible_hits = set()
-    completed_anchor_candidates = detect_completed_submarine_candidate_cells(
-        grid_img,
-        click_points,
-        grid_size,
-    )
-    # Title/countdown occlusion is only a static-wreck restriction.  A
-    # surfaced submarine can occupy the upper diamonds, and its red
-    # marker plus the surrounding hull geometry is still valid evidence.
-    completed_red_anchor_cells = detect_red_submarine_marker_cells(
-        grid_img,
-        click_points,
-        grid_size,
-    )
-    # The upper-right water highlight can look like a gray hull to the
-    # completed-submarine body classifier.  Unlike a real surfaced ship,
-    # it has no nearby red marker.  Remove only those reflection-dominated
-    # candidates; keep marker-supported hull cells intact.
-    if completed_anchor_candidates:
-        # 青色反光过滤会误伤潜艇的暗淡端点：level 22 的 (4,6) 是长4潜艇
-        # (1,6)(2,6)(3,6)(4,6) 的末格，却满足「右上 + 青色占比高 + body 偏低」而被
-        # 当成水面反光删掉，导致整艘长4拼不出来、开局一艘潜艇都不显示。
-        # 孤立的假反光不会与其它候选格连成直排，真艇身端点会，所以先算出「能构成
-        # 直排（同行/同列有相邻候选格）」的候选并保护它们。
-        straight_run_cells = {
-            cell
-            for cell in completed_anchor_candidates
-            if any(
-                (cell[0] + drow, cell[1] + dcol) in completed_anchor_candidates
-                for drow, dcol in ((0, -1), (0, 1), (-1, 0), (1, 0))
-            )
-        }
-        filtered_completed_candidates: set[Cell] = set()
-        for cell in completed_anchor_candidates:
-            index = cell[0] * grid_size + cell[1]
-            if not (0 <= index < len(click_points)):
-                continue
-            body_score = completed_ship_body_score(
-                grid_img,
-                click_points[index],
-                cell_polygon=grid_cell_polygon(click_points, index, grid_size),
-            )
-            shape_metrics = wreck_shape_metrics(
-                grid_img,
-                click_points[index],
-                cell_polygon=grid_cell_polygon(click_points, index, grid_size),
-            )
-            near_marker = any(
-                _cells_are_adjacent(cell, anchor, 2)
-                for anchor in completed_red_anchor_cells
-            )
-            relative_row = cell[0] / max(1, grid_size - 1)
-            relative_col = cell[1] / max(1, grid_size - 1)
-            upper_right_glare = (
-                relative_row <= 0.55
-                and relative_col >= 0.55
-                and shape_metrics.cyan_ratio >= 0.35
-                and body_score < 0.55
-            )
-            if (
-                (not near_marker or upper_right_glare)
-                and surface_reflection_detected(
-                    grid_img,
-                    click_points[index],
-                    baseline=surface_baseline,
-                    cell_polygon=grid_cell_polygon(click_points, index, grid_size),
-                    relative_position=(
-                        cell[0] / max(1, grid_size - 1),
-                        cell[1] / max(1, grid_size - 1),
-                    ),
-                )
-            ):
-                logger.info(
-                    "surface reflection candidate discarded from completed submarine cells: cell=%s",
-                    cell,
-                )
-                continue
-            if (
-                upper_right_glare
-                and cell not in completed_red_anchor_cells
-                and cell not in straight_run_cells
-            ):
-                logger.info(
-                    "upper-right cyan glare discarded from completed submarine cells: cell=%s body=%.3f cyan=%.3f",
-                    cell,
-                    body_score,
-                    shape_metrics.cyan_ratio,
-                )
-                continue
-            filtered_completed_candidates.add(cell)
-        completed_anchor_candidates = filtered_completed_candidates
-    if completed_anchor_candidates:
-        logger.info(
-            "level %s completed ship anchor review found %s candidate cells",
-            level,
-            len(completed_anchor_candidates),
-        )
-    if completed_red_anchor_cells:
-        logger.info(
-            "level %s red completion marker review found anchors=%s",
-            level,
-            sorted(completed_red_anchor_cells),
-        )
-    return StartupWreckReview(
-        visible_hits=visible_hits,
-        visible_hits_over_limit=visible_hits_over_limit,
-        partial_cells=partial_cells,
-        completed_anchor_candidates=completed_anchor_candidates,
-        completed_red_anchor_cells=completed_red_anchor_cells,
-    )
-
-
 def handle_game_level(
     level: int,
     hit_map: list[list[int]],
@@ -4251,19 +3638,13 @@ def handle_game_level(
     """处理单个关卡：有潜艇配置时使用策略，缺少配置时逐格扫描。"""
     effective_settings = settings or RedScoutSettings()
     adb.delay(1.5)
-    grid_size = get_level_grid_size(level)
-    swipe_reveal = _swipe_reveal_should_run(level)
-    if swipe_reveal:
-        _swipe_board_down()
     grid_img = adb.read_screenshot()
-    if swipe_reveal:
-        click_points, grid_quad = _reveal_quad_points(level, grid_img, grid_size)
-    else:
-        click_points, grid_quad = get_click_points(level, grid_img)
+    click_points, grid_quad = get_click_points(level, grid_img)
+    grid_size = get_level_grid_size(level)
     submarines = get_configured_submarines(level, SUBMARINES)
     # A baseline only helps the configured static-recovery path.  Unknown
     # levels already fall back to a conservative grid scan, so avoid spending
-    # extra screenshots and delays there.
+    # two extra screenshots and delays there.
     surface_baseline = (
         _capture_surface_water_baseline(grid_img)
         if submarines is not None
@@ -4282,8 +3663,6 @@ def handle_game_level(
     initial_visual_hit_count: int | None = None
     startup_visual_evidence: dict[Cell, dict[str, object]] = {}
     visible_hits_over_limit = False
-    # 严格二值法模式需要在基础视觉之后把 hit_map 恢复成"只用二值法"，先存一份原始快照。
-    pre_vision_hit_map = [row[:] for row in hit_map]
     if submarines is not None:
         detected_sidebar_progress = detect_sidebar_progress(grid_img, submarines)
         if detected_sidebar_progress is not None and detected_sidebar_progress.valid:
@@ -4296,21 +3675,138 @@ def handle_game_level(
             )
         else:
             logger.warning("level %s sidebar progress was not confidently recognized", level)
-        wreck_review = review_startup_wreck_evidence(
-            level,
+        visible_hits = detect_visible_wreck_cells(
             grid_img,
             click_points,
             grid_size,
-            submarines=submarines,
-            sidebar_progress=sidebar_progress,
             surface_baseline=surface_baseline,
-            visible_hits_over_limit=visible_hits_over_limit,
         )
-        visible_hits = wreck_review.visible_hits
-        visible_hits_over_limit = wreck_review.visible_hits_over_limit
-        partial_cells = wreck_review.partial_cells
-        completed_anchor_candidates = wreck_review.completed_anchor_candidates
-        completed_red_anchor_cells = wreck_review.completed_red_anchor_cells
+        max_visible_hits = sum(submarines)
+        if len(visible_hits) > max_visible_hits:
+            visible_hits_over_limit = True
+            logger.warning(
+                "level %s visible wreck review ignored suspicious result: %s/%s cells",
+                level,
+                len(visible_hits),
+                grid_size * grid_size,
+            )
+            # Keep the raw set only when the sidebar is valid so the later
+            # aggregate guard can retain the intersection of static and
+            # template wreck evidence.  Without a trustworthy sidebar, clear
+            # the suspicious batch and stay fully fail-closed.
+            if sidebar_progress is None or not sidebar_progress.valid:
+                visible_hits = set()
+        elif visible_hits:
+            logger.info("level %s visible wreck review found %s hit cells", level, len(visible_hits))
+
+        partial_wreck_cells = detect_partial_wreck_cells(
+            grid_img,
+            click_points,
+            grid_size=grid_size,
+            template_paths=PARTIAL_WRECK_TEMPLATES,
+        )
+        partial_wreck_cells = _remove_surface_reflection_candidates(
+            grid_img,
+            click_points,
+            set(partial_wreck_cells or set()),
+            grid_size,
+            baseline=surface_baseline,
+        )
+        partial_cells = {
+            cell
+            for cell in set(partial_wreck_cells or set())
+            if not is_title_occluded_cell(cell, grid_size)
+        }
+        if visible_hits_over_limit and not (set(visible_hits) & partial_cells):
+            # An over-limit batch with no independent template agreement is
+            # pure noise (for example a test frame matching every diamond).
+            # Drop it before any geometry solver sees the full board.
+            visible_hits = set()
+        completed_anchor_candidates = detect_completed_submarine_candidate_cells(
+            grid_img,
+            click_points,
+            grid_size,
+        )
+        # Title/countdown occlusion is only a static-wreck restriction.  A
+        # surfaced submarine can occupy the upper diamonds, and its red
+        # marker plus the surrounding hull geometry is still valid evidence.
+        completed_red_anchor_cells = detect_red_submarine_marker_cells(
+            grid_img,
+            click_points,
+            grid_size,
+        )
+        # The upper-right water highlight can look like a gray hull to the
+        # completed-submarine body classifier.  Unlike a real surfaced ship,
+        # it has no nearby red marker.  Remove only those reflection-dominated
+        # candidates; keep marker-supported hull cells intact.
+        if completed_anchor_candidates:
+            filtered_completed_candidates: set[Cell] = set()
+            for cell in completed_anchor_candidates:
+                index = cell[0] * grid_size + cell[1]
+                if not (0 <= index < len(click_points)):
+                    continue
+                body_score = completed_ship_body_score(
+                    grid_img,
+                    click_points[index],
+                    cell_polygon=grid_cell_polygon(click_points, index, grid_size),
+                )
+                shape_metrics = wreck_shape_metrics(
+                    grid_img,
+                    click_points[index],
+                    cell_polygon=grid_cell_polygon(click_points, index, grid_size),
+                )
+                near_marker = any(
+                    max(abs(cell[0] - anchor[0]), abs(cell[1] - anchor[1])) <= 2
+                    for anchor in completed_red_anchor_cells
+                )
+                relative_row = cell[0] / max(1, grid_size - 1)
+                relative_col = cell[1] / max(1, grid_size - 1)
+                upper_right_glare = (
+                    relative_row <= 0.55
+                    and relative_col >= 0.55
+                    and shape_metrics.cyan_ratio >= 0.35
+                    and body_score < 0.55
+                )
+                if (
+                    (not near_marker or upper_right_glare)
+                    and surface_reflection_detected(
+                        grid_img,
+                        click_points[index],
+                        baseline=surface_baseline,
+                        cell_polygon=grid_cell_polygon(click_points, index, grid_size),
+                        relative_position=(
+                            cell[0] / max(1, grid_size - 1),
+                            cell[1] / max(1, grid_size - 1),
+                        ),
+                    )
+                ):
+                    logger.info(
+                        "surface reflection candidate discarded from completed submarine cells: cell=%s",
+                        cell,
+                    )
+                    continue
+                if upper_right_glare and cell not in completed_red_anchor_cells:
+                    logger.info(
+                        "upper-right cyan glare discarded from completed submarine cells: cell=%s body=%.3f cyan=%.3f",
+                        cell,
+                        body_score,
+                        shape_metrics.cyan_ratio,
+                    )
+                    continue
+                filtered_completed_candidates.add(cell)
+            completed_anchor_candidates = filtered_completed_candidates
+        if completed_anchor_candidates:
+            logger.info(
+                "level %s completed ship anchor review found %s candidate cells",
+                level,
+                len(completed_anchor_candidates),
+            )
+        if completed_red_anchor_cells:
+            logger.info(
+                "level %s red completion marker review found anchors=%s",
+                level,
+                sorted(completed_red_anchor_cells),
+            )
         completed_candidates = (
             completed_anchor_candidates
             if completed_anchor_candidates
@@ -4357,42 +3853,6 @@ def handle_game_level(
                         )
                     ):
                         completed_resolution = broad_anchor_resolution
-                    if completed_resolution.unresolved_lengths:
-                        # 端点延伸可能把纯水面并进直排（level 22 的 (0,1) 覆盖率 0.00），
-                        # 使真正的「长4」潜艇看起来是「长5」而与侧边栏长度冲突，无法
-                        # 唯一绑定。此时用「剔除几乎没有灰白像素的候选格」的集合再试一次。
-                        # 只在前面全部失败后才回退，且用覆盖率而非地表分类——暗淡的真艇身
-                        # 端点仍有 0.3+ 覆盖率，不会被误删。
-                        coverage_map = surface_coverage_map(grid_img, click_points, grid_size)
-                        if coverage_map:
-                            trimmed_candidates = {
-                                cell
-                                for cell in completed_candidates
-                                if coverage_map.get(cell, 1.0) >= SURFACE_COVERAGE_SPURIOUS_MAX
-                            }
-                            if trimmed_candidates and trimmed_candidates != completed_candidates:
-                                trimmed_resolution = resolve_completed_ship_cells_by_anchors(
-                                    trimmed_candidates,
-                                    completed_red_anchor_cells,
-                                    sidebar_progress.completed_lengths,
-                                    grid_size=grid_size,
-                                    preferred_cells=trimmed_candidates,
-                                    fallback_to_global=False,
-                                )
-                                if (
-                                    not trimmed_resolution.unresolved_lengths
-                                    and resolution_has_unique_anchor_support(
-                                        trimmed_resolution.placements,
-                                        completed_red_anchor_cells,
-                                    )
-                                ):
-                                    logger.info(
-                                        "level %s recovered completed ships after dropping "
-                                        "no-coverage candidates: %s",
-                                        level,
-                                        [list(placement) for placement in trimmed_resolution.placements],
-                                    )
-                                    completed_resolution = trimmed_resolution
                     if completed_resolution.unresolved_lengths:
                         # When the number of red markers matches the number of
                         # completed sidebar entries, a global geometry solution
@@ -4766,169 +4226,6 @@ def handle_game_level(
             ),
         )
 
-    _sd_setting = os.environ.get(USE_SUBMARINE_DETECTOR_ENV, "").strip().lower()
-    if _sd_setting in {"1", "true", "yes", "on"}:
-        _sd_enabled = True
-    elif _sd_setting in {"0", "false", "off", "no"}:
-        _sd_enabled = False
-    else:
-        _sd_enabled = bool(USE_SUBMARINE_DETECTOR)
-    if _sd_enabled:
-        try:
-            detected_sub_cells, detected_debris_cells = detect_ship_and_debris_cells(
-                grid_img, click_points, grid_size, grid_quad=grid_quad
-            )
-        except Exception as exc:
-            detected_sub_cells = set()
-            detected_debris_cells = set()
-            logger.warning("submarine detector failed: %s", exc)
-        merged_cells = detected_sub_cells | detected_debris_cells
-        if merged_cells:
-            initial_visual_hits.update(merged_cells)
-            logger.info(
-                "submarine detector merged %s start-of-level cells (%s submarine + %s debris)",
-                sorted(merged_cells),
-                len(detected_sub_cells),
-                len(detected_debris_cells),
-            )
-
-    board_mode = (
-        os.environ.get(USE_BOARD_RECOGNIZER_ENV, "").strip().lower()
-        or str(BOARD_RECOGNIZER_MODE).strip().lower()
-    )
-    if board_mode in {"merge", "only"} and grid_quad is not None:
-        try:
-            board_model = _board_recognizer_model()
-            if board_model is not None:
-                board_cells = classify_board_cells(grid_img, grid_quad, grid_size, board_model)
-                # 几何拟合裁剪：二值法常把"精灵覆盖到的格"都标上（过标，实测能到应有两倍），
-                # 用该关的潜艇长度把它收敛成合法直线潜艇，去掉多余的格。
-                if submarines:
-                    try:
-                        _fit = resolve_completed_ship_cells(
-                            board_cells, submarines, grid_size=grid_size
-                        )
-                        _fitted = set(_fit.cells)
-                        if _fitted and len(_fitted) < len(board_cells):
-                            logger.info(
-                                "二值法几何拟合裁剪: %s -> %s 格 (placements=%s unresolved=%s)",
-                                len(board_cells),
-                                len(_fitted),
-                                [list(p) for p in _fit.placements],
-                                list(_fit.unresolved_lengths),
-                            )
-                            board_cells = _fitted
-                    except Exception as exc:
-                        logger.warning("二值法几何拟合失败: %s", exc)
-                try:
-                    board_subs, board_debris = classify_board_cells_classes(
-                        grid_img, grid_quad, grid_size, board_model
-                    )
-                    if board_subs or board_debris:
-                        logger.info(
-                            "二值法分类: 潜艇格=%s 残骸格=%s (level %s)",
-                            sorted(board_subs),
-                            sorted(board_debris),
-                            level,
-                        )
-                except Exception as exc:
-                    logger.warning("二值法分类（潜艇/残骸）失败: %s", exc)
-                if board_mode == "only" and _board_strict_only():
-                    # 严格只用二值法识图：丢掉其它所有开局视觉（模板/残骸/特征/侧边栏/红标记）的结果。
-                    initial_visual_hits = set(board_cells)
-                    initial_visual_candidates = set()
-                    initial_visual_hit_count = len(board_cells)
-                    if submarines is not None:
-                        completed_visual_hits = set()
-                        red_marker_completed_cells = set()
-                        sidebar_progress = None
-                        strategy_initial_hits = set(board_cells)
-                        strategy_visual_candidates = set()
-                        strategy_completed_visual_hits = set()
-                        strategy_completed_blocking_placements = ()
-                        strategy_authoritative_visual_hits = set()
-                        strategy_authoritative_placements = ()
-                        strategy_completed_lengths = ()
-                        strategy_visual_hit_count = len(board_cells)
-                        # 恢复基础视觉写入之前的 hit_map，只标二值法的格。
-                        for r in range(int(grid_size)):
-                            for c in range(int(grid_size)):
-                                hit_map[r][c] = pre_vision_hit_map[r][c]
-                        for row, col in board_cells:
-                            if 0 <= int(row) < int(grid_size) and 0 <= int(col) < int(grid_size):
-                                hit_map[int(row)][int(col)] = 1
-                        # 同步状态面板与诊断快照，让它们也反映"只用二值法"的结果。
-                        write_runtime_status(
-                            hits=len(board_cells),
-                            initial_visual_hits=len(board_cells),
-                            mapped_visual_hits=len(board_cells),
-                            visual_candidate_count=0,
-                            visual_candidates=[],
-                            unmapped_visual_hits=0,
-                            board_states=build_startup_board_states(
-                                grid_size,
-                                hit_cells=set(board_cells),
-                                completed_cells=set(),
-                            ),
-                            startup_wreck_candidates=[],
-                            startup_submarine_cells=[],
-                            startup_wreck_hit_cells=sorted(board_cells),
-                            startup_red_anchors=[],
-                        )
-                        startup_visual_evidence = _save_startup_vision_diagnostics(
-                            level,
-                            grid_img,
-                            click_points,
-                            grid_size,
-                            wreck_candidates=set(),
-                            submarine_cells=set(),
-                            wreck_hit_cells=set(board_cells),
-                            red_anchors=set(),
-                            partial_cells=set(),
-                            visible_cells=set(),
-                            surface_baseline=surface_baseline,
-                        )
-                        if startup_visual_evidence:
-                            write_runtime_status(
-                                startup_visual_evidence={
-                                    f"{row},{col}": value
-                                    for (row, col), value in startup_visual_evidence.items()
-                                },
-                            )
-                    logger.info(
-                        "board recognizer ONLY mode (严格二值法-only，其它开局视觉结果已丢弃): "
-                        "startup cells=%s (level %s)",
-                        sorted(board_cells),
-                        level,
-                    )
-                elif board_mode == "only":
-                    # 二值法替换开局潜艇格，保留其它开局视觉。
-                    # 注意：实测二值法输出噪声很大（格数能到应有的两倍、位置也易错），
-                    # 所以**不覆盖策略用的 strategy_initial_hits / hit_map**——策略仍以
-                    # 基础视觉（侧边栏 + 残骸复核 + 几何）为准，二值法只影响训练样本标签。
-                    initial_visual_hits = set(board_cells)
-                    initial_visual_candidates = set()
-                    logger.info(
-                        "board recognizer ONLY mode (不改策略，策略仍用基础视觉): "
-                        "startup cells=%s (level %s)",
-                        sorted(board_cells),
-                        level,
-                    )
-                elif board_cells:
-                    initial_visual_hits.update(board_cells)
-                    logger.info(
-                        "board recognizer merged %s start-of-level cells (level %s)",
-                        sorted(board_cells),
-                        level,
-                    )
-            else:
-                logger.warning(
-                    "board recognizer enabled but no model at %s; run tools/train_board_real.py",
-                    board_recognizer_model_path(),
-                )
-        except Exception as exc:
-            logger.warning("board recognizer failed: %s", exc)
-
     if submarines is None:
         message = f"第 {level} 关缺少潜艇长度配置，回退逐格扫描"
         logger.warning(message)
@@ -4973,8 +4270,6 @@ def handle_game_level(
             # post-click evidence frames remain governed by the normal hit
             # classifier.
             surface_baseline=surface_baseline,
-            # 供红色侦察采集训练样本时把 quad 透传给侦察事务。
-            grid_quad=grid_quad,
         )
 
     return grid_img, grid_quad, completed
@@ -5937,8 +5232,7 @@ def _scan_level_by_strategy(
 def _run_red_scout_and_blue_strategy(
     level: int, hit_map: list[list[int]], click_points: list[tuple[int, int]],
     submarines: list[int], initial_hits: set[Cell], settings: RedScoutSettings,
-    run_started_at: float | None = None, grid_quad: object = None,
-    **scan_kwargs: object,
+    run_started_at: float | None = None, **scan_kwargs: object,
 ) -> bool:
     if settings.mode is ProbeMode.BLUE_ONLY:
         return _scan_level_by_strategy(level, hit_map, click_points, submarines,
@@ -6266,10 +5560,11 @@ def _run_red_scout_and_blue_strategy(
             if match is None:
                 return
             upper, lower_pair = match
-            # Raised-flag L is an explicit exception: locked lower cells are
-            # the real ship and must not protect an upper projection/flag.
-            # Only a locked upper body cell blocks this correction.
-            if upper in locked_completed_ship_cells:
+            # Durable completed geometry is authoritative.  A later flag/L
+            # artifact cannot reinterpret one of its cells as water.
+            if upper in locked_completed_ship_cells or any(
+                cell in locked_completed_ship_cells for cell in lower_pair
+            ):
                 ignored_false_cells.add(upper)
                 continue
             # A supported 2x2 L is the explicit raised-flag exception to the
@@ -6360,25 +5655,12 @@ def _run_red_scout_and_blue_strategy(
         # the analyzer reports only the newly changed lower cells. Initial hits
         # need the same exception because the analyzer excludes known cells;
         # later committed hits deliberately remain snapshot-scoped.
-        # A red result omits already-known cells, so a historical blue hit
-        # that completes a 2x2 L would otherwise be invisible.  Include
-        # committed/scout hits adjacent to the current result so the raised
-        # upper flag can be removed before any blue shot is spent.
-        adjacent_historical = {
-            cell
-            for cell in historical_evidence
-            if any(
-                max(abs(cell[0] - current_row), abs(cell[1] - current_col)) <= 1
-                for current_row, current_col in current_cells
-            )
-        }
         evidence = (
             current_cells
             | (historical_evidence & current_snapshot)
             | (visual_evidence & current_snapshot)
             | visual_evidence
             | initial_real_hits
-            | adjacent_historical
         )
         def find_supported_block() -> tuple[tuple[Cell, ...], Cell] | None:
             candidate_origins = {
@@ -6401,11 +5683,11 @@ def _run_red_scout_and_blue_strategy(
                 upper = _resolve_false_hit_in_l_shape(block_tuple, {})
                 if upper is None:
                     continue
-                # A durable completed placement cannot rewrite its own body
-                # cells.  The raised-flag L is the explicit exception: locked
-                # lower cells ARE the real ship, so they must not block
-                # discarding the upper projection/flag cell.
-                if upper in locked_completed_ship_cells:
+                # A durable completed placement cannot be rewritten by a
+                # later visual flag/L-shaped snapshot.
+                if upper in locked_completed_ship_cells or any(
+                    cell in locked_completed_ship_cells for cell in block_tuple
+                ):
                     continue
                 # A raised red flag is an explicit exception to the normal
                 # completed-cell lock.  The L-shape rule has priority for all
@@ -6864,16 +6146,9 @@ def _run_red_scout_and_blue_strategy(
         for cell in initial_misses - real_hits - committed_misses:
             state_strategy.report_result(cell, False)
         if scout_hits or scout_misses:
-            # Keep the two sets disjoint (hit evidence wins) so the strategy's
-            # strict no-overlap invariant is never violated by a cell that the
-            # red-scout accumulator recorded as both a hit and a miss.
-            disjoint_hits = scout_hits - real_hits
-            disjoint_misses = (
-                scout_misses - real_hits - committed_misses - disjoint_hits
-            )
             state_strategy.report_scout_results(
-                hits=disjoint_hits,
-                misses=disjoint_misses,
+                hits=scout_hits - real_hits,
+                misses=scout_misses - real_hits - committed_misses,
             )
         completed_lengths = (
             online_sidebar_completed_lengths
@@ -6971,7 +6246,6 @@ def _run_red_scout_and_blue_strategy(
             submarine_lengths=submarines,
             attempt=attempts_completed + 1,
             surface_baseline=surface_baseline,
-            grid_quad=grid_quad,
         )
         blue_bomb_ready = False
         online_network_ready = False
@@ -7319,12 +6593,12 @@ def _run_red_scout_and_blue_strategy(
                         l_shaped_block,
                         online_hit_evidence,
                     )
-                    if false_cell in locked_completed_ship_cells:
-                        # Only the discarded upper cell being a locked ship
-                        # body blocks the correction.  Locked lower cells are
-                        # expected: they are the real submarine the raised
-                        # flag/projected hull spilled onto.  2x2 L-shape has
-                        # priority over the completion lock for that upper cell.
+                    if false_cell in locked_completed_ship_cells or (
+                        set(l_shaped_block) & locked_completed_ship_cells
+                    ):
+                        # The online result conflicts with durable geometry;
+                        # keep the completed placement authoritative and do
+                        # not reinterpret any of its cells as flag noise.
                         false_cell = None
                     if false_cell is not None:
                         # The explicit 2x2 L rule has priority over every
@@ -9430,46 +8704,6 @@ def _execute_online_scout_hit(
             "the stable frame is a miss; recording miss",
             cell,
         )
-    if HIT_METHOD == "binarize" and victory_screenshot is None:
-        binarize_model = _board_recognizer_model()
-        if binarize_model is not None and frame_captures and cell_polygon is not None:
-            after_img = getattr(frame_captures[-1][1], "image", None)
-            if isinstance(after_img, np.ndarray):
-                binarize_hit = binarize_cell_hit(
-                    before_img, after_img, cell_polygon, binarize_model
-                )
-                if _hit_binarize_primary():
-                    # 和开局识图一致：二值法替换（能独立定命中），其它视觉（单格变化判定/侧边栏）并存参与。
-                    hit = bool(binarize_hit or hit or bool(sidebar_newly_completed))
-                    if binarize_hit:
-                        decision_reason = "binarize_reveal"
-                    elif sidebar_newly_completed:
-                        decision_reason = "sidebar_completed"
-                    elif hit:
-                        decision_reason = decision_reason or "classic_hit"
-                    else:
-                        decision_reason = "binarize_miss"
-                    logger.info(
-                        "online scout-hit cell %s decided by binarize (primary, other vision coexists): %s",
-                        cell,
-                        "hit" if hit else "miss",
-                    )
-                else:
-                    # 二值法只做"补充"：经典判定为命中时保持命中；经典未命中但二值法看到
-                    # 该格新出现潜艇内容时补成命中。绝不把命中改成未命中。
-                    if binarize_hit and not hit:
-                        logger.info(
-                            "online scout-hit cell %s promoted to hit by binarize supplement",
-                            cell,
-                        )
-                    hit = bool(hit or binarize_hit or bool(sidebar_newly_completed))
-                    if binarize_hit:
-                        decision_reason = "binarize_reveal"
-                    logger.info(
-                        "online scout-hit cell %s decided by binarize: %s",
-                        cell,
-                        "hit" if hit else "miss",
-                    )
     uncertain = not hit and (
         hit_votes == 1
         or any(_is_suspect_hit_frame(result) for result in hit_results)
@@ -9665,17 +8899,9 @@ def _probe_cell(
                 max_unknown_retries,
             )
             continue
-        # 重试用尽仍判不出：**不要抛异常**，否则一次歧义读数就会把整轮跑挂
-        # （level 22 的 (3,8) 就是这样停掉的：state=miss 但 score≈0.97，
-        # 3 帧里有 2 帧算「近命中」→ UNKNOWN → 重试 → ProbeProtocolError）。
-        # 按未命中记录并继续：strategy.report_result(cell, False) 会让策略不再挑这一格，
-        # 既不会死循环，也不丢整轮进度。
-        logger.warning(
-            "cell %s result stayed UNKNOWN after %s retries; recording as MISS and continuing",
-            cell,
-            max_unknown_retries,
+        raise ProbeProtocolError(
+            f"cell {cell} result stayed UNKNOWN after {max_unknown_retries} retries"
         )
-        return ProbeResult.MISS
 
     raise AssertionError("探测重试循环意外结束")
 
@@ -9777,7 +9003,7 @@ def _execute_probe_transaction(
             use_system_back=True,
         )
         _write_probe_status(sample_dir, "activity_exited", phase=transaction.phase.name)
-        if _reenter_activity_for_probe_result(level):
+        if _reenter_activity_for_probe_result():
             _latch_blue_victory(level, "probe_cell_reentry")
             transaction.advance(ProbePhase.RESULT_VISIBLE)
             update_pending_probe(phase=transaction.phase.name)
@@ -10411,65 +9637,6 @@ def _discard_pending_request_and_prepare_next_probe(
     return level_complete
 
 
-def _server_confirm_marker_count(image: np.ndarray) -> int:
-    """Count small orange marker components inside the server-confirm ROI.
-
-    The commit-confirmation markers are tiny gold/orange blobs that flash in the
-    title/upper-submarine region only once the server has accepted the upload.
-    Returns 0 for invalid frames or empty ROIs.
-    """
-    if not isinstance(image, np.ndarray) or image.ndim < 2:
-        return 0
-    height, width = image.shape[:2]
-    x0, y0, x1, y1 = SERVER_CONFIRM_ROI
-    left = max(0, min(width, int(x0)))
-    top = max(0, min(height, int(y0)))
-    right = min(width, max(left, int(x1)))
-    bottom = min(height, max(top, int(y1)))
-    if right <= left or bottom <= top:
-        return 0
-    roi = image[top:bottom, left:right]
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    hue_lo, hue_hi = SERVER_CONFIRM_HUE
-    mask = (
-        (hsv[..., 0] >= hue_lo)
-        & (hsv[..., 0] <= hue_hi)
-        & (hsv[..., 1] >= SERVER_CONFIRM_SAT_MIN)
-        & (hsv[..., 2] >= SERVER_CONFIRM_VAL_MIN)
-    ).astype(np.uint8)
-    num, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
-    count = 0
-    for index in range(1, num):
-        if stats[index, cv2.CC_STAT_AREA] >= SERVER_CONFIRM_MIN_AREA:
-            count += 1
-    return count
-
-
-def wait_until_server_commit_confirmed(
-    baseline_count: int,
-    *,
-    timeout: float = SERVER_CONFIRM_TIMEOUT_SECONDS,
-) -> tuple[bool, int]:
-    """Wait until a flash of commit-confirmation markers appears in the ROI.
-
-    A few baseline markers may already be present from earlier uploads, so
-    confirmation requires the observed count to rise by
-    ``SERVER_CONFIRM_MIN_NEW_MARKERS`` above ``baseline_count``.  Returns
-    ``(confirmed, peak_count)``; ``confirmed`` is False on timeout.
-    """
-    deadline = monotonic() + max(0.0, float(timeout))
-    peak_count = baseline_count
-    while monotonic() < deadline:
-        image = adb.read_screenshot()
-        count = _server_confirm_marker_count(image)
-        if count > peak_count:
-            peak_count = count
-        if count >= baseline_count + SERVER_CONFIRM_MIN_NEW_MARKERS:
-            return True, peak_count
-        sleep(SERVER_CONFIRM_POLL_SECONDS)
-    return False, peak_count
-
-
 def restart_process(
     reopen_game: bool = False,
     app_already_closed: bool = False,
@@ -10496,33 +9663,11 @@ def restart_process(
 
     disable_weak_network()
     if blue_request_upload_settle_seconds > 0:
-        # Do not treat a fixed settle as proof the request reached the server.
-        # Wait for the commit-confirmation marker flash; only then is it safe
-        # to cut the network again for the next probe.  Keep the settle value as
-        # the minimum wait so we do not race an upload that lands within it.
-        baseline_count = _server_confirm_marker_count(adb.read_screenshot())
-        confirmed, peak_count = wait_until_server_commit_confirmed(
-            baseline_count,
-            timeout=max(
-                blue_request_upload_settle_seconds,
-                SERVER_CONFIRM_TIMEOUT_SECONDS,
-            ),
+        logger.info(
+            "waiting %.1fs for committed blue request upload before recovery",
+            blue_request_upload_settle_seconds,
         )
-        if confirmed:
-            logger.info(
-                "committed blue request upload confirmed by server markers "
-                "(baseline=%s peak=%s)",
-                baseline_count,
-                peak_count,
-            )
-        else:
-            logger.warning(
-                "committed blue request upload was NOT visually confirmed after "
-                "%.1fs (baseline=%s peak=%s); proceeding conservatively",
-                max(blue_request_upload_settle_seconds, SERVER_CONFIRM_TIMEOUT_SECONDS),
-                baseline_count,
-                peak_count,
-            )
+        adb.delay(blue_request_upload_settle_seconds)
     level_complete = handle_victory_prompt(timeout=victory_wait_timeout)
     if level_complete:
         # A committed final blue hit must leave the old activity instance
@@ -10532,14 +9677,10 @@ def restart_process(
         # page.  Force the same DROP+REJECT -> retry -> base -> activity path
         # used by the original victory recovery flow.
         logger.info(
-            "victory handled after committed blue hit; proceeding directly to next "
-            "level detection (no reconnect)"
+            "victory handled after committed blue hit; reconnecting through base "
+            "before detecting the next level"
         )
-        # Do not force a DROP+REJECT reconnect after victory: it can cut the
-        # network before the server persists the level completion and then
-        # restore the just-completed level.  Let the main loop's level-advance
-        # logic identify the next level directly and continue.
-        adb.delay(VICTORY_WAIT_BEFORE_LEVEL_SECONDS)
+        _reconnect_to_base_and_reenter_activity_after_victory()
         return True
 
     recovered_level_complete = enter_activity() is True
@@ -10855,11 +9996,84 @@ def _clear_red_victory_before_blue_attack(expected_level: int | None = None) -> 
             "胜利页重复点击保护仍生效且页面未清除；禁止进入蓝色攻击"
         )
 
-    logger.info(
-        "red-scout victory banner remains before blue attack; skipping the "
-        "DROP+REJECT reconnect and continuing directly"
+    logger.warning(
+        "red-scout victory banner remains before blue attack; reloading the "
+        "server-authoritative current board without tapping the victory page"
     )
-    return
+    enable_weak_network(PROBE_DROP_SETTLE_SECONDS)
+    _verify_network_isolated_or_fail_closed(red_scout=False)
+    adb.enable_reject_network(GAME_PACKAGE_NAME)
+    write_runtime_status(network="DROP+REJECT 断网中", phase="red_victory_recovery")
+
+    dialog = wait_until_connection_interrupted_dialog(
+        timeout=MISS_CONNECTION_DIALOG_WAIT_SECONDS,
+    )
+    if dialog is None:
+        reason = "红色胜利页恢复未检测到连接中断弹窗；保持断网并停止蓝色攻击"
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+    retry = wait_until_retry_button(timeout=MISS_RETRY_BUTTON_WAIT_SECONDS)
+    if retry is None:
+        reason = "红色胜利页恢复未检测到重试按钮；保持断网并停止蓝色攻击"
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+
+    disable_weak_network()
+    adb.disable_reject_network(GAME_PACKAGE_NAME)
+    logger.info(
+        "red-scout victory recovery: clicking retry center=%s without tapping victory",
+        retry.center,
+    )
+    adb.click(*retry.center)
+    try:
+        recovered_complete = enter_activity(
+            re_enter=True,
+            max_retries=1,
+            prepare_activity_list=True,
+            activity_button_timeout=POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
+        )
+    except Exception as exc:
+        reason = "红色胜利页重连后未能确认活动详情页；保持断网并停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason) from exc
+    if recovered_complete:
+        reason = "红色胜利页重连后仍检测到胜利状态；停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+
+    fresh_screen = adb.read_screenshot()
+    if not isinstance(fresh_screen, np.ndarray):
+        reason = "红色胜利页清除后无法读取有效截图；保持断网并停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+    if find_victory_banner(fresh_screen) is not None:
+        reason = "红色胜利页清除后仍可见；保持断网并停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+    if find_connection_interrupted_dialog(fresh_screen) is not None:
+        reason = "红色胜利页清除后出现连接中断弹窗；保持断网并停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+    if find_template(fresh_screen, QUIT_ACTIVITY_TEMPLATE) is None:
+        reason = "红色胜利页清除后未确认仍在本关活动详情页；保持断网并停止蓝色攻击"
+        enable_weak_network()
+        adb.enable_reject_network(GAME_PACKAGE_NAME)
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+    verify_expected_level(fresh_screen)
+    logger.info(
+        "red-scout victory state reloaded; current activity detail confirmed before blue attack"
+    )
 
 
 def handle_connection_interrupted_prompt(timeout: float = 20.0) -> bool:
@@ -10879,6 +10093,57 @@ def handle_connection_interrupted_prompt(timeout: float = 20.0) -> bool:
         raise ProbeProtocolError("connection-interrupted dialog found, but retry button was not found")
 
     adb.delay(0.8).click(*retry.center)
+    return True
+
+
+def _reconnect_to_base_and_reenter_activity_after_victory() -> bool:
+    """通过一次完整的断网重连，把胜利后的旧详情页清理干净。"""
+    if _has_pending_probe_request():
+        raise ProbeProtocolError("胜利后切换下一关时仍有待提交探测请求，禁止重连")
+
+    logger.info(
+        "victory transition: enabling DROP+REJECT to return to the base before next level"
+    )
+    enable_weak_network(PROBE_DROP_SETTLE_SECONDS)
+    _verify_network_isolated_or_fail_closed(red_scout=False)
+    adb.enable_reject_network(GAME_PACKAGE_NAME)
+    write_runtime_status(network="DROP+REJECT 断网中", phase="victory_reconnect")
+
+    dialog = wait_until_connection_interrupted_dialog(
+        timeout=MISS_CONNECTION_DIALOG_WAIT_SECONDS,
+    )
+    if dialog is None:
+        reason = "胜利后重连未检测到连接中断弹窗；保持断网并停止下一关切换"
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+
+    retry = wait_until_retry_button(timeout=MISS_RETRY_BUTTON_WAIT_SECONDS)
+    if retry is None:
+        reason = "胜利后连接中断弹窗未检测到重试按钮；保持断网并停止下一关切换"
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+
+    disable_weak_network()
+    adb.disable_reject_network(GAME_PACKAGE_NAME)
+    logger.info(
+        "victory transition: base reconnect confirmed; clicking retry center=%s",
+        retry.center,
+    )
+    adb.click(*retry.center)
+    if wait_until_occur(
+        ACTIVITY_BUTTON_TEMPLATE,
+        timeout=POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
+        poll_interval=ACTIVITY_REENTRY_POLL_INTERVAL_SECONDS,
+    ) is None:
+        reason = "胜利后重试已点击，但未确认回到主基地活动入口"
+        latch_network_fail_closed(reason)
+        raise ProbeProtocolError(reason)
+
+    logger.info("victory transition: base screen confirmed; reopening activity list")
+    enter_activity(
+        prepare_activity_list=True,
+        activity_button_timeout=POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
+    )
     return True
 
 
@@ -11009,6 +10274,14 @@ def wait_until_retry_button(timeout: float = 20.0) -> MatchResult | None:
     return None
 
 
+def wait_until_retry_prompt(timeout: float = 20.0) -> MatchResult | None:
+    """Wait for the retry prompt using the consolidated retry-button helper."""
+    retry = wait_until_retry_button(timeout=timeout)
+    if retry is None:
+        logger.warning("retry button wait timed out (%s seconds)", timeout)
+    return retry
+
+
 def wait_until_occur(
     template_path: str | Path,
     timeout: float = 30.0,
@@ -11130,22 +10403,15 @@ def resolve_current_level(
 def resolve_current_level_from_device(
     fallback_level: int = DEFAULT_LEVEL,
     fallback_is_manual: bool = False,
-    attempts: int = 4,
+    attempts: int = 8,
 ) -> int:
     """Take several screenshots until the level title is stable enough to read."""
     if attempts <= 0:
         raise ValueError(f"attempts must be positive: {attempts}")
 
     last_error: Exception | None = None
-    # 预热关卡标题的数字模板（懒加载缓存），把首次加载参考图模板的冷启动
-    # 移到识别开始之前，避免识别时再触发一次 ~190ms 的模板提取卡顿。
-    try:
-        from utils.level_title_recognition import _load_single_digit_templates
-        _load_single_digit_templates(str(Path(LEVEL_REFERENCE_DIR).resolve()))
-    except Exception:
-        pass
     for attempt in range(1, attempts + 1):
-        adb.delay(0.4)
+        adb.delay(1.0)
         screenshot = adb.read_screenshot()
         if handle_victory_prompt(
             timeout=VICTORY_WAIT_BEFORE_LEVEL_SECONDS,
@@ -11547,20 +10813,6 @@ def run_main_entrypoint() -> int:
     except RedScoutSafetyError as exc:
         logger.critical("%s", exc)
         return 3
-    except ProbeSafetyError as exc:
-        # 蓝弹侧的安全停机（网络隔离校验失败等）：已经在断网状态下关掉游戏，
-        # 用专门的退出码/措辞与「协议错误」「真崩」区分开。
-        logger.critical("blue probe safety stop: %s", exc)
-        return 4
-    except ProbeProtocolError as exc:
-        # 协议错误（探测事务进入不安全/无法确认的状态）。这类以前会直接冒到
-        # 顶层变成 traceback，看起来像崩溃；现在明确记录并给专用退出码。
-        logger.error("probe protocol error; script stopped: %s", exc)
-        return 5
-    except Exception:
-        # 把未捕获异常的完整堆栈写入日志（bbma.log），便于定位停止原因。
-        logger.exception("uncaught exception; script stopped")
-        raise
     finally:
         if main_pid is not None:
             cleanup_weak_network("main finished")

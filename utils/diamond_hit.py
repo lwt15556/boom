@@ -457,11 +457,6 @@ def refine_center_by_pair(
     best_score = -1e9
     best_center = local_center
 
-    # 前后同帧(例如静态恢复把同一张图作为 before/after)时 diff_gray 全为 0，
-    # 每个候选中心的 inner_diff/outer_diff 恒为 0，无需重复构造外圈掩膜和
-    # 求均值。分数退化为 35.0 * white_ratio，与完整公式严格等价。
-    diff_is_zero = bool(np.count_nonzero(diff_gray) == 0)
-
     for dy in range(-config.search_radius, config.search_radius + 1):
         for dx in range(-config.search_radius, config.search_radius + 1):
             cand = (local_center[0] + dx, local_center[1] + dy)
@@ -473,32 +468,28 @@ def refine_center_by_pair(
                 config.diamond_h,
                 scale=config.inner_scale,
             )
+            full_mask = make_diamond_mask(
+                (h, w),
+                cand,
+                config.diamond_w,
+                config.diamond_h,
+                scale=1.0,
+            )
+            outer_big = make_diamond_mask(
+                (h, w),
+                cand,
+                config.diamond_w,
+                config.diamond_h,
+                scale=1.34,
+            )
+            outer_ring = cv2.subtract(outer_big, full_mask)
+
+            inner_diff = mean_in_mask(diff_gray, inner_mask)
+            outer_diff = mean_in_mask(diff_gray, outer_ring)
             white_ratio = ratio_in_mask(before_white, inner_mask)
 
-            if diff_is_zero:
-                # inner_diff = 0, outer_diff = 0。
-                score = 35.0 * white_ratio
-            else:
-                full_mask = make_diamond_mask(
-                    (h, w),
-                    cand,
-                    config.diamond_w,
-                    config.diamond_h,
-                    scale=1.0,
-                )
-                outer_big = make_diamond_mask(
-                    (h, w),
-                    cand,
-                    config.diamond_w,
-                    config.diamond_h,
-                    scale=1.34,
-                )
-                outer_ring = cv2.subtract(outer_big, full_mask)
-
-                inner_diff = mean_in_mask(diff_gray, inner_mask)
-                outer_diff = mean_in_mask(diff_gray, outer_ring)
-                # inner_diff 衡量目标格子变化，outer_diff 用来扣除周围动态海水变化。
-                score = inner_diff - 0.35 * outer_diff + 35.0 * white_ratio
+            # inner_diff 衡量目标格子变化，outer_diff 用来扣除周围动态海水变化。
+            score = inner_diff - 0.35 * outer_diff + 35.0 * white_ratio
 
             if score > best_score:
                 best_score = score
