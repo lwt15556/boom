@@ -1,4 +1,5 @@
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -6,6 +7,9 @@ import cv2
 import numpy as np
 
 from utils.image_io import read_image_compat, write_image_compat
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -98,19 +102,6 @@ def write_image(path: str | Path, img: np.ndarray) -> None:
     """保存图片文件，兼容中文路径。"""
     if not write_image_compat(path, img):
         raise RuntimeError(f"无法保存图片：{path}")
-
-
-def parse_roi(text: str | None) -> tuple[int, int, int, int] | None:
-    """解析 x,y,w,h 格式的 ROI 文本。"""
-    if not text:
-        return None
-
-    parts = text.replace("，", ",").split(",")
-
-    if len(parts) != 4:
-        raise ValueError("--roi 格式应为 x,y,w,h，例如 --roi 350,80,980,690")
-
-    return tuple(map(int, parts))
 
 
 def apply_roi(
@@ -472,7 +463,8 @@ def detect_grid_quad(img: np.ndarray) -> GridDetection:
 
     if not candidates:
         raise RuntimeError(
-            "没有找到稳定的大菱形网格。建议手动加 --roi，只框住格子区域附近。"
+            "没有找到稳定的大菱形网格。建议检查截图是否为完整棋盘画面，"
+            "或先用 tools/crop_red_border.py 裁剪出棋盘区域再重试。"
         )
 
     candidates.sort(key=lambda item: item[0])
@@ -488,6 +480,196 @@ def detect_grid_quad(img: np.ndarray) -> GridDetection:
         orientation_mask=raw_oriented,
         component_mask=component,
     )
+
+
+RED_BORDER_MIN_AREA_RATIO = 0.0008
+
+
+def make_red_mask(img: np.ndarray) -> np.ndarray:
+    """提取亮红色掩码（游戏红色边框/菱形边框）。"""
+    blue = img[:, :, 0].astype(np.int16)
+    green = img[:, :, 1].astype(np.int16)
+    red = img[:, :, 2].astype(np.int16)
+    mask = (red > 150) & (red - green > 80) & (red - blue > 80)
+    return mask.astype(np.uint8)
+
+
+def detect_red_border_quad(
+    img: np.ndarray,
+    min_area: float | None = None,
+) -> np.ndarray | None:
+    """检测棋子棋盘外围的红色菱形边框，返回排序好的四角 (top, right, bottom, left)。
+
+    找不到可靠的红色菱形时返回 ``None``，由调用方回退到白线检测。
+    """
+    _validate_screenshot(img)
+    h, w = img.shape[:2]
+
+    floor_area = max(
+        300.0,
+        float(h) * float(w) * RED_BORDER_MIN_AREA_RATIO,
+    )
+    min_area = max(floor_area, float(min_area) if min_area else 0.0)
+
+    red = make_red_mask(img)
+    closed = cv2.morphologyEx(
+        red * 255,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
+    )
+
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        closed,
+        8,
+    )
+
+    candidates: list[tuple[tuple[float, ...], np.ndarray]] = []
+
+    for label in range(1, num_labels):
+        x, y, bw, bh, area = stats[label]
+
+        if area < min_area:
+            continue
+
+        component = (labels == label).astype(np.uint8) * 255
+        quad = approximate_quad_from_component(component)
+
+        if quad is None:
+            continue
+
+        score = quad_geometry_score(quad, img.shape)
+
+        if score is None:
+            # 该组件不是贴合外部大菱形的形状（例如左上角关闭按钮、右下角
+            # 弹药图标、棋盘上的小红晶体等），跳过。
+            continue
+
+        candidates.append((score, quad))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
+
+
+def apply_quad_roi(
+    img: np.ndarray,
+    quad: np.ndarray,
+    *,
+    mask: bool = True,
+) -> tuple[np.ndarray, int, int]:
+    """把图像裁剪到 ``quad`` 的外接矩形，返回 (裁剪图, 相对原图偏移 x, 偏移 y)。
+
+    ``mask=True`` 时把菱形四角外的像素置 0，只保留红色边框内部（裁掉四角水面）。
+    """
+    _validate_screenshot(img)
+    q = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+
+    img_h, img_w = img.shape[:2]
+    xs = q[:, 0]
+    ys = q[:, 1]
+
+    x0 = max(0, int(np.floor(float(xs.min()))))
+    y0 = max(0, int(np.floor(float(ys.min()))))
+    x1 = min(img_w, int(np.ceil(float(xs.max()))))
+    y1 = min(img_h, int(np.ceil(float(ys.max()))))
+
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("quad ROI 无效或越界")
+
+    cropped = img[y0:y1, x0:x1].copy()
+
+    if mask:
+        local = q - np.array([x0, y0], dtype=np.float32)
+        polygon = np.round(local).astype(np.int32).reshape(-1, 1, 2)
+        mask_img = np.zeros((y1 - y0, x1 - x0), dtype=np.uint8)
+        cv2.fillConvexPoly(mask_img, polygon, 255, lineType=cv2.LINE_8)
+        cropped[mask_img == 0] = 0
+
+    return cropped, x0, y0
+
+
+def _quad_centers_result(
+    quad: np.ndarray,
+    n: int,
+) -> DiamondCentersResult:
+    """根据给定的菱形外框四角直接生成 N x N 中心点结果。"""
+    float_points = centers_from_quad(quad, n)
+    points = [
+        (int(round(x)), int(round(y)))
+        for x, y in float_points
+    ]
+    return DiamondCentersResult(
+        points=points,
+        float_points=float_points,
+        detection=None,
+        local_quad=quad.copy(),
+        global_quad=quad.copy(),
+        offset_x=0,
+        offset_y=0,
+    )
+
+
+def _sane_grid_quad(quad: np.ndarray, img: np.ndarray) -> bool:
+    """轻量校验，确保四角能当作网格边界使用，否则回退。"""
+    h, w = img.shape[:2]
+    q = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    if not np.isfinite(q).all():
+        return False
+    if (
+        q[:, 0].min() < 0
+        or q[:, 0].max() >= w
+        or q[:, 1].min() < 0
+        or q[:, 1].max() >= h
+    ):
+        return False
+    contour = q.reshape((-1, 1, 2))
+    if not cv2.isContourConvex(contour):
+        return False
+    minimum_area = max(100.0, float(w * h) * 0.01)
+    if abs(float(cv2.contourArea(contour))) < minimum_area:
+        return False
+    return True
+
+
+def detect_grid_points_red_roi(
+    img: np.ndarray,
+    n: int,
+    *,
+    fixed_quad: np.ndarray | Sequence[Sequence[float]] | None = None,
+    use_red_border: bool = True,
+) -> DiamondCentersResult:
+    """检测 N x N 网格中心点，按优先级依次尝试：
+
+    1. ``fixed_quad`` —— 调用方提供的固定四角（例如 points.json 里的标定点位）。
+       这是唯一权威的网格外框，可保证裁剪、点击点、检测三处使用同一组四角。
+    2. 自动检测的红色菱形边框四角。
+    3. 常规白线网格检测。
+
+    前两者拿到合法 quad 时直接用 ``centers_from_quad`` 生成中心点（当格子被
+    潜艇/泡沫遮挡时，白线检测常会找到过小的错误菱形）。返回的点和 quad 均在
+    原图像坐标系内。
+    """
+    _validate_screenshot(img)
+    n = _validate_grid_size(n)
+
+    if fixed_quad is not None:
+        quad = np.asarray(fixed_quad, dtype=np.float32).reshape(4, 2)
+        if _sane_grid_quad(quad, img):
+            logger.info("using fixed quad as the grid boundary")
+            return _quad_centers_result(quad, n)
+        logger.warning("fixed quad 无效，回退到自动检测")
+
+    if use_red_border:
+        quad = detect_red_border_quad(img)
+        if quad is not None:
+            if _sane_grid_quad(quad, img):
+                logger.info("using red-border quad as the grid boundary")
+                return _quad_centers_result(quad, n)
+            logger.warning("red-border quad 无效，回退到白线检测")
+
+    return detect_diamond_centers(img, n)
 
 
 def centers_from_quad(quad: np.ndarray, n: int) -> list[tuple[float, float]]:
@@ -529,43 +711,6 @@ def centers_from_quad(quad: np.ndarray, n: int) -> list[tuple[float, float]]:
             )
 
     return points
-
-
-def draw_points(
-    img: np.ndarray,
-    points: list[tuple[float, float]] | list[tuple[int, int]],
-    radius: int,
-    label: bool,
-) -> np.ndarray:
-    """在图片上绘制中心点和可选编号。"""
-    out = img.copy()
-
-    for idx, (x, y) in enumerate(points, start=1):
-        px = int(round(x))
-        py = int(round(y))
-
-        cv2.circle(
-            out,
-            (px, py),
-            radius,
-            (0, 0, 255),
-            -1,
-            lineType=cv2.LINE_AA,
-        )
-
-        if label:
-            cv2.putText(
-                out,
-                str(idx),
-                (px + radius + 4, py - radius - 4),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.46,
-                (0, 0, 255),
-                1,
-                cv2.LINE_AA,
-            )
-
-    return out
 
 
 def draw_quad(
