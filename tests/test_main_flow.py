@@ -106,6 +106,13 @@ def dummy_hit_result(state):
     )
 
 
+def promoted_miss_result():
+    """点击后视觉变化可晋升为命中的 miss 帧：格子向灰色残骸打开，s_drop>0。"""
+    result = dummy_hit_result("miss")
+    result.s_drop = 5.0
+    return result
+
+
 class MainFlowTest(unittest.TestCase):
     def test_probe_result_json_preserves_unknown_decision(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -184,6 +191,11 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "update_pending_probe", return_value=False),
             patch.object(self.main, "clear_pending_probe"),
             patch.object(self.main, "read_pending_probe", return_value=None),
+            # 这些用例验证的是经典命中/揭示判定路径；二值法路径单独测。
+            patch.object(self.main, "HIT_METHOD", "classic"),
+            # 这些用例验证的是开局基础视觉（模板/残骸/侧边栏）；二值法识图会替换它，单独测。
+            patch.object(self.main, "BOARD_RECOGNIZER_MODE", ""),
+            patch.object(self.main, "_board_strict_only", return_value=False),
         ]
         for patcher in self.pending_probe_patchers:
             patcher.start()
@@ -523,6 +535,51 @@ class MainFlowTest(unittest.TestCase):
         cleanup_reject.assert_not_called()
         release_lock.assert_not_called()
         ensure_root.assert_not_called()
+
+    def test_entrypoint_exit_codes_separate_safety_stops_from_protocol_errors(self):
+        """红/蓝安全停、协议错误、弹药耗尽必须给出不同退出码。
+
+        以前 ``ProbeProtocolError``（含蓝弹安全停）没有在入口被捕获，会直接冒到
+        顶层变成 traceback，看起来像崩溃。现在各自的退出码能让日志与返回值直接
+        区分「体面停机」和「真崩」。
+        """
+        cases = (
+            (self.main.RedScoutSafetyError("red stop"), 3),
+            (self.main.ProbeSafetyError("blue stop"), 4),
+            (self.main.ProbeProtocolError("protocol violation"), 5),
+            (self.main.BlueAmmoDepletedError("no blue ammo"), 0),
+        )
+        for error, expected in cases:
+            with self.subTest(error=type(error).__name__):
+                with (
+                    patch.object(self.main, "acquire_main_lock", return_value=1234),
+                    patch.object(self.main, "register_exit_cleanup"),
+                    patch.object(self.main, "write_runtime_status"),
+                    patch.object(self.main, "cleanup_reject_network"),
+                    patch.object(self.main, "cleanup_weak_network"),
+                    patch.object(self.main, "release_main_lock"),
+                    patch.object(self.main.adb, "ensure_root_shell", create=True),
+                    patch.object(
+                        self.main, "recover_interrupted_probe_at_startup", return_value=False
+                    ),
+                    patch.object(self.main, "main", side_effect=error),
+                ):
+                    self.assertEqual(
+                        self.main.run_main_entrypoint(),
+                        expected,
+                        f"{type(error).__name__} 应返回退出码 {expected}",
+                    )
+
+    def test_blue_safety_error_is_not_a_probe_protocol_error(self):
+        """安全停不能是 ProbeProtocolError 的子类。
+
+        main.py 里有多处 ``except ProbeProtocolError`` 会吞掉异常继续跑；安全停
+        一旦被吞掉，就会在断网状态下继续操作游戏。
+        """
+        self.assertFalse(
+            issubclass(self.main.ProbeSafetyError, self.main.ProbeProtocolError)
+        )
+        self.assertTrue(issubclass(self.main.ProbeSafetyError, RuntimeError))
 
     def test_red_mode_runs_configured_attempts_then_seeds_strategy(self):
         settings = self.main.RedScoutSettings(self.main.ProbeMode.RED_SCOUT, 3)
@@ -1050,6 +1107,7 @@ class MainFlowTest(unittest.TestCase):
             excluded_cells=set(),
             learned_footprint=None,
             submarine_lengths=[3],
+            binarize_hit_cells=frozenset(),
         )
 
     def test_red_transaction_capture_does_not_precede_preflight(self):
@@ -1295,7 +1353,7 @@ class MainFlowTest(unittest.TestCase):
             patch.object(
                 self.main,
                 "classify_diamond_hit",
-                side_effect=lambda *_args, **_kwargs: dummy_hit_result("miss"),
+                side_effect=lambda *_args, **_kwargs: promoted_miss_result(),
             ),
             patch.object(self.main, "find_victory_banner", return_value=None),
             patch.object(self.main, "red_hit_marker_visible", return_value=False),
@@ -1678,7 +1736,7 @@ class MainFlowTest(unittest.TestCase):
         )
 
         def classify(_before, _after, point):
-            return dummy_hit_result("hit" if point == (400, 300) else "miss")
+            return dummy_hit_result("hit") if point == (400, 300) else promoted_miss_result()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             sample_root = self.main.Path(temp_dir)
@@ -1760,7 +1818,7 @@ class MainFlowTest(unittest.TestCase):
                 patch.object(
                     self.main,
                     "classify_diamond_hit",
-                    side_effect=lambda *_args, **_kwargs: dummy_hit_result("miss"),
+                    side_effect=lambda *_args, **_kwargs: promoted_miss_result(),
                 ),
                 patch.object(
                     self.main,
@@ -1836,7 +1894,7 @@ class MainFlowTest(unittest.TestCase):
                 patch.object(
                     self.main,
                     "classify_diamond_hit",
-                    side_effect=lambda *_args, **_kwargs: dummy_hit_result("miss"),
+                    side_effect=lambda *_args, **_kwargs: promoted_miss_result(),
                 ),
                 patch.object(
                     self.main,
@@ -2183,7 +2241,8 @@ class MainFlowTest(unittest.TestCase):
             ("delay", self.main.ONLINE_SCOUT_BLUE_SELECT_SETTLE_SECONDS),
             self.adb.calls,
         )
-        self.assertEqual(self.adb.read_screenshot.call_count, 5)
+        # 就绪快路径跳过一次冗余截图。
+        self.assertEqual(self.adb.read_screenshot.call_count, 4)
 
     def test_fast_blue_selection_waits_remaining_window_when_switch_is_slow(self):
         selection_screen = object()
@@ -2301,7 +2360,7 @@ class MainFlowTest(unittest.TestCase):
         weak_hit = dummy_hit_result("hit")
         weak_hit.score = 0.70
         weak_hit.confidence = 0.70
-        frame_results = [weak_hit] + [dummy_hit_result("miss") for _ in range(6)]
+        frame_results = [weak_hit] + [promoted_miss_result() for _ in range(6)]
 
         with (
             patch.object(self.main, "wait_until_occur", return_value=DummyMatch((40, 38))),
@@ -2358,7 +2417,7 @@ class MainFlowTest(unittest.TestCase):
         weak_hit.confidence = 0.70
         frame_results = (
             [weak_hit]
-            + [dummy_hit_result("miss") for _ in range(3)]
+            + [promoted_miss_result() for _ in range(3)]
             + [dummy_hit_result("hit"), dummy_hit_result("hit"), dummy_hit_result("miss")]
         )
 
@@ -2403,7 +2462,8 @@ class MainFlowTest(unittest.TestCase):
         self.assertEqual(result, self.main.ProbeResult.HIT)
         self.assertEqual(hit_map[1][1], 1)
         self.assertEqual(self.adb.calls.count(("click", 640, 360)), 1)
-        self.assertEqual(self.adb.calls.count(("capture_screenshot",)), 4)
+        # 视觉变化后可以提前停帧；关键是不得超出常规 4 帧排程（无额外嫌疑帧）。
+        self.assertLessEqual(self.adb.calls.count(("capture_screenshot",)), 4)
 
     def test_online_scout_hit_does_not_treat_red_submarine_decoration_as_visible_hit(self):
         hit_map = [[0, 0, 0] for _row in range(3)]
@@ -2420,7 +2480,7 @@ class MainFlowTest(unittest.TestCase):
             patch.object(
                 self.main,
                 "classify_diamond_hit",
-                side_effect=lambda *_args, **_kwargs: dummy_hit_result("miss"),
+                side_effect=lambda *_args, **_kwargs: promoted_miss_result(),
             ) as classify,
             patch.object(self.main, "_create_probe_sample_dir", return_value=self.main.Path("unused")),
             patch.object(self.main, "_write_probe_status"),
@@ -4089,8 +4149,12 @@ class MainFlowTest(unittest.TestCase):
         crop = cv2.imread(str(self.main.Path(__file__).parent / "fixtures" / "level15_top_submarine.png"))
         self.assertIsNotNone(crop)
         frame = np.zeros((720, 1280, 3), dtype=np.uint8)
-        frame[82:162, 655:775] = crop
+        # 相对第 15 关当前保存点位中的 (0,2)/(1,2) 格中心摆放潜艇图，
+        # 使"顶部 L 型修正"在任意 quad 下都落在 (0,2)/(1,2) 上。
         points = self.main.read_saved_points(15, expected_n=10)
+        crop_left = int(round(points[2][0] - 82))
+        crop_top = int(round(points[2][1] - 31))
+        frame[crop_top:crop_top + 80, crop_left:crop_left + 120] = crop
         hit_map = [[0] * 10 for _ in range(10)]
 
         def inspect_startup(*_args, **kwargs):
@@ -4106,9 +4170,12 @@ class MainFlowTest(unittest.TestCase):
 
         with (
             patch.object(self.main.adb, "read_screenshot", return_value=frame),
+            patch.object(self.main, "_swipe_reveal_should_run", return_value=False),
             patch.object(self.main, "get_click_points", return_value=(points, None)),
             patch.object(self.main, "get_configured_submarines", return_value=[2, 5]),
             patch.object(self.main, "_capture_surface_water_baseline", return_value=None),
+            patch.object(self.main, "detect_wreck_cells_by_features", return_value=set()),
+            patch.object(self.main, "detect_water_cells_by_features", return_value=set()),
             patch.object(self.main, "detect_sidebar_progress", return_value=SidebarProgress(active_lengths=(5,), completed_lengths=(2,))),
             patch.object(self.main, "detect_visible_wreck_cells", return_value=set()),
             patch.object(self.main, "detect_partial_wreck_cells", return_value=set()),
@@ -4509,7 +4576,7 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "read_saved_quad", return_value=quad),
             patch.object(
                 self.main,
-                "detect_diamond_centers",
+                "detect_grid_points_red_roi",
                 return_value=SimpleNamespace(points=auto_points, global_quad=quad),
             ) as detect,
         ):
@@ -4517,7 +4584,7 @@ class MainFlowTest(unittest.TestCase):
 
         self.assertEqual(points, auto_points)
         np.testing.assert_array_equal(detected_quad, quad)
-        detect.assert_called_once_with(image, 3)
+        detect.assert_called_once_with(image, 3, fixed_quad=quad)
 
     def test_get_click_points_stops_before_probe_when_auto_geometry_is_unsafe(self):
         image = np.zeros((100, 100, 3), dtype=np.uint8)
@@ -4531,7 +4598,7 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "USE_SAVED_POINTS", False),
             patch.object(
                 self.main,
-                "detect_diamond_centers",
+                "detect_grid_points_red_roi",
                 return_value=SimpleNamespace(
                     points=duplicate_points,
                     global_quad=degenerate_quad,
@@ -5811,56 +5878,40 @@ class MainFlowTest(unittest.TestCase):
             1,
         )
 
-    def test_red_victory_gate_clears_banner_before_blue_attack(self):
+    def test_red_victory_gate_skips_reconnect_when_banner_is_unguarded(self):
         screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
-        fresh_screen = np.ones((720, 1280, 3), dtype=np.uint8)
         victory = DummyMatch((640, 360))
 
-        self.adb.read_screenshot = Mock(side_effect=[screenshot, fresh_screen])
+        self.adb.read_screenshot = Mock(return_value=screenshot)
         with (
-            patch.object(self.main, "find_victory_banner", side_effect=[victory, None]),
+            patch.object(self.main, "find_victory_banner", return_value=victory),
             patch.object(self.main, "_victory_prompt_guard_matches", return_value=False),
-            patch.object(self.main, "find_connection_interrupted_dialog", return_value=None),
-            patch.object(self.main, "find_template", return_value=DummyMatch((40, 38))),
-            patch.object(self.main, "wait_until_connection_interrupted_dialog", return_value=DummyMatch((1, 1))),
-            patch.object(self.main, "wait_until_retry_button", return_value=DummyMatch((2, 2))),
-            patch.object(self.main, "enter_activity", return_value=False) as enter,
+            patch.object(self.main, "enter_activity") as enter,
         ):
             self.main._clear_red_victory_before_blue_attack()
 
-        enter.assert_called_once_with(
-            re_enter=True,
-            max_retries=1,
-            prepare_activity_list=True,
-            activity_button_timeout=self.main.POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
-        )
-        self.assertIn(("click", 2, 2), self.adb.calls)
-        self.assertIn(
-            ("enable_weak_network", self.main.GAME_PACKAGE_NAME),
-            self.adb.calls,
-        )
-        self.assertIn(
-            ("disable_weak_network", self.main.GAME_PACKAGE_NAME),
-            self.adb.calls,
-        )
+        enter.assert_not_called()
+        package_name = self.main.GAME_PACKAGE_NAME
+        self.assertNotIn(("enable_weak_network", package_name), self.adb.calls)
+        self.assertNotIn(("enable_reject_network", package_name), self.adb.calls)
+        self.assertNotIn(("disable_weak_network", package_name), self.adb.calls)
+        self.assertNotIn(("disable_reject_network", package_name), self.adb.calls)
 
-    def test_red_victory_gate_fails_closed_when_banner_will_not_clear(self):
+    def test_red_victory_gate_fails_closed_when_prompt_guard_is_still_active(self):
         screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
         self.adb.read_screenshot = Mock(return_value=screenshot)
 
         with (
             patch.object(self.main, "find_victory_banner", return_value=DummyMatch((640, 360))),
-            patch.object(self.main, "_victory_prompt_guard_matches", return_value=False),
-            patch.object(self.main, "wait_until_connection_interrupted_dialog", return_value=None),
-            patch.object(self.main, "latch_network_fail_closed"),
+            patch.object(self.main, "_victory_prompt_guard_matches", return_value=True),
+            patch.object(self.main, "enter_activity") as enter,
         ):
-            with self.assertRaises(self.main.ProbeProtocolError):
+            with self.assertRaisesRegex(self.main.ProbeProtocolError, "重复点击保护"):
                 self.main._clear_red_victory_before_blue_attack()
 
-        self.assertIn(
-            ("enable_weak_network", self.main.GAME_PACKAGE_NAME),
-            self.adb.calls,
-        )
+        enter.assert_not_called()
+        package_name = self.main.GAME_PACKAGE_NAME
+        self.assertNotIn(("enable_weak_network", package_name), self.adb.calls)
 
     def test_red_victory_gate_rejects_next_level_before_blue_attack(self):
         screenshot = np.zeros((720, 1280, 3), dtype=np.uint8)
@@ -6010,10 +6061,6 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "LEVEL_ADVANCE_RETRIES", 1),
             patch.object(
                 self.main,
-                "_reconnect_to_base_and_reenter_activity_after_victory",
-            ) as reconnect,
-            patch.object(
-                self.main,
                 "resolve_current_level_from_device",
                 return_value=7,
             ),
@@ -6024,7 +6071,6 @@ class MainFlowTest(unittest.TestCase):
             )
 
         self.assertIsNone(next_level)
-        reconnect.assert_not_called()
         self.assertNotIn(("click", *self.main.SCREEN_CONTINUE_POINT), self.adb.calls)
         package_name = self.main.GAME_PACKAGE_NAME
         self.assertNotIn(("enable_weak_network", package_name), self.adb.calls)
@@ -6035,10 +6081,6 @@ class MainFlowTest(unittest.TestCase):
     def test_next_level_detection_directly_uses_activity_after_victory(self):
         with (
             patch.object(self.main, "LEVEL_ADVANCE_RETRIES", 1),
-            patch.object(
-                self.main,
-                "_reconnect_to_base_and_reenter_activity_after_victory",
-            ) as reconnect,
             patch.object(
                 self.main,
                 "resolve_current_level_from_device",
@@ -6055,7 +6097,6 @@ class MainFlowTest(unittest.TestCase):
             fallback_level=8,
             fallback_is_manual=False,
         )
-        reconnect.assert_not_called()
 
     def test_next_level_board_ready_waits_for_victory_overlay_to_clear(self):
         banner_frame = np.zeros((20, 20, 3), dtype=np.uint8)
@@ -6104,70 +6145,6 @@ class MainFlowTest(unittest.TestCase):
         self.assertFalse(ready)
         find_template.assert_not_called()
         self.assertNotIn(("click", *self.main.SCREEN_CONTINUE_POINT), self.adb.calls)
-
-    def test_victory_transition_reconnects_to_base_then_reopens_activity_list(self):
-        package_name = self.main.GAME_PACKAGE_NAME
-        retry = DummyMatch((320, 240))
-        with (
-            patch.object(
-                self.main,
-                "wait_until_connection_interrupted_dialog",
-                return_value=DummyMatch((500, 300)),
-            ) as dialog,
-            patch.object(self.main, "wait_until_retry_button", return_value=retry) as retry_wait,
-            patch.object(
-                self.main,
-                "wait_until_occur",
-                return_value=DummyMatch((100, 100)),
-            ) as base_wait,
-            patch.object(self.main, "enter_activity", return_value=True) as enter,
-        ):
-            completed = self.main._reconnect_to_base_and_reenter_activity_after_victory()
-
-        self.assertTrue(completed)
-        self.assertIn(("enable_weak_network", package_name), self.adb.calls)
-        self.assertIn(("enable_reject_network", package_name), self.adb.calls)
-        self.assertIn(("disable_weak_network", package_name), self.adb.calls)
-        self.assertIn(("disable_reject_network", package_name), self.adb.calls)
-        self.assertIn(("click", *retry.center), self.adb.calls)
-        dialog.assert_called_once_with(timeout=self.main.MISS_CONNECTION_DIALOG_WAIT_SECONDS)
-        retry_wait.assert_called_once_with(timeout=self.main.MISS_RETRY_BUTTON_WAIT_SECONDS)
-        base_wait.assert_called_once_with(
-            self.main.ACTIVITY_BUTTON_TEMPLATE,
-            timeout=self.main.POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
-            poll_interval=self.main.ACTIVITY_REENTRY_POLL_INTERVAL_SECONDS,
-        )
-        enter.assert_called_once_with(
-            prepare_activity_list=True,
-            activity_button_timeout=self.main.POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
-        )
-
-    def test_victory_transition_treats_normal_activity_entry_as_success(self):
-        with (
-            patch.object(
-                self.main,
-                "wait_until_connection_interrupted_dialog",
-                return_value=DummyMatch((500, 300)),
-            ),
-            patch.object(
-                self.main,
-                "wait_until_retry_button",
-                return_value=DummyMatch((320, 240)),
-            ),
-            patch.object(
-                self.main,
-                "wait_until_occur",
-                return_value=DummyMatch((100, 100)),
-            ),
-            patch.object(self.main, "enter_activity", return_value=False) as enter,
-        ):
-            completed = self.main._reconnect_to_base_and_reenter_activity_after_victory()
-
-        self.assertTrue(completed)
-        enter.assert_called_once_with(
-            prepare_activity_list=True,
-            activity_button_timeout=self.main.POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
-        )
 
     def test_enter_activity_recovers_after_activity_button_missing(self):
         waits = iter(
@@ -6236,14 +6213,9 @@ class MainFlowTest(unittest.TestCase):
             activity_button_timeout=self.main.POST_LOGIN_ACTIVITY_BUTTON_WAIT_SECONDS,
         )
 
-    def test_committed_victory_reconnects_through_base_before_next_level(self):
+    def test_committed_victory_waits_before_next_level_without_reconnect(self):
         with (
             patch.object(self.main, "handle_victory_prompt", return_value=True) as handle_victory,
-            patch.object(
-                self.main,
-                "_reconnect_to_base_and_reenter_activity_after_victory",
-                return_value=True,
-            ) as reconnect,
             patch.object(self.main, "enter_activity") as enter_activity,
         ):
             completed = self.main.restart_process()
@@ -6252,23 +6224,41 @@ class MainFlowTest(unittest.TestCase):
         handle_victory.assert_called_once_with(
             timeout=self.main.VICTORY_WAIT_AFTER_HIT_SECONDS,
         )
-        reconnect.assert_called_once_with()
+        self.assertIn(
+            ("delay", self.main.VICTORY_WAIT_BEFORE_LEVEL_SECONDS),
+            self.adb.calls,
+        )
         enter_activity.assert_not_called()
+        package_name = self.main.GAME_PACKAGE_NAME
+        self.assertNotIn(("enable_weak_network", package_name), self.adb.calls)
+        self.assertNotIn(("enable_reject_network", package_name), self.adb.calls)
+        self.assertNotIn(("disable_reject_network", package_name), self.adb.calls)
 
-    def test_committed_request_waits_for_upload_after_network_restore(self):
+    def test_committed_request_waits_for_server_upload_confirmation(self):
         with (
-            patch.object(self.main, "handle_victory_prompt", return_value=False),
-            patch.object(self.main, "enter_activity", return_value=False),
+            patch.object(self.main, "_server_confirm_marker_count", return_value=0) as marker_count,
+            patch.object(
+                self.main,
+                "wait_until_server_commit_confirmed",
+                return_value=(True, 5),
+            ) as confirm_wait,
+            patch.object(self.main, "handle_victory_prompt", return_value=False) as handle_victory,
+            patch.object(self.main, "enter_activity", return_value=False) as enter,
         ):
             completed = self.main.restart_process(
                 blue_request_upload_settle_seconds=3.0,
             )
 
         self.assertFalse(completed)
-        package_name = self.main.GAME_PACKAGE_NAME
-        disable_index = self.adb.calls.index(("disable_weak_network", package_name))
-        delay_index = self.adb.calls.index(("delay", 3.0))
-        self.assertLess(disable_index, delay_index)
+        marker_count.assert_called_once()
+        confirm_wait.assert_called_once_with(
+            0,
+            timeout=max(3.0, self.main.SERVER_CONFIRM_TIMEOUT_SECONDS),
+        )
+        handle_victory.assert_called_once_with(
+            timeout=self.main.VICTORY_WAIT_AFTER_HIT_SECONDS,
+        )
+        enter.assert_called_once_with()
 
     def test_blue_commit_passes_upload_settle_to_recovery(self):
         transaction = self.main.ProbeTransaction(1, (0, 0), 0)
@@ -6848,6 +6838,7 @@ class MainFlowTest(unittest.TestCase):
         self.assertIsNotNone(evidence_gate)
         result = dummy_hit_result("miss")
         result.changed_ratio = 0.01
+        result.s_drop = 5.0
 
         vetoed = evidence_gate(
             result,
@@ -6891,6 +6882,7 @@ class MainFlowTest(unittest.TestCase):
     def test_completed_submarine_confirmation_requires_marker_and_hull(self):
         image = np.zeros((720, 1280, 3), dtype=np.uint8)
         result = dummy_hit_result("miss")
+        result.center_gray_ratio = 0.2
 
         with (
             patch.object(self.main, "red_submarine_marker_visible", return_value=True),
@@ -8543,8 +8535,17 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "handle_connection_interrupted_prompt", return_value=False),
             patch.object(self.main, "click_template", return_value=True),
             patch.object(self.main, "_wait_until_activity_detail_closed", return_value=True),
-            patch.object(self.main, "classify_diamond_hit", return_value=dummy_hit_result("hit")),
+            patch.object(
+                self.main,
+                "classify_diamond_hit",
+                side_effect=[
+                    dummy_hit_result("hit"),
+                    dummy_hit_result("hit"),
+                    dummy_hit_result("hit"),
+                ],
+            ),
             patch.object(self.main, "apply_wreck_template_confirmation", return_value=True),
+            patch.object(self.main, "_static_wreck_persists_after_delay", return_value=True),
         ):
             result = self.main._probe_cell(
                 level=1,
@@ -8629,7 +8630,7 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "wait_until_occur", return_value=DummyMatch((1, 1))),
             patch.object(self.main, "sleep"),
             patch.object(self.main, "write_pending_probe") as write_pending,
-            self.assertRaisesRegex(self.main.ProbeProtocolError, "ipv6 unblocked"),
+            self.assertRaisesRegex(self.main.ProbeSafetyError, "ipv6 unblocked"),
         ):
             self.main._execute_probe_transaction(
                 level=1,
@@ -8653,7 +8654,7 @@ class MainFlowTest(unittest.TestCase):
             patch.object(self.main, "wait_until_occur", return_value=DummyMatch((1, 1))),
             patch.object(self.main, "sleep"),
             patch.object(self.main, "write_pending_probe") as write_pending,
-            self.assertRaisesRegex(self.main.ProbeProtocolError, "adb unavailable"),
+            self.assertRaisesRegex(self.main.ProbeSafetyError, "adb unavailable"),
         ):
             self.main._execute_probe_transaction(
                 level=1,

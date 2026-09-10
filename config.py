@@ -27,7 +27,36 @@ MAX_SCREENSHOT_STORAGE_BYTES: Final[int] = 500 * 1024 * 1024
 
 
 # 目前支持的最大关卡
-MAX_LEVEL: Final[int] = 50
+MAX_LEVEL: Final[int] = 70
+
+# 二值法识图模式（开局潜艇格识别）：
+#   "only"  = 只用二值法（board_cell_model.json）识别，忽略残骸/模板/特征启动视觉
+#   "merge" = 二值法结果叠加进现有启动命中
+#   ""      = 关闭二值法识图（当前：全部二值法已停用）
+# 可用环境变量 BBMA_USE_BOARD_RECOGNIZER 覆盖。
+BOARD_RECOGNIZER_MODE: Final[str] = ""
+
+# 严格二值法模式：True 时开局识图**只用二值法结果**，丢弃其它所有开局视觉
+# （模板/残骸/特征/侧边栏/红标记）。默认 False = 保留其它开局视觉。
+# 可用环境变量 BBMA_BOARD_STRICT_ONLY 覆盖（"1"/"true" 开）。
+BOARD_RECOGNIZER_STRICT_ONLY: Final[bool] = False
+
+# 开局是否用 sprite 级潜艇/残骸检测器（utils/submarine_detector.py，棋盘四边形 ROI）：
+#   True  = 运行，并把命中的潜艇格/碎片格叠加进开局命中
+# 可用环境变量 BBMA_USE_SUBMARINE_DETECTOR 覆盖（"1"/"true" 强制开，"0"/"false" 强制关）。
+USE_SUBMARINE_DETECTOR: Final[bool] = False
+
+# 命中/揭示判定方法：
+#   "binarize" = 二值法前后帧差分（打点后新出现"潜艇内容"=命中）
+#   "classic"  = 原色彩/模板/侧边栏判定（当前：二值法已停用）
+# 可用环境变量 BBMA_HIT_METHOD 覆盖。
+HIT_METHOD: Final[str] = "classic"
+
+# 二值法在"攻击后判定"里的角色（HIT_METHOD="binarize" 时才生效）：
+#   True  = 以二值法前后帧差分结果**为准**（不再只做补充）
+#   False = 二值法只把未命中补成命中（原行为，绝不把命中改成未命中）
+# 可用环境变量 BBMA_HIT_BINARIZE_PRIMARY 覆盖。
+HIT_BINARIZE_PRIMARY: Final[bool] = False
 
 # 自动识别不可用时使用的默认回退关卡
 DEFAULT_LEVEL: Final[int] = 2

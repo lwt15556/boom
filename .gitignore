@@ -40,3 +40,10 @@ _debug/runtime/**
 _debug/reports/**
 _debug/red_scout_samples/**
 save_points/dbg/
+
+# 本地训练样本目录（运行时已不再自动生成）
+识图/
+
+# setup.ps1 重建无效 venv 时的备份
+.venv.invalid.*/
+

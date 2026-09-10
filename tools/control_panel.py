@@ -77,7 +77,7 @@ RUN_STDOUT = PROJECT_ROOT / "run_stdout.log"
 RUN_STDERR = PROJECT_ROOT / "run_stderr.log"
 STATUS_FILE = PROJECT_ROOT / "_debug" / "runtime" / "status.json"
 PANEL_LOCK_FILE = PROJECT_ROOT / "_debug" / "runtime" / "control_panel.lock"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.1.0"
 
 NETWORK_BLOCK_SETTLE_SECONDS = 0.2
 APP_STOP_TIMEOUT_SECONDS = 5.0
@@ -141,6 +141,15 @@ RESULT_NAMES = {
     "scout_invalid": "侦察结果无效",
     "supplemental_recheck_pending": "正在补炸侦察未命中格",
 }
+# 是否在棋盘上把"视觉候选"格标成金色（识图怀疑有内容、但未用蓝炮确认的格子）。
+# 默认关闭：识别不准时满盘黄色候选会很吵，且它只是"待确认"提示、不是已确认结果。
+# 用环境变量 BBMA_SHOW_VISUAL_CANDIDATES=1 打开。
+SHOW_VISUAL_CANDIDATES = os.environ.get("BBMA_SHOW_VISUAL_CANDIDATES", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 BOARD_STATE_NAMES = {
     "scout_miss": "侦察未命中",
     "scout_hit": "侦察命中",
@@ -191,6 +200,8 @@ def format_red_scout_progress(
 def overlay_visual_candidates(
     board_states: object,
     visual_candidates: object,
+    *,
+    show: bool = SHOW_VISUAL_CANDIDATES,
 ) -> object:
     """Overlay unverified visual hints without replacing real board states."""
     if not isinstance(board_states, list) or not board_states:
@@ -206,6 +217,9 @@ def overlay_visual_candidates(
         ["miss" if state == "blocked" else state for state in row]
         for row in board_states
     ]
+    # ``show`` 关闭时（默认）不标黄：候选格保持"未探测"浅蓝，只隐藏提示，不影响策略。
+    if not show:
+        return normalized
     if not isinstance(visual_candidates, (list, tuple, set)):
         return normalized
     for raw_cell in visual_candidates:
