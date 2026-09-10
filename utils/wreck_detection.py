@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Sequence
@@ -1073,15 +1072,7 @@ def detect_red_submarine_marker_cells(
     click_points: list[tuple[int, int]],
     grid_size: int,
 ) -> set[Cell]:
-    """Assign visible red submarine components to their unique grid cells.
-
-    Overlapping parallel submarines would otherwise bind both flags onto one row
-    ((1,1) and (1,2) on level 20), which makes the per-anchor binding solver
-    unable to tell the two hulls apart and demotes every submarine cell to a
-    provisional candidate.  Split neighbouring mis-bindings here so each flag
-    owns a distinct hull row, while leaving same-cell collapses collapsed: that
-    count selects the (more robust) global geometry branch in main.py.
-    """
+    """Assign visible red submarine components to their unique grid cells."""
     if not isinstance(screenshot, np.ndarray) or screenshot.ndim != 3:
         return set()
     if grid_size <= 0 or len(click_points) != grid_size * grid_size:
@@ -1090,8 +1081,6 @@ def detect_red_submarine_marker_cells(
         screenshot,
         [(int(x), int(y)) for x, y in click_points],
         grid_size,
-        deduplicate=True,
-        split_exact=False,
     )
 
 
@@ -1149,16 +1138,7 @@ def detect_completed_submarine_candidate_cells(
         return set()
 
     normalized_points = [(int(x), int(y)) for x, y in click_points]
-    # Use the de-duplicated anchors here (unlike detect_red_submarine_marker_cells):
-    # when two overlapping submarines share one brightest hull cell, the split
-    # anchor for the second hull widens the candidate reach onto its own row, so
-    # the global geometry solver can recover it.
-    anchors = _detect_completed_ship_anchor_cells(
-        screenshot,
-        normalized_points,
-        grid_size,
-        deduplicate=True,
-    )
+    anchors = _detect_completed_ship_anchor_cells(screenshot, normalized_points, grid_size)
     if not anchors:
         return set()
 
@@ -1330,13 +1310,13 @@ def detect_completed_submarine_candidate_cells(
                     end_col = max(col for _, col in placement)
                     while start_col > 0:
                         cell = (row, start_col - 1)
-                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_BODY_MIN_SCORE:
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
                             break
                         selected.add(cell)
                         start_col -= 1
                     while end_col + 1 < grid_size:
                         cell = (row, end_col + 1)
-                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_BODY_MIN_SCORE:
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
                             break
                         selected.add(cell)
                         end_col += 1
@@ -1346,13 +1326,13 @@ def detect_completed_submarine_candidate_cells(
                     end_row = max(row for row, _ in placement)
                     while start_row > 0:
                         cell = (start_row - 1, col)
-                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_BODY_MIN_SCORE:
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
                             break
                         selected.add(cell)
                         start_row -= 1
                     while end_row + 1 < grid_size:
                         cell = (end_row + 1, col)
-                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_BODY_MIN_SCORE:
+                        if cell not in candidates or body_scores.get(cell, 0.0) < COMPLETED_SHIP_OFFSET_BODY_MIN_SCORE:
                             break
                         selected.add(cell)
                         end_row += 1
@@ -1367,9 +1347,6 @@ def _detect_completed_ship_anchor_cells(
     image: np.ndarray,
     click_points: list[tuple[int, int]],
     grid_size: int,
-    *,
-    deduplicate: bool = False,
-    split_exact: bool = True,
 ) -> set[Cell]:
     height, width = image.shape[:2]
     xs = [point[0] for point in click_points]
@@ -1416,16 +1393,8 @@ def _detect_completed_ship_anchor_cells(
     )
     max_point_distance_sq = (step * COMPLETED_SHIP_MARKER_MAX_POINT_DISTANCE_FACTOR) ** 2
 
+    anchors: set[Cell] = set()
     num_labels, _labels, stats, centroids = cv2.connectedComponentsWithStats(red_mask, connectivity=8)
-
-    # Each red component is assigned to a hull cell.  In an isometric frame two
-    # surfaced submarines can overlap (the parallel length-5 and length-3 hulls
-    # at the top of level 20) so their flags can project onto the *same*
-    # brightest hull cell.  Keeping the per-marker single best cell then
-    # collapses two real submarines into one anchor, and the later per-anchor
-    # straight-run step silently drops the second hull.  Collect all
-    # per-component binding candidates first and resolve those collisions below.
-    component_records: list[dict[str, object]] = []
     for label_index in range(1, num_labels):
         area = int(stats[label_index, cv2.CC_STAT_AREA])
         component_width = int(stats[label_index, cv2.CC_STAT_WIDTH])
@@ -1480,7 +1449,6 @@ def _detect_completed_ship_anchor_cells(
 
         best_index = nearest_index
         best_key: tuple[float, float, float, int] | None = None
-        candidate_bodies: dict[tuple[int, int], float] = {}
         for index in candidate_indices:
             point = click_points[index]
             candidate_row, candidate_col = divmod(index, grid_size)
@@ -1493,7 +1461,6 @@ def _detect_completed_ship_anchor_cells(
                 point,
                 cell_polygon=grid_cell_polygon(click_points, index, grid_size),
             )
-            candidate_bodies[(candidate_row, candidate_col)] = float(body_score)
             # Prefer strong hull evidence first, then proximity.  The small
             # proximity tie-break keeps a flag centred on its own hull from
             # jumping to a similarly bright neighbouring cell.
@@ -1512,161 +1479,9 @@ def _detect_completed_ship_anchor_cells(
 
         if best_key is not None and best_key[0] < COMPLETED_SHIP_BODY_MIN_SCORE:
             best_index = nearest_index
-        best_cell = (best_index // grid_size, best_index % grid_size)
-        component_records.append(
-            {
-                "nearest_cell": (nearest_row, nearest_col),
-                "best_cell": best_cell,
-                "body": float(best_key[0]) if best_key is not None else 0.0,
-                "candidate_bodies": candidate_bodies,
-            }
-        )
+        anchors.add((best_index // grid_size, best_index % grid_size))
 
-    if deduplicate:
-        return _deduplicate_anchor_collisions(
-            component_records,
-            grid_size,
-            split_exact=split_exact,
-        )
-    return {
-        (int(record["best_cell"][0]), int(record["best_cell"][1]))
-        for record in component_records
-        if record["best_cell"] is not None
-    }
-
-
-def _deduplicate_anchor_collisions(
-    records: Sequence[dict[str, object]],
-    grid_size: int,
-    *,
-    split_exact: bool = True,
-) -> set[Cell]:
-    """Resolve red-marker anchors that overlap onto the same or adjacent cells.
-
-    Two surfaced submarines seen in the same isometric frame can overlap (the
-    parallel length-5 and length-3 hulls at the top of level 20).  Their flags
-    then bind either to the *same* brightest hull cell or to two *neighbouring*
-    cells ((1,1) and (1,2)).  Adjacent cells can never belong to two different
-    submarines because the game keeps at least one empty cell between hulls, so
-    both shapes are mis-bindings that leave two anchors on one row and hide the
-    parallel hull from the per-anchor solver.
-
-    For each such group, keep the marker that has no independent strong hull to
-    retreat to, and move every other marker to its own distinct,
-    strongly-supported hull cell that is not on the same sub-region as the
-    shared cell (Chebyshev distance > 1).  Cells already claimed by another
-    marker are never reused.
-
-    ``split_exact`` controls whether markers that landed on the *same* cell are
-    split as well.  The red-marker anchor set used by main.py keeps those
-    collapsed: that count selects the global geometry branch, which is more
-    robust than the per-anchor branch for those frames.  Only the neighbouring
-    pairs are split there.  The candidate generator splits both.
-    """
-    by_cell: dict[Cell, list[dict[str, object]]] = defaultdict(list)
-    for record in records:
-        cell = record["best_cell"]
-        if cell is None:
-            continue
-        by_cell[(int(cell[0]), int(cell[1]))].append(record)
-
-    cell_entries: list[tuple[Cell, list[dict[str, object]]]] = []
-    for cell, group in by_cell.items():
-        if len(group) > 1 and not split_exact:
-            strongest = max(group, key=lambda r: float(r.get("body", 0.0)))
-            cell_entries.append((cell, [strongest]))
-        else:
-            cell_entries.append((cell, list(group)))
-
-    merged_groups: list[tuple[Cell, list[dict[str, object]]]] = []
-    for cell, group in cell_entries:
-        for index, (_rep_cell, accumulated) in enumerate(merged_groups):
-            if any(
-                max(abs(cell[0] - int(r["best_cell"][0])), abs(cell[1] - int(r["best_cell"][1]))) <= 1
-                for r in accumulated
-            ):
-                accumulated.extend(group)
-                strongest = max(accumulated, key=lambda r: float(r.get("body", 0.0)))
-                strongest_cell = strongest["best_cell"]
-                merged_groups[index] = (
-                    (int(strongest_cell[0]), int(strongest_cell[1])),
-                    accumulated,
-                )
-                break
-        else:
-            merged_groups.append((cell, list(group)))
-
-    def alternative_cells(
-        record: dict[str, object],
-        shared_cell: Cell,
-    ) -> list[Cell]:
-        candidate_bodies = record["candidate_bodies"]
-        if not isinstance(candidate_bodies, dict):
-            return []
-        alternatives: list[tuple[float, Cell]] = []
-        for cell, body in candidate_bodies.items():
-            cell = (int(cell[0]), int(cell[1])) if isinstance(cell, tuple) else cell
-            if cell == shared_cell:
-                continue
-            if not isinstance(body, (int, float)) or body < COMPLETED_SHIP_DIAGONAL_BODY_MIN_SCORE:
-                continue
-            if max(abs(cell[0] - shared_cell[0]), abs(cell[1] - shared_cell[1])) <= 1:
-                continue
-            alternatives.append((float(body), cell))
-        alternatives.sort(reverse=True)
-        return [cell for _body, cell in alternatives]
-
-    used: set[Cell] = set()
-    final: list[Cell] = []
-    for shared_cell, group in merged_groups:
-        if len(group) == 1:
-            cell = group[0]["best_cell"]
-            if cell is not None and cell not in used:
-                final.append((int(cell[0]), int(cell[1])))
-                used.add((int(cell[0]), int(cell[1])))
-            continue
-
-        # Keep the marker that cannot move to another strong hull.  If every
-        # marker in the group can move, keep the strongest body evidence.
-        stuck = [r for r in group if not alternative_cells(r, shared_cell)]
-        if stuck:
-            primary = max(stuck, key=lambda r: float(r.get("body", 0.0)))
-        else:
-            primary = max(group, key=lambda r: float(r.get("body", 0.0)))
-
-        if shared_cell in used:
-            placed = False
-            for candidate in alternative_cells(primary, shared_cell):
-                if candidate not in used:
-                    final.append(candidate)
-                    used.add(candidate)
-                    placed = True
-                    break
-            if not placed:
-                continue
-        else:
-            final.append(shared_cell)
-            used.add(shared_cell)
-
-        for record in group:
-            if record is primary:
-                continue
-            placed = False
-            for candidate in alternative_cells(record, shared_cell):
-                if candidate not in used:
-                    final.append(candidate)
-                    used.add(candidate)
-                    placed = True
-                    break
-            if not placed:
-                nearest = record.get("nearest_cell")
-                if isinstance(nearest, tuple) and nearest not in used:
-                    nearest_cell = (int(nearest[0]), int(nearest[1]))
-                    if nearest_cell not in used:
-                        final.append(nearest_cell)
-                        used.add(nearest_cell)
-
-    return set(final)
+    return anchors
 
 
 def grid_cell_polygon(

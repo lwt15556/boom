@@ -731,47 +731,6 @@ class AdbController:
             duration_ms,
         )
 
-    def swipe_hold(
-        self,
-        start_x: int,
-        start_y: int,
-        end_x: int,
-        end_y: int,
-        duration_ms: int = 800,
-        hold_ms: int = 300,
-    ) -> None:
-        """Drag from start to end, pausing at the endpoint before lifting.
-
-        ``input swipe`` always lifts at the end of the duration, which can make a
-        scroll rebound.  This issues DOWN -> N x MOVE -> hold at the end -> UP so
-        the page stays put for ``hold_ms`` before the finger lifts.  Falls back
-        to a plain drag if the motionevent stream is unsupported.
-        """
-        try:
-            self._run(["shell", "input", "motionevent", "DOWN", str(start_x), str(start_y)])
-            steps = 8
-            step_sleep = max(0.01, (duration_ms / 1000.0) / steps)
-            for index in range(1, steps + 1):
-                t = index / steps
-                x = int(round(start_x + (end_x - start_x) * t))
-                y = int(round(start_y + (end_y - start_y) * t))
-                self._run(["shell", "input", "motionevent", "MOVE", str(x), str(y)])
-                sleep(step_sleep)
-            sleep(max(0.0, hold_ms) / 1000.0)
-            self._run(["shell", "input", "motionevent", "UP", str(end_x), str(end_y)])
-            logger.info(
-                "滑动(端点停顿)屏幕: start=(%s, %s) end=(%s, %s) duration_ms=%s hold_ms=%s",
-                start_x,
-                start_y,
-                end_x,
-                end_y,
-                duration_ms,
-                hold_ms,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("swipe_hold 不可用，回退到普通滑动: %s", exc)
-            self.drag(start_x, start_y, end_x, end_y, duration_ms)
-
     def connect(self) -> None:
         """连接 adb 设备。"""
         logger.info("连接 adb 设备: %s", self.serial)
